@@ -261,8 +261,11 @@ def _select_int(label: str, default: int, minimum: int = 1, maximum: int = 6) ->
 def _interactive_args_raw(color_override: bool | None = None) -> argparse.Namespace:
     print("Param Forge")
     print("Test image-gen APIs and capture receipts that help configure calls.")
-    fd = sys.stdin.fileno()
-    original = termios.tcgetattr(fd)
+    try:
+        fd = sys.stdin.fileno()
+        original = termios.tcgetattr(fd)
+    except Exception:
+        return _interactive_args_simple()
     with _RawMode(fd, original):
         provider = _select_from_list("Provider", PROVIDER_CHOICES, 0)
         size = _select_from_list("Size", SIZE_CHOICES, 0)
@@ -270,6 +273,55 @@ def _interactive_args_raw(color_override: bool | None = None) -> argparse.Namesp
         prompt_set_name = _select_from_list("Prompt set", list(PROMPT_SETS.keys()), 0)
         out_choice = _select_from_list("Output dir", OUT_DIR_CHOICES, 0)
     return _build_interactive_namespace(provider, size, n, prompt_set_name, out_choice)
+
+
+def _interactive_args_simple() -> argparse.Namespace:
+    print("Param Forge (simple mode)")
+    print("Type a number and press Enter. Press Enter to accept defaults.")
+
+    provider = _prompt_choice("Provider", PROVIDER_CHOICES, 0)
+    size = _prompt_choice("Size", SIZE_CHOICES, 0)
+    n = _prompt_int("Images per prompt", 1, minimum=1, maximum=4)
+    prompt_set_name = _prompt_choice("Prompt set", list(PROMPT_SETS.keys()), 0)
+    out_choice = _prompt_choice("Output dir", OUT_DIR_CHOICES, 0)
+    return _build_interactive_namespace(provider, size, n, prompt_set_name, out_choice)
+
+
+def _prompt_choice(label: str, choices: list[str], default_index: int = 0) -> str:
+    while True:
+        print(f"{label}:")
+        for idx, choice in enumerate(choices, start=1):
+            suffix = " (default)" if idx - 1 == default_index else ""
+            print(f"  {idx}. {choice}{suffix}")
+        try:
+            response = input(f"Select {label} [default {default_index + 1}]: ").strip()
+        except EOFError:
+            raise KeyboardInterrupt from None
+        if response == "":
+            return choices[default_index]
+        if response.isdigit():
+            selected = int(response)
+            if 1 <= selected <= len(choices):
+                return choices[selected - 1]
+        print("Invalid choice. Try again.")
+
+
+def _prompt_int(label: str, default: int, minimum: int = 1, maximum: int = 6) -> int:
+    while True:
+        try:
+            response = input(f"{label} [{default}]: ").strip()
+        except EOFError:
+            raise KeyboardInterrupt from None
+        if response == "":
+            return default
+        try:
+            value = int(response)
+        except ValueError:
+            print("Please enter a number.")
+            continue
+        if minimum <= value <= maximum:
+            return value
+        print(f"Enter a number between {minimum} and {maximum}.")
 
 
 def _build_interactive_namespace(
@@ -593,49 +645,103 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
         stdscr.refresh()
 
         receipts: list[Path] = []
+        cancel_requested = False
         for idx, prompt in enumerate(args.prompt, start=1):
-            if y < height - 1:
-                line = f"Generating ({idx}/{len(args.prompt)}): {prompt}"
-                try:
-                    stdscr.addstr(y, 0, line[: width - 1])
-                except curses.error:
-                    pass
+            line = f"Generating ({idx}/{len(args.prompt)}): {prompt}"
+            _safe_addstr(stdscr, y, 0, line)
             stdscr.refresh()
-            try:
-                results = generate(
-                    prompt=prompt,
-                    provider=args.provider,
-                    size=args.size,
-                    n=args.n,
-                    out_dir=Path(args.out),
-                    model=args.model,
-                )
-            except Exception as exc:
-                result["exit_code"] = 1
-                if y + 2 < height - 1:
-                    try:
-                        stdscr.addstr(y + 1, 0, f"Generation failed: {exc}"[: width - 1])
-                    except curses.error:
-                        pass
+
+            result_holder: dict[str, object] = {}
+            done = threading.Event()
+            start = time.monotonic()
+
+            def _run_generate() -> None:
+                try:
+                    result_holder["results"] = generate(
+                        prompt=prompt,
+                        provider=args.provider,
+                        size=args.size,
+                        n=args.n,
+                        out_dir=Path(args.out),
+                        model=args.model,
+                    )
+                except Exception as exc:
+                    result_holder["error"] = exc
+                finally:
+                    done.set()
+
+            thread = threading.Thread(target=_run_generate, daemon=True)
+            thread.start()
+
+            frames = ["|", "/", "-", "\\"]
+            frame_idx = 0
+            status_y = min(y + 1, height - 1)
+            local_cancel = False
+            while not done.is_set():
+                elapsed = time.monotonic() - start
+                status = f"{frames[frame_idx % len(frames)]} Elapsed {elapsed:5.1f}s (press Q to cancel)"
+                _safe_addstr(stdscr, status_y, 0, status)
                 stdscr.refresh()
+                frame_idx += 1
+                key = stdscr.getch()
+                if key in (ord("q"), ord("Q")):
+                    local_cancel = True
+            thread.join()
+
+            elapsed = time.monotonic() - start
+            _safe_addstr(stdscr, status_y, 0, f"Done in {elapsed:5.1f}s")
+            stdscr.refresh()
+
+            if "error" in result_holder:
+                result["exit_code"] = 1
+                _safe_addstr(
+                    stdscr,
+                    min(height - 1, y + 2),
+                    0,
+                    f"Generation failed: {result_holder['error']}",
+                )
+                stdscr.refresh()
+                stdscr.timeout(-1)
                 stdscr.getch()
                 return
+
+            results = result_holder.get("results", [])
             for res in results:
                 receipts.append(Path(res.receipt_path))
+
+            if local_cancel:
+                cancel_requested = True
+                result["exit_code"] = 1
+                _safe_addstr(
+                    stdscr,
+                    min(height - 1, y + 2),
+                    0,
+                    "Cancel requested; stopping after current prompt.",
+                )
+                stdscr.refresh()
+                break
+
             y += 2
             if y >= height - 2:
                 y = min(height - 2, max(0, height - 3))
 
+        stdscr.timeout(-1)
+        if cancel_requested:
+            _safe_addstr(stdscr, min(height - 2, y), 0, "Cancelled. Press any key to exit.")
+            stdscr.refresh()
+            stdscr.getch()
+            return
         if receipts:
             prompt_line = "Open last receipt now? (o = open, any key = exit)"
-            try:
-                stdscr.addstr(min(height - 2, y), 0, prompt_line[: width - 1])
-            except curses.error:
-                pass
+            _safe_addstr(stdscr, min(height - 2, y), 0, prompt_line)
             stdscr.refresh()
             key = stdscr.getch()
             if key in (ord("o"), ord("O")):
                 result["open_path"] = receipts[-1]
+        else:
+            _safe_addstr(stdscr, min(height - 2, y), 0, "No receipts produced. Press any key to exit.")
+            stdscr.refresh()
+            stdscr.getch()
 
     try:
         curses.wrapper(_curses_flow)
@@ -658,8 +764,26 @@ def _run_raw_fallback(reason: str | None, color_override: bool | None) -> int:
         reason = reason.strip()
     if reason:
         print(f"Curses UI unavailable ({reason}). Falling back to raw prompts.")
-    args = _interactive_args_raw(color_override=color_override)
+    try:
+        args = _interactive_args_raw(color_override=color_override)
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        return 1
+    except Exception as exc:
+        print(f"Raw prompt failed ({exc}). Falling back to simple prompts.")
+        args = _interactive_args_simple()
     return _run_generation(args)
+
+
+def _safe_addstr(stdscr, y: int, x: int, text: str, attr: int = 0) -> None:
+    import curses
+    height, width = stdscr.getmaxyx()
+    if y < 0 or x < 0 or y >= height or x >= width:
+        return
+    try:
+        stdscr.addstr(y, x, text[: max(0, width - x - 1)], attr)
+    except curses.error:
+        pass
 
 
 def _draw_choice_line(
@@ -877,14 +1001,17 @@ def _format_choices_line(choices: list[str], idx: int, max_width: int, color: bo
 
 
 class _Spinner:
-    def __init__(self, message: str, interval: float = 0.1) -> None:
+    def __init__(self, message: str, interval: float = 0.1, show_elapsed: bool = False) -> None:
         self.message = message
         self.interval = interval
+        self.show_elapsed = show_elapsed
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
+        self._start: float | None = None
 
     def start(self) -> None:
         if sys.stdout.isatty():
+            self._start = time.monotonic()
             self._thread.start()
 
     def stop(self) -> None:
@@ -900,7 +1027,11 @@ class _Spinner:
         index = 0
         while not self._stop.is_set():
             frame = frames[index % len(frames)]
-            sys.stdout.write(f"\r{self.message} {frame}")
+            line = f"\r{self.message} {frame}"
+            if self.show_elapsed and self._start is not None:
+                elapsed = time.monotonic() - self._start
+                line = f"{line}  {elapsed:5.1f}s"
+            sys.stdout.write(line)
             sys.stdout.flush()
             time.sleep(self.interval)
             index += 1
@@ -993,7 +1124,7 @@ def _run_generation(args: argparse.Namespace) -> int:
     for idx, prompt in enumerate(prompts, start=1):
         label = f"Generating ({idx}/{len(prompts)})"
         print(f"{label}: {prompt}")
-        spinner = _Spinner(f"{label} in progress")
+        spinner = _Spinner(f"{label} in progress", show_elapsed=True)
         spinner.start()
         stopped = False
         try:
