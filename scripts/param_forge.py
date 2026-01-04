@@ -3578,6 +3578,11 @@ def _build_final_recommendation_lines(
     _append("FINAL RECOMMENDED API CALL", "section")
     goals_line = ", ".join(user_goals) if user_goals else "(not specified)"
     _append_wrapped(f"Goals: {goals_line}", "goal")
+    if baseline_settings:
+        _append_wrapped(
+            f"Round 1 baseline (vanilla): {_format_call_settings_line(baseline_settings)}",
+            "change",
+        )
     recommended_settings = _settings_after_recommendation(settings, recommendation) if recommendation else settings
     _append_wrapped(_format_call_settings_line(recommended_settings))
     baseline_diffs: list[str] = []
@@ -3643,45 +3648,55 @@ def _build_final_recommendation_lines(
                     time_target = time_ref * (area_target / area_ref)
 
         gain_lines: list[str] = []
-        if (
-            "minimize cost of render" in goals
-            and cost_ref is not None
-            and cost_target is not None
-            and cost_ref > 0
-        ):
+        wants_cost = "minimize cost of render" in goals
+        wants_time = "minimize time to render" in goals
+        wants_quality = "maximize quality of render" in goals
+        quality_secondary = wants_quality and (wants_cost or wants_time)
+        quality_delta_line = None
+        adherence_delta_line = None
+        if quality_baseline is not None and quality_current is not None and quality_baseline > 0:
+            delta = quality_current - quality_baseline
+            pct = (delta / quality_baseline) * 100.0
+            direction = "increase" if delta >= 0 else "decrease"
+            quality_delta_line = f"Quality: {abs(pct):.0f}% {direction}"
+        if adherence_baseline is not None and adherence_current is not None and adherence_baseline > 0:
+            delta = adherence_current - adherence_baseline
+            pct = (delta / adherence_baseline) * 100.0
+            direction = "increase" if delta >= 0 else "decrease"
+            adherence_delta_line = f"Prompt adherence: {abs(pct):.0f}% {direction}"
+        cost_delta_line = None
+        if cost_ref is not None and cost_target is not None and cost_ref > 0:
             delta = (cost_target - cost_ref) / cost_ref
             if abs(delta) >= 0.005:
                 pct = abs(delta) * 100.0
                 direction = "decrease" if delta < 0 else "increase"
-                gain_lines.append(f"Cost: {pct:.0f}% {direction}")
-        if (
-            "minimize time to render" in goals
-            and time_ref is not None
-            and time_target is not None
-            and time_ref > 0
-        ):
+                cost_delta_line = f"Cost: {pct:.0f}% {direction}"
+        time_delta_line = None
+        if time_ref is not None and time_target is not None and time_ref > 0:
             delta = (time_target - time_ref) / time_ref
             if abs(delta) >= 0.005:
                 pct = abs(delta) * 100.0
                 direction = "decrease" if delta < 0 else "increase"
-                gain_lines.append(f"Time: {pct:.0f}% {direction}")
-        if "maximize quality of render" in goals:
-            if quality_baseline is not None and quality_current is not None and quality_baseline > 0:
-                delta = quality_current - quality_baseline
-                pct = (delta / quality_baseline) * 100.0
-                direction = "increase" if delta >= 0 else "decrease"
-                gain_lines.append(f"Quality: {abs(pct):.0f}% {direction}")
-            elif force_quality_metrics:
-                gain_lines.append("Quality: N/A (no baseline)")
-            else:
-                gain_lines.append("Quality: secondary to cost/time goals")
-            if adherence_baseline is not None and adherence_current is not None and adherence_baseline > 0:
-                delta = adherence_current - adherence_baseline
-                pct = (delta / adherence_baseline) * 100.0
-                direction = "increase" if delta >= 0 else "decrease"
-                gain_lines.append(f"Prompt adherence: {abs(pct):.0f}% {direction}")
-            elif force_quality_metrics:
-                gain_lines.append("Prompt adherence: N/A (no baseline)")
+                time_delta_line = f"Time: {pct:.0f}% {direction}"
+
+        def _maybe_append(line: str | None, *, primary: bool, quality: bool = False) -> None:
+            if not line:
+                return
+            suffix = ""
+            if goals and not primary:
+                suffix = " (secondary)"
+            if quality and quality_secondary:
+                suffix = " (secondary)"
+            gain_lines.append(f"{line}{suffix}")
+
+        _maybe_append(cost_delta_line, primary=wants_cost)
+        _maybe_append(time_delta_line, primary=wants_time)
+        if wants_quality:
+            _maybe_append(quality_delta_line or ("Quality: N/A (no baseline)" if force_quality_metrics else None), primary=not quality_secondary, quality=True)
+            _maybe_append(adherence_delta_line or ("Prompt adherence: N/A (no baseline)" if force_quality_metrics else None), primary=not quality_secondary, quality=True)
+        else:
+            _maybe_append(quality_delta_line, primary=False, quality=True)
+            _maybe_append(adherence_delta_line, primary=False, quality=True)
 
         if gain_lines:
             _append_wrapped("Expected gains:", "section")

@@ -55,14 +55,21 @@ python scripts/param_forge.py --defaults
 ```
 
 Receipt analyzer provider:
-- Default: Anthropic (`anthropic`).
-- Override with env var: `RECEIPT_ANALYZER=openai` (or `anthropic`).
+- Default: Anthropic (`anthropic`), with automatic fallback to OpenAI if Anthropic rate-limits.
+- Options: `anthropic`, `openai`, `council`.
+- Override with env var: `RECEIPT_ANALYZER=openai` (or `anthropic`, `council`).
 - Or pass `--analyzer openai` on the CLI.
+- Note: `council` runs multiple analyzers and may take a few minutes.
+
+OpenAI image call options:
+- `--openai-stream` (env: `OPENAI_IMAGE_STREAM=1`) to stream gpt-image models.
+- `--openai-responses` (env: `OPENAI_IMAGE_USE_RESPONSES=1`) to call gpt-image via the Responses API.
+- Analyzer can recommend `use_responses=true/false` when using OpenAI.
 
 ## Notes
 - If curses can’t initialize (TERM issues or small terminal), the script falls back to a raw prompt flow.
 - Receipts are stored next to generated images in the output directory.
-- Pricing reference (per-image costs): docs/pricing_reference.md, docs/pricing_reference.json
+- Pricing reference (per 1K images): docs/pricing_reference.md, docs/pricing_reference.json
 
 ## Backlog
 - If you want that pre-cost call to run for any analysis (not just cost goal), say the word.
