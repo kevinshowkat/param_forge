@@ -91,7 +91,7 @@ _VERSION_HISTORY = [
     ("v0.4.0", "Pilot"),
 ]
 _MIN_CURSES_WIDTH = max(40, max(len(line) for line in _BANNER))
-_MIN_CURSES_HEIGHT = max(12, len(_BANNER) + 2)
+_MIN_CURSES_HEIGHT = max(12, len(_BANNER) + 4)
 
 
 class _CursesFallback(RuntimeError):
@@ -1300,6 +1300,8 @@ def _recommendations_summary(recommendation: object) -> str:
 
 def _interactive_args_raw(color_override: bool | None = None) -> argparse.Namespace:
     print("Param Forge")
+    for line in _version_text_lines():
+        print(line)
     print("Test image-gen APIs and capture receipts that help configure calls.")
     try:
         fd = sys.stdin.fileno()
@@ -1308,9 +1310,9 @@ def _interactive_args_raw(color_override: bool | None = None) -> argparse.Namesp
         return _interactive_args_simple()
     with _RawMode(fd, original):
         while True:
-            mode = _select_from_list("Mode", ["Explore", "Test"], 0)
-            if mode.lower() == "test":
-                print("Test mode coming next.")
+            mode = _select_from_list("Mode", ["Explore", "Experiment"], 0)
+            if mode.lower() == "experiment":
+                print("Experiment mode coming next.")
                 continue
             break
         provider = _select_from_list("Provider", PROVIDER_CHOICES, 0)
@@ -1324,12 +1326,14 @@ def _interactive_args_raw(color_override: bool | None = None) -> argparse.Namesp
 
 def _interactive_args_simple() -> argparse.Namespace:
     print("Param Forge (simple mode)")
+    for line in _version_text_lines():
+        print(line)
     print("Type a number and press Enter. Press Enter to accept defaults.")
 
     while True:
-        mode = _prompt_choice("Mode", ["Explore", "Test"], 0)
-        if mode.lower() == "test":
-            print("Test mode coming next.")
+        mode = _prompt_choice("Mode", ["Explore", "Experiment"], 0)
+        if mode.lower() == "experiment":
+            print("Experiment mode coming next.")
             continue
         break
     provider = _prompt_choice("Provider", PROVIDER_CHOICES, 0)
@@ -1502,20 +1506,22 @@ def _interactive_args_curses(stdscr, color_override: bool | None = None) -> argp
                 except curses.error:
                     pass
             y += 1
-        if y < height - 1:
+        version_attr = curses.A_DIM
+        for line in _banner_version_lines(width):
+            if y >= height:
+                break
+            try:
+                stdscr.addstr(y, 0, line[: max(0, width - 1)], version_attr)
+            except curses.error:
+                pass
             y += 1
         if y < height - 1:
-            y += 2
-        if y < height - 1:
-            y += 3
-
-        if y < height - 1:
-            y += 2
+            y += 1
         y = _draw_choice_line(
             stdscr,
             y,
             "Mode",
-            ["Explore", "Test"],
+            ["Explore", "Experiment"],
             mode_idx,
             field_idx == 0,
             field_idx,
@@ -1525,11 +1531,11 @@ def _interactive_args_curses(stdscr, color_override: bool | None = None) -> argp
             color_enabled,
         )
         hint = (
-            "Test AI image-gen APIs and capture receipts that help configure calls."
+            "Repeatable prompt runs with fixed knobs, receipt exports, and side-by-side rounds."
             if mode_idx == 0
-            else "put a sample line here for now"
+            else "Start from a reference image to find the best provider/model/params and export one receipt."
         )
-        _safe_addstr(stdscr, y, 4, hint[: max(0, width - 5)], curses.A_DIM)
+        _safe_addstr(stdscr, y, 4, hint[: max(0, width - 5)], curses.A_BOLD)
         y += 2
         if field_idx >= 1:
             y = _draw_choice_line(
@@ -2562,13 +2568,17 @@ def _line_text_and_attr(line: object, *, color_enabled: bool) -> tuple[str, int]
 
 
 def _banner_version_lines(width: int) -> list[str]:
-    current_label = f"{_VERSION_CURRENT[0]} {_VERSION_CURRENT[1]}"
-    prev_label = " | ".join(f"{ver} {name}" for ver, name in _VERSION_HISTORY)
+    current_label = f"{_VERSION_CURRENT[0]} — {_VERSION_CURRENT[1]}"
+    prev_label = " / ".join(f"{ver} {name}" for ver, name in _VERSION_HISTORY)
     lines = [
-        f"Versioning (The Americans): {current_label}",
-        f"Prev: {prev_label}" if prev_label else "Prev: (none)",
+        f"{current_label}",
+        f"prev: {prev_label}" if prev_label else "prev: (none)",
     ]
     return [line[: max(0, width - 1)] for line in lines]
+
+
+def _version_text_lines() -> list[str]:
+    return _banner_version_lines(10_000)
 
 
 def _draw_banner(stdscr, color_enabled: bool, color_pair: int = 1) -> int:
@@ -2593,11 +2603,12 @@ def _draw_banner(stdscr, color_enabled: bool, color_pair: int = 1) -> int:
             except curses.error:
                 pass
         y += 1
+    version_attr = curses.A_DIM
     for line in _banner_version_lines(width):
         if y >= height:
             break
         try:
-            stdscr.addstr(y, 0, line[: max(0, width - 1)], curses.A_DIM)
+            stdscr.addstr(y, 0, line[: max(0, width - 1)], version_attr)
         except curses.error:
             pass
         y += 1
