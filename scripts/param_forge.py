@@ -585,19 +585,11 @@ def _parse_recommendation_payload(payload: object) -> tuple[object | None, str |
     if payload is None:
         return None, None, False
     if isinstance(payload, dict):
-        stop_flag = bool(
-            payload.get("stop")
-            or payload.get("terminate")
-            or payload.get("local_max")
-            or payload.get("local_maximum")
-        )
-        reason = payload.get("reason") or payload.get("stop_reason") or payload.get("local_max_reason")
-        reason_text = str(reason).strip() if isinstance(reason, str) and reason.strip() else None
         if "recommendations" in payload and isinstance(payload.get("recommendations"), list):
-            return payload.get("recommendations"), reason_text, stop_flag
+            return payload.get("recommendations"), None, False
         if "setting_name" in payload:
-            return [payload], reason_text, stop_flag
-        return None, reason_text, stop_flag
+            return [payload], None, False
+        return None, None, False
     if isinstance(payload, list):
         return payload, None, False
     return None, None, False
@@ -848,11 +840,8 @@ def _normalize_rationale_cost(rationale: str, cost_token: str | None) -> str | N
 def _rewrite_rec_line(
     text: str,
     recommendations: list[dict],
-    stop_reason: str | None = None,
 ) -> str:
-    if stop_reason:
-        rec_line = "REC: local maximum reached; export latest receipt."
-    elif recommendations:
+    if recommendations:
         parts: list[str] = []
         for rec in recommendations:
             name = str(rec.get("setting_name") or "").strip()
@@ -886,6 +875,18 @@ def _strip_cost_prefix(cost_line: str | None) -> str | None:
     if stripped.upper().startswith("COST:"):
         stripped = stripped[5:].strip()
     return stripped or None
+
+
+def _parse_cost_amount(cost_line: str | None) -> float | None:
+    if not cost_line:
+        return None
+    match = re.search(r"\$?([0-9]+(?:\.[0-9]+)?)", cost_line)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except Exception:
+        return None
 
 
 def _analysis_history_line(entry: dict) -> str:
@@ -928,6 +929,8 @@ def _append_analysis_history(
     accepted: bool,
     elapsed: float | None,
     cost_line: str | None,
+    adherence: int | None,
+    quality: int | None,
 ) -> None:
     summary = _recommendations_summary(recommendations)
     history.append(
@@ -938,6 +941,8 @@ def _append_analysis_history(
             "cost": cost_line,
             "recs": summary,
             "accepted": accepted,
+            "adherence": adherence,
+            "quality": quality,
         }
     )
 
@@ -966,6 +971,32 @@ def _recommendations_rationale(recommendation: object) -> str | None:
         return None
     joined = " / ".join(rationales)
     return f"Rationale: {joined}"
+
+
+def _average_score(values: list[int | None]) -> int | None:
+    scores = [value for value in values if isinstance(value, (int, float))]
+    if not scores:
+        return None
+    return int(round(sum(scores) / len(scores)))
+
+
+def _quality_from_history(
+    history: list[dict] | None,
+    current_quality: int | None = None,
+) -> tuple[int | None, int | None]:
+    baseline = None
+    latest = None
+    for entry in history or []:
+        value = entry.get("quality")
+        if isinstance(value, int):
+            if baseline is None:
+                baseline = value
+            latest = value
+    if current_quality is not None:
+        latest = current_quality
+        if baseline is None:
+            baseline = current_quality
+    return baseline, latest
 
 
 def _compress_analysis_to_limit(text: str, limit: int, *, analyzer: str | None = None) -> str:
@@ -1653,6 +1684,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
             float | None,
             dict[str, object],
             list[str],
+            tuple[int | None, int | None],
         ]:
             stdscr.erase()
             height, width = stdscr.getmaxyx()
@@ -1708,6 +1740,8 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
             images: list[Path] = []
             cancel_requested = False
             last_elapsed: float | None = None
+            adherence_scores: list[int | None] = []
+            quality_scores: list[int | None] = []
             total_prompts = len(args.prompt)
             prompt_entries: dict[int, dict[str, object]] = {}
             max_prompt_width = max(20, width - 1)
@@ -1876,13 +1910,15 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                             curses.A_DIM,
                         )
                         stdscr.refresh()
-                        _apply_snapshot_for_result(
+                        scores = _apply_snapshot_for_result(
                             image_path=Path(res.image_path),
                             receipt_path=Path(res.receipt_path),
                             prompt=prompt,
                             elapsed=elapsed,
                             fallback_settings=_capture_call_settings(args),
                         )
+                        adherence_scores.append(scores[0])
+                        quality_scores.append(scores[1])
 
                 if local_cancel:
                     cancel_requested = True
@@ -1901,6 +1937,8 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                 y = min(height - 2, max(0, height - 3))
 
             if cancel_requested:
+                avg_adherence = _average_score(adherence_scores)
+                avg_quality = _average_score(quality_scores)
                 return (
                     receipts,
                     images,
@@ -1909,6 +1947,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                     last_elapsed,
                     current_settings,
                     [],
+                    (avg_adherence, avg_quality),
                 )
 
             history_block: list[str] = []
@@ -1933,6 +1972,8 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                 )
             if last_elapsed is not None:
                 history_block.append(f"Completed in {last_elapsed:.1f}s")
+            avg_adherence = _average_score(adherence_scores)
+            avg_quality = _average_score(quality_scores)
             return (
                 receipts,
                 images,
@@ -1941,6 +1982,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                 last_elapsed,
                 current_settings,
                 history_block,
+                (avg_adherence, avg_quality),
             )
 
         auto_analyze_next = False
@@ -1950,6 +1992,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
         stored_cost: str | None = None
         stored_speed_benchmark: float | None = None
         analysis_history: list[dict] = []
+        baseline_settings: dict[str, object] | None = None
         compare_baseline: Path | None = None
         compare_round_start: int | None = None
         compare_round_end: int | None = None
@@ -1967,6 +2010,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                 last_elapsed,
                 last_call_settings,
                 history_block,
+                round_scores,
             ) = _generate_once(
                 run_index,
                 last_call_settings,
@@ -1978,6 +2022,8 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                 if history_lines:
                     history_lines.append("")
                 history_lines.extend(history_block)
+            if baseline_settings is None and last_call_settings:
+                baseline_settings = dict(last_call_settings)
             stdscr.timeout(-1)
             if cancel_requested:
                 height, width = stdscr.getmaxyx()
@@ -2040,6 +2086,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                         last_elapsed=last_elapsed,
                         last_cost=stored_cost,
                         benchmark_elapsed=stored_speed_benchmark,
+                        round_scores=round_scores,
                     )
                     _append_analysis_history(
                         analysis_history,
@@ -2049,19 +2096,26 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                         accepted=accepted,
                         elapsed=last_elapsed,
                         cost_line=cost_line,
+                        adherence=round_scores[0],
+                        quality=round_scores[1],
                     )
                     if cost_line:
                         stored_cost = cost_line.replace("COST:", "").strip()
-                    if stop_recommended:
-                        return
                     if run_index >= MAX_ROUNDS:
                         base_settings = last_call_settings or _capture_call_settings(args)
+                        quality_baseline, quality_current = _quality_from_history(analysis_history)
                         _show_final_recommendation_curses(
                             stdscr,
                             settings=base_settings,
                             recommendation=recommendation,
                             user_goals=stored_goals,
                             color_enabled=color_enabled,
+                            last_elapsed=last_elapsed,
+                            cost_line=cost_line,
+                            quality_baseline=quality_baseline,
+                            quality_current=quality_current,
+                            receipt_path=receipts[-1] if receipts else None,
+                            baseline_settings=baseline_settings,
                         )
                         return
                     if accepted and recommendation:
@@ -2130,6 +2184,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                         last_elapsed=last_elapsed,
                         last_cost=stored_cost,
                         benchmark_elapsed=stored_speed_benchmark,
+                        round_scores=round_scores,
                     )
                     _append_analysis_history(
                         analysis_history,
@@ -2139,19 +2194,26 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                         accepted=accepted,
                         elapsed=last_elapsed,
                         cost_line=cost_line,
+                        adherence=round_scores[0],
+                        quality=round_scores[1],
                     )
                     if cost_line:
                         stored_cost = cost_line.replace("COST:", "").strip()
-                    if stop_recommended:
-                        return
                     if run_index >= MAX_ROUNDS:
                         base_settings = last_call_settings or _capture_call_settings(args)
+                        quality_baseline, quality_current = _quality_from_history(analysis_history)
                         _show_final_recommendation_curses(
                             stdscr,
                             settings=base_settings,
                             recommendation=recommendation,
                             user_goals=user_goals,
                             color_enabled=color_enabled,
+                            last_elapsed=last_elapsed,
+                            cost_line=cost_line,
+                            quality_baseline=quality_baseline,
+                            quality_current=quality_current,
+                            receipt_path=receipts[-1] if receipts else None,
+                            baseline_settings=baseline_settings,
                         )
                         return
                     if accepted and recommendation:
@@ -2838,7 +2900,7 @@ def _apply_snapshot_for_result(
     prompt: str,
     elapsed: float | None,
     fallback_settings: dict[str, object],
-) -> None:
+) -> tuple[int | None, int | None]:
     provider = fallback_settings.get("provider")
     model = fallback_settings.get("model")
     size = fallback_settings.get("size")
@@ -2875,6 +2937,7 @@ def _apply_snapshot_for_result(
         quality=quality,
     )
     _apply_snapshot_overlay(image_path, lines)
+    return adherence, quality
 
 
 def _diff_call_settings(prev: dict[str, object], current: dict[str, object]) -> list[str]:
@@ -2953,6 +3016,43 @@ def _format_setting_value(value: object, *, depth: int = 0) -> str:
             return "{...}"
         return _format_dict_inline(value, depth=depth + 1)
     return str(value)
+
+
+def _size_area_estimate(size_value: object) -> float | None:
+    if not isinstance(size_value, str):
+        return None
+    raw = size_value.strip().lower()
+    if not raw:
+        return None
+    if "x" in raw:
+        parts = raw.split("x", 1)
+        try:
+            w = int(float(parts[0].strip()))
+            h = int(float(parts[1].strip()))
+        except Exception:
+            return None
+        if w <= 0 or h <= 0:
+            return None
+        return float(w * h)
+    if raw in {"portrait", "tall"}:
+        return float(1024 * 1536)
+    if raw in {"landscape", "wide"}:
+        return float(1536 * 1024)
+    if raw in {"square", "1:1"}:
+        return float(1024 * 1024)
+    if ":" in raw:
+        parts = raw.split(":", 1)
+        try:
+            w = float(parts[0].strip())
+            h = float(parts[1].strip())
+        except Exception:
+            return None
+        if w <= 0 or h <= 0:
+            return None
+        base = 1024.0
+        height = base * (h / w)
+        return base * height
+    return None
 
 
 def _format_dict_inline(data: dict, *, max_items: int = 8, depth: int = 0) -> str:
@@ -3134,11 +3234,6 @@ def _build_receipt_detail_lines(
         _append_wrapped(warning_line)
 
     _append("")
-    if stop_reason:
-        _append("LOCAL MAXIMUM", "section")
-        _append_wrapped(stop_reason)
-        _append_wrapped("Recommendation: export the latest receipt and stop iterating.")
-        _append("")
 
     _append("RECOMMENDATIONS", "section")
     recommendations = _normalize_recommendations(recommendation)
@@ -3195,6 +3290,45 @@ def _settings_after_recommendation(
     return _capture_call_settings(temp_args)
 
 
+def _settings_from_receipt(
+    receipt: dict | None,
+    *,
+    fallback_provider: str,
+    fallback_model: str | None,
+    fallback_size: str,
+    fallback_n: int,
+) -> dict[str, object]:
+    resolved = receipt.get("resolved") if isinstance(receipt, dict) else None
+    request = receipt.get("request") if isinstance(receipt, dict) else None
+    settings: dict[str, object] = {
+        "provider": fallback_provider,
+        "model": fallback_model,
+        "size": fallback_size,
+        "n": fallback_n,
+        "seed": None,
+        "output_format": None,
+        "background": None,
+        "provider_options": {},
+    }
+    for key in ("provider", "model", "size", "n", "seed", "output_format", "background"):
+        value = None
+        if isinstance(resolved, dict):
+            value = resolved.get(key)
+        if value is None and isinstance(request, dict):
+            value = request.get(key)
+        if value is not None:
+            settings[key] = value
+    provider_options = None
+    if isinstance(request, dict):
+        provider_options = request.get("provider_options")
+    if not (isinstance(provider_options, dict) and provider_options):
+        if isinstance(resolved, dict):
+            provider_options = resolved.get("provider_params")
+    if isinstance(provider_options, dict):
+        settings["provider_options"] = dict(provider_options)
+    return settings
+
+
 def _build_final_recommendation_lines(
     settings: dict[str, object],
     recommendation: object,
@@ -3202,6 +3336,10 @@ def _build_final_recommendation_lines(
     user_goals: list[str] | None,
     max_width: int,
     return_tags: bool = False,
+    last_elapsed: float | None = None,
+    cost_line: str | None = None,
+    quality_baseline: int | None = None,
+    quality_current: int | None = None,
 ) -> list[object]:
     lines: list[object] = []
 
@@ -3229,6 +3367,71 @@ def _build_final_recommendation_lines(
             _append_wrapped(f"{prefix}{diff}", "change")
     else:
         _append_wrapped("No changes recommended.", "change")
+
+    goals = set(user_goals or [])
+    if goals:
+        cost_current = _estimate_cost_value(
+            provider=str(settings.get("provider")) if settings.get("provider") else None,
+            model=str(settings.get("model")) if settings.get("model") else None,
+            size=str(settings.get("size")) if settings.get("size") else None,
+        )
+        if cost_current is None:
+            cost_current = _parse_cost_amount(cost_line)
+        cost_next = _estimate_cost_value(
+            provider=str(recommended_settings.get("provider"))
+            if recommended_settings.get("provider")
+            else None,
+            model=str(recommended_settings.get("model")) if recommended_settings.get("model") else None,
+            size=str(recommended_settings.get("size")) if recommended_settings.get("size") else None,
+        )
+        if cost_next is None and cost_current is not None:
+            cost_next = cost_current
+
+        time_current = last_elapsed
+        time_next = None
+        if (
+            time_current is not None
+            and cost_current is not None
+            and cost_next is not None
+            and cost_current > 0
+        ):
+            time_next = time_current * (cost_next / cost_current)
+        elif time_current is not None:
+            area_current = _size_area_estimate(settings.get("size"))
+            area_next = _size_area_estimate(recommended_settings.get("size"))
+            if area_current and area_next and area_current > 0:
+                time_next = time_current * (area_next / area_current)
+
+        gain_lines: list[str] = []
+        if "minimize cost of render" in goals and cost_current is not None and cost_next is not None and cost_current > 0:
+            delta = (cost_next - cost_current) / cost_current
+            if abs(delta) >= 0.005:
+                pct = abs(delta) * 100.0
+                direction = "decrease" if delta < 0 else "increase"
+                gain_lines.append(f"Cost: {pct:.0f}% {direction}")
+        if "minimize time to render" in goals and time_current is not None and time_next is not None and time_current > 0:
+            delta = (time_next - time_current) / time_current
+            if abs(delta) >= 0.005:
+                pct = abs(delta) * 100.0
+                direction = "decrease" if delta < 0 else "increase"
+                gain_lines.append(f"Time: {pct:.0f}% {direction}")
+        if "maximize quality of render" in goals:
+            if "minimize cost of render" in goals or "minimize time to render" in goals:
+                gain_lines.append("Quality: secondary to cost/time goals")
+            elif quality_baseline is not None and quality_current is not None and quality_baseline > 0:
+                delta = quality_current - quality_baseline
+                pct = (delta / quality_baseline) * 100.0
+                direction = "increase" if delta >= 0 else "decrease"
+                gain_lines.append(f"Quality: {abs(pct):.0f}% {direction}")
+            else:
+                gain_lines.append("Quality: N/A (no baseline)")
+
+        if gain_lines:
+            _append_wrapped("Expected gains:", "section")
+            for line in gain_lines:
+                _append_wrapped(line, "goal")
+        else:
+            _append_wrapped("Expected gains: none (no changes recommended).", "goal")
     return lines
 
 
@@ -3239,6 +3442,12 @@ def _show_final_recommendation_curses(
     recommendation: object,
     user_goals: list[str] | None,
     color_enabled: bool,
+    last_elapsed: float | None = None,
+    cost_line: str | None = None,
+    quality_baseline: int | None = None,
+    quality_current: int | None = None,
+    receipt_path: Path | None = None,
+    baseline_settings: dict[str, object] | None = None,
 ) -> None:
     import curses
     height, width = stdscr.getmaxyx()
@@ -3249,15 +3458,41 @@ def _show_final_recommendation_curses(
         user_goals=user_goals,
         max_width=max_width,
         return_tags=True,
+        last_elapsed=last_elapsed,
+        cost_line=cost_line,
+        quality_baseline=quality_baseline,
+        quality_current=quality_current,
     )
-    _render_scrollable_text_with_banner(
-        stdscr,
-        title_line=f"Final recommendation (max {MAX_ROUNDS} rounds)",
-        body_lines=lines,
-        footer_line="Press Q or Enter to exit",
-        color_enabled=color_enabled,
-        footer_attr=curses.A_DIM,
-    )
+    if baseline_settings:
+        recommended_settings = _settings_after_recommendation(settings, recommendation) if recommendation else settings
+        diff_lines = _diff_call_settings(baseline_settings, recommended_settings)
+        if diff_lines:
+            lines.append("")
+            lines.append(("Changes vs Round 1 baseline", "section"))
+            for diff in diff_lines:
+                prefix = "Change: " if not diff.startswith("Change:") else ""
+                for line in _wrap_text(f"{prefix}{diff}", max_width):
+                    lines.append((line, "change"))
+    footer_line = "Open receipt (o) • Press Q or Enter to exit"
+    open_keys = {ord("o"), ord("O")} if receipt_path else None
+    hotkeys = None
+    if receipt_path:
+        hotkeys = {"o": curses.color_pair(1) | curses.A_BOLD if color_enabled else curses.A_BOLD}
+    while True:
+        action = _render_scrollable_text_with_banner(
+            stdscr,
+            title_line=f"Final recommendation (max {MAX_ROUNDS} rounds)",
+            body_lines=lines,
+            footer_line=footer_line if receipt_path else "Press Q or Enter to exit",
+            color_enabled=color_enabled,
+            footer_attr=curses.A_DIM,
+            footer_hotkeys=hotkeys,
+            open_keys=open_keys,
+        )
+        if action == "open" and receipt_path:
+            _open_path(receipt_path)
+            continue
+        break
 
 
 
@@ -3496,11 +3731,14 @@ def _show_receipt_analysis_curses(
     last_elapsed: float | None = None,
     last_cost: str | None = None,
     benchmark_elapsed: float | None = None,
+    round_scores: tuple[int | None, int | None] | None = None,
 ) -> tuple[list[dict] | None, str | None, bool, bool]:
     import curses
     analyzer_key = _normalize_analyzer(analyzer)
     cost_line: str | None = None
     pre_cost_line: str | None = None
+    current_round = len(analysis_history or []) + 1
+    rounds_left = max(0, MAX_ROUNDS - current_round)
     if user_goals and "minimize cost of render" in user_goals and not last_cost:
         pre_cost_line = _estimate_cost_only(
             provider=provider,
@@ -3537,6 +3775,11 @@ def _show_receipt_analysis_curses(
         goals_attr = curses.color_pair(4) | curses.A_BOLD if color_enabled else curses.A_BOLD
         _safe_addstr(stdscr, y, 0, goals_text[: max(0, width - 1)], goals_attr)
         y += 1
+    if y < height - 1:
+        rounds_text = f"Rounds left: {rounds_left} (of {MAX_ROUNDS})"
+        rounds_attr = curses.color_pair(4) | curses.A_BOLD if color_enabled else curses.A_BOLD
+        _safe_addstr(stdscr, y, 0, rounds_text[: max(0, width - 1)], rounds_attr)
+        y += 1
     if user_goals and "minimize time to render" in user_goals and y < height - 1:
         if benchmark_elapsed is not None and last_elapsed is not None:
             speed_text = f"Speed benchmark: {benchmark_elapsed:.1f}s → latest {last_elapsed:.1f}s"
@@ -3570,6 +3813,7 @@ def _show_receipt_analysis_curses(
                 user_goals=user_goals,
                 user_notes=user_notes,
                 history_text=history_text,
+                history_rounds=len(analysis_history or []),
             )
         except Exception as exc:
             result_holder["error"] = exc
@@ -3601,6 +3845,7 @@ def _show_receipt_analysis_curses(
         )
         return None, pre_cost_line or cost_line, False, False
     analysis, citations, recommendation, cost_line, stop_reason = result_holder.get("payload")  # type: ignore[misc]
+    stop_reason = None
     if not cost_line and pre_cost_line:
         cost_line = pre_cost_line
     recommendations = _normalize_recommendations(recommendation)
@@ -3608,9 +3853,7 @@ def _show_receipt_analysis_curses(
         recommendation = None
     else:
         recommendation = recommendations
-    stop_recommended = bool(stop_reason)
-    if stop_recommended:
-        recommendation = None
+    stop_recommended = False
 
     comparison_lines: list[str] = []
     if benchmark_elapsed is not None and last_elapsed is not None:
@@ -3632,6 +3875,10 @@ def _show_receipt_analysis_curses(
 
     detail_lines: list[object] = []
     receipt_payload: dict | None = None
+    quality_baseline, quality_current = _quality_from_history(
+        analysis_history or [],
+        round_scores[1] if round_scores else None,
+    )
     try:
         receipt_payload = _load_receipt_payload(receipt_path)
         detail_lines = _build_receipt_detail_lines(
@@ -3639,7 +3886,7 @@ def _show_receipt_analysis_curses(
             recommendation,
             max_width=max(20, width - 2),
             return_tags=True,
-            stop_reason=stop_reason,
+            stop_reason=None,
         )
     except Exception as exc:
         detail_lines = _wrap_text(f"Render settings unavailable: {exc}", max(20, width - 2))
@@ -3649,6 +3896,8 @@ def _show_receipt_analysis_curses(
         goals_text = ", ".join(user_goals)
         lines.append((f"User goals: {goals_text}", "goal"))
         lines.append("")
+    lines.append((f"Rounds left: {rounds_left} (of {MAX_ROUNDS})", "goal"))
+    lines.append("")
     lines.append("MODEL ANALYSIS (LLM)")
     lines.append("")
     if analysis:
@@ -3659,6 +3908,28 @@ def _show_receipt_analysis_curses(
     if detail_lines:
         lines.append("")
         lines.extend(detail_lines)
+    if not recommendations:
+        summary_settings = _settings_from_receipt(
+            receipt_payload,
+            fallback_provider=provider,
+            fallback_model=model,
+            fallback_size=size,
+            fallback_n=n,
+        )
+        lines.append("")
+        lines.extend(
+            _build_final_recommendation_lines(
+                summary_settings,
+                None,
+                user_goals=user_goals,
+                max_width=max(20, width - 2),
+                return_tags=True,
+                last_elapsed=last_elapsed,
+                cost_line=cost_line,
+                quality_baseline=quality_baseline,
+                quality_current=quality_current,
+            )
+        )
 
     rec_label = "recommendations" if recommendations and len(recommendations) > 1 else "recommendation"
     footer_line = (
@@ -3669,7 +3940,7 @@ def _show_receipt_analysis_curses(
     footer_attr = curses.color_pair(4) | curses.A_BOLD if color_enabled else curses.A_BOLD
     hotkeys = None
     accept_keys = None
-    if allow_rerun and recommendations and not stop_recommended:
+    if allow_rerun and recommendations:
         hotkeys = {
             "y": curses.color_pair(1) | curses.A_BOLD if color_enabled else curses.A_BOLD,
             "q": curses.color_pair(1) | curses.A_BOLD if color_enabled else curses.A_BOLD,
@@ -3731,7 +4002,7 @@ def _show_receipt_analysis_curses(
                             receipt_payload,
                             recommendation,
                             max_width=120,
-                            stop_reason=stop_reason,
+                            stop_reason=None,
                         )
                         if isinstance(line, str)
                     ]
@@ -4812,6 +5083,8 @@ def _build_receipt_analysis_prompt(
     history_text: str | None = None,
     model_options_line: str | None = None,
     enable_web_search: bool = True,
+    current_round: int = 1,
+    max_rounds: int = MAX_ROUNDS,
 ) -> str:
     explicit_lines = "\n".join(f"- {key}: {value}" for key, value in explicit_fields.items())
     allowed_line = ", ".join(allowed_settings) if allowed_settings else "(none)"
@@ -4837,6 +5110,7 @@ def _build_receipt_analysis_prompt(
             "Use the web_search tool to find model/provider settings and pricing that best achieve the user's goals. "
             "Base recommendations and cost estimate on documented settings for the selected provider/model. "
         )
+    remaining_rounds = max(0, max_rounds - current_round)
     return (
         "You are an expert image-generation assistant. An image output is attached. "
         "Respond with EXACTLY four lines labeled ADH, UNSET, COST, REC, then a <setting_json> block. "
@@ -4849,12 +5123,17 @@ def _build_receipt_analysis_prompt(
         "If speed is a priority, you may suggest unconventional levers (e.g., output format/filetype, "
         "compression, or size tradeoffs) in addition to standard settings. "
         "Prefer step-change recommendations over incremental tweaks (avoid tiny deltas like steps 20→30); "
-        "think big and unconventional when it helps meet the goals.\n\n"
+        "think big and unconventional when it helps meet the goals.\n"
+        f"You have at most {max_rounds} total rounds. This is round {current_round}; "
+        f"{remaining_rounds} round(s) remain after this. "
+        "Plan a coherent testing path and avoid flip-flopping settings (e.g., jpeg→png→jpeg) unless there's a strong reason.\n\n"
         f"Target prompt:\n{target_prompt}\n\n"
         f"Explicitly set in the flow:\n{explicit_lines}\n\n"
         f"User goals (multi-select): {goals_line}\n"
         "If the user selected 'maximize quality of render', treat this as an optimization problem: "
-        "prioritize maximizing prompt adherence and LLM-rated image quality, even if it increases cost/time.\n"
+        "prioritize maximizing prompt adherence and LLM-rated image quality, even if it increases cost/time. "
+        "However, if the user also selected 'minimize cost of render' or 'minimize time to render', "
+        "those goals take precedence and quality becomes secondary.\n"
         f"User notes: {notes_line or '(none)'}\n\n"
         f"{web_search_text}"
         f"{history_block}"
@@ -4864,9 +5143,6 @@ def _build_receipt_analysis_prompt(
         "Use setting_target='provider_options' for provider-specific options, "
         "and setting_target='request' for top-level settings like size, n, seed, "
         "output_format, background, or model.\n\n"
-        "If you have reached a local maximum for the user's goals, you may signal stopping by "
-        "returning <setting_json>{\"stop\": true, \"reason\": \"...\", \"recommendations\": [...]}</setting_json> "
-        "(recommendations can be empty). When stop=true, recommend exporting the latest receipt.\n\n"
         "At the end, output a JSON array (max 3 items) wrapped in <setting_json>...</setting_json> "
         "with objects that include keys: setting_name, setting_value, setting_target, rationale. "
         "If no safe recommendation, output an empty array.\n\n"
@@ -4886,6 +5162,8 @@ def _build_recommendation_only_prompt(
     history_text: str | None = None,
     model_options_line: str | None = None,
     enable_web_search: bool = True,
+    current_round: int = 1,
+    max_rounds: int = MAX_ROUNDS,
 ) -> str:
     allowed_line = ", ".join(allowed_settings) if allowed_settings else "(none)"
     model_label = model or "(default)"
@@ -4903,6 +5181,7 @@ def _build_recommendation_only_prompt(
             "Use the web_search tool to find model/provider settings that best achieve the user's goals. "
             "Base recommendations on documented settings for the selected provider/model.\n"
         )
+    remaining_rounds = max(0, max_rounds - current_round)
     return (
         "You are an expert image-generation assistant. "
         "Based on the receipt summary, recommend 1–3 API setting changes to improve prompt adherence. "
@@ -4912,7 +5191,9 @@ def _build_recommendation_only_prompt(
         f"Provider: {provider}\nModel: {model_label}\n"
         f"User goals (multi-select): {goals_line}\n"
         "If the user selected 'maximize quality of render', treat this as an optimization problem: "
-        "prioritize maximizing prompt adherence and LLM-rated image quality, even if it increases cost/time.\n"
+        "prioritize maximizing prompt adherence and LLM-rated image quality, even if it increases cost/time. "
+        "However, if the user also selected 'minimize cost of render' or 'minimize time to render', "
+        "those goals take precedence and quality becomes secondary.\n"
         f"User notes: {notes_line or '(none)'}\n"
         f"{web_search_text}"
         f"{history_block}"
@@ -4921,13 +5202,15 @@ def _build_recommendation_only_prompt(
         "compression, or size tradeoffs) but still choose from the allowed list. "
         "Prefer step-change recommendations over incremental tweaks (avoid tiny deltas like steps 20→30); "
         "think big and unconventional when it helps meet the goals.\n"
+        "If cost/time goals are selected, treat them as primary and only pursue quality improvements "
+        "that do not materially worsen cost/time.\n"
+        f"You have at most {max_rounds} total rounds. This is round {current_round}; "
+        f"{remaining_rounds} round(s) remain after this. "
+        "Plan a coherent testing path and avoid flip-flopping settings unless there's a strong reason.\n"
         "Model changes must stay within the same provider and use the listed model options.\n"
         "Use setting_target='provider_options' for provider-specific options, "
         "and setting_target='request' for top-level settings like size, n, seed, "
         "output_format, background, or model.\n"
-        "If you have reached a local maximum for the user's goals, you may signal stopping by "
-        "returning <setting_json>{\"stop\": true, \"reason\": \"...\", \"recommendations\": [...]}</setting_json> "
-        "(recommendations can be empty). When stop=true, recommend exporting the latest receipt.\n"
         f"Allowed settings: {allowed_line}\n\n"
         f"Receipt summary JSON:\n{summary_json}"
     )
@@ -4945,6 +5228,7 @@ def _analyze_receipt_payload(
     user_goals: list[str] | None = None,
     user_notes: str | None = None,
     history_text: str | None = None,
+    history_rounds: int = 0,
 ) -> tuple[str, list[dict[str, str]], list[dict] | None, str | None, str | None]:
     analyzer_key = _normalize_analyzer(analyzer)
     receipt = _load_receipt_payload(receipt_path)
@@ -4977,6 +5261,7 @@ def _analyze_receipt_payload(
     }
     summary_json = json.dumps(summary, indent=2, ensure_ascii=True)
     allow_web_search = analyzer_key in {"anthropic", "council"}
+    current_round = max(1, history_rounds + 1)
     prompt = _build_receipt_analysis_prompt(
         receipt=receipt,
         explicit_fields=explicit_fields,
@@ -4987,6 +5272,8 @@ def _analyze_receipt_payload(
         history_text=history_text,
         model_options_line=model_options_line,
         enable_web_search=allow_web_search,
+        current_round=current_round,
+        max_rounds=MAX_ROUNDS,
     )
     fallback_prompt = None
     if allow_web_search:
@@ -5000,6 +5287,8 @@ def _analyze_receipt_payload(
             history_text=history_text,
             model_options_line=model_options_line,
             enable_web_search=False,
+            current_round=current_round,
+            max_rounds=MAX_ROUNDS,
         )
     image_base64 = None
     image_mime = None
@@ -5025,6 +5314,8 @@ def _analyze_receipt_payload(
     analysis_text = _normalize_rec_line(analysis_text)
     cleaned_text, recommendation_payload = _extract_setting_json(analysis_text)
     recs_payload, stop_reason, stop_recommended = _parse_recommendation_payload(recommendation_payload)
+    stop_reason = None
+    stop_recommended = False
     cleaned_text = _normalize_rec_line(cleaned_text)
     rec_text = _rec_line_text(cleaned_text)
     recommendations = _normalize_recommendations(recs_payload)
@@ -5051,9 +5342,7 @@ def _analyze_receipt_payload(
         size=size,
         n=n,
     )
-    if stop_recommended:
-        recommendations = []
-    cleaned_text = _rewrite_rec_line(cleaned_text, recommendations, stop_reason)
+    cleaned_text = _rewrite_rec_line(cleaned_text, recommendations)
     if not recommendations:
         fallback_prompt = _build_recommendation_only_prompt(
             summary_json=summary_json,
@@ -5065,6 +5354,8 @@ def _analyze_receipt_payload(
             history_text=history_text,
             model_options_line=model_options_line,
             enable_web_search=allow_web_search,
+            current_round=current_round,
+            max_rounds=MAX_ROUNDS,
         )
         fallback_prompt_no_search = None
         if allow_web_search:
@@ -5078,6 +5369,8 @@ def _analyze_receipt_payload(
                 history_text=history_text,
                 model_options_line=model_options_line,
                 enable_web_search=False,
+                current_round=current_round,
+                max_rounds=MAX_ROUNDS,
             )
         fallback_text, _ = _call_analyzer(
             fallback_prompt,
@@ -5087,6 +5380,8 @@ def _analyze_receipt_payload(
         )
         _, fallback_payload = _extract_setting_json(fallback_text)
         recs_payload, fallback_stop_reason, fallback_stop = _parse_recommendation_payload(fallback_payload)
+        fallback_stop_reason = None
+        fallback_stop = False
         recommendations = _normalize_recommendations(recs_payload)
         recommendations = _filter_noop_recommendations(
             recommendations,
@@ -5104,10 +5399,7 @@ def _analyze_receipt_payload(
             size=size,
             n=n,
         )
-        if fallback_stop:
-            stop_reason = fallback_stop_reason or stop_reason
-            recommendations = []
-        cleaned_text = _rewrite_rec_line(cleaned_text, recommendations, stop_reason)
+        cleaned_text = _rewrite_rec_line(cleaned_text, recommendations)
     return cleaned_text, citations, recommendations or None, cost_line, stop_reason
 
 
@@ -5126,7 +5418,7 @@ def _analyze_receipt(
     if analyzer_key == "council":
         print("Note: Council analysis can take a few minutes.")
     try:
-        analysis, citations, recommendation, _, stop_reason = _analyze_receipt_payload(
+        analysis, citations, recommendation, cost_line, stop_reason = _analyze_receipt_payload(
             receipt_path=receipt_path,
             provider=provider,
             model=model,
@@ -5144,8 +5436,32 @@ def _analyze_receipt(
             receipt_payload,
             recommendation,
             max_width=max(40, _term_width() - 2),
-            stop_reason=stop_reason,
+            stop_reason=None,
         )
+        if not recommendation:
+            summary_settings = _settings_from_receipt(
+                receipt_payload,
+                fallback_provider=provider,
+                fallback_model=model,
+                fallback_size=size,
+                fallback_n=n,
+            )
+            detail_lines.append("")
+            detail_lines.extend(
+                [
+                    line
+                    for line in _build_final_recommendation_lines(
+                        summary_settings,
+                        None,
+                        user_goals=None,
+                        max_width=max(40, _term_width() - 2),
+                        return_tags=False,
+                        last_elapsed=None,
+                        cost_line=cost_line,
+                    )
+                    if isinstance(line, str)
+                ]
+            )
     except Exception:
         detail_lines = []
     print("\nMODEL ANALYSIS (LLM):")
