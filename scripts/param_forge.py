@@ -942,6 +942,32 @@ def _append_analysis_history(
     )
 
 
+def _recommendations_rationale(recommendation: object) -> str | None:
+    recs = _normalize_recommendations(recommendation)
+    if not recs:
+        return None
+    rationales: list[str] = []
+    seen: set[str] = set()
+    for rec in recs:
+        rationale = rec.get("rationale")
+        if not isinstance(rationale, str):
+            continue
+        cleaned = rationale.strip()
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        rationales.append(cleaned)
+        if len(rationales) >= 2:
+            break
+    if not rationales:
+        return None
+    joined = " / ".join(rationales)
+    return f"Rationale: {joined}"
+
+
 def _compress_analysis_to_limit(text: str, limit: int, *, analyzer: str | None = None) -> str:
     if len(text) <= limit:
         return text
@@ -1618,6 +1644,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
             round_index: int,
             prev_settings: dict[str, object] | None,
             history_lines: list[str],
+            rationale_line: str | None,
         ) -> tuple[
             list[Path],
             list[Path],
@@ -1654,6 +1681,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                 prev_settings=prev_settings,
                 current_settings=current_settings,
                 color_enabled=color_enabled,
+                rationale_line=rationale_line,
             )
             if y < height - 1:
                 try:
@@ -1929,6 +1957,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
         run_index = 1
         last_call_settings: dict[str, object] | None = None
         history_lines: list[str] = []
+        pending_rationale: str | None = None
         while True:
             (
                 receipts,
@@ -1938,7 +1967,13 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                 last_elapsed,
                 last_call_settings,
                 history_block,
-            ) = _generate_once(run_index, last_call_settings, history_lines)
+            ) = _generate_once(
+                run_index,
+                last_call_settings,
+                history_lines,
+                pending_rationale,
+            )
+            pending_rationale = None
             if history_block:
                 if history_lines:
                     history_lines.append("")
@@ -2031,6 +2066,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                         return
                     if accepted and recommendation:
                         if _apply_recommendation(args, recommendation):
+                            pending_rationale = _recommendations_rationale(recommendation)
                             goals_text = ", ".join(stored_goals) if stored_goals else "your goal"
                             summary = _recommendations_summary(recommendation)
                             if summary:
@@ -2120,6 +2156,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                         return
                     if accepted and recommendation:
                         if _apply_recommendation(args, recommendation):
+                            pending_rationale = _recommendations_rationale(recommendation)
                             goals_text = ", ".join(user_goals) if user_goals else "your goal"
                             summary = _recommendations_summary(recommendation)
                             if summary:
@@ -2877,6 +2914,7 @@ def _render_generation_header(
     prev_settings: dict[str, object] | None,
     current_settings: dict[str, object],
     color_enabled: bool,
+    rationale_line: str | None = None,
 ) -> int:
     import curses
     header_attr = curses.color_pair(4) | curses.A_BOLD if color_enabled else curses.A_BOLD
@@ -2891,6 +2929,10 @@ def _render_generation_header(
         attr = header_attr if idx == 0 else change_attr
         _safe_addstr(stdscr, y, 0, line[: max(0, width - 1)], attr)
         y += 1
+        if idx == 0 and rationale_line:
+            for wrapped in _wrap_text(rationale_line, max(20, width - 1)):
+                _safe_addstr(stdscr, y, 0, wrapped[: max(0, width - 1)], header_attr)
+                y += 1
     return y
 
 
