@@ -85,6 +85,11 @@ _BANNER = [
     "██║      ╚██████╔╝ ██║  ██║ ╚██████╔╝███████╗",
     "╚═╝       ╚═════╝  ╚═╝  ╚═╝  ╚═════╝ ╚══════╝",
 ]
+_VERSION_CURRENT = ("v0.6.0", "START")
+_VERSION_HISTORY = [
+    ("v0.5.0", "The Colonel"),
+    ("v0.4.0", "Pilot"),
+]
 _MIN_CURSES_WIDTH = max(40, max(len(line) for line in _BANNER))
 _MIN_CURSES_HEIGHT = max(12, len(_BANNER) + 2)
 
@@ -2556,6 +2561,16 @@ def _line_text_and_attr(line: object, *, color_enabled: bool) -> tuple[str, int]
     return str(line), curses.A_NORMAL
 
 
+def _banner_version_lines(width: int) -> list[str]:
+    current_label = f"{_VERSION_CURRENT[0]} {_VERSION_CURRENT[1]}"
+    prev_label = " | ".join(f"{ver} {name}" for ver, name in _VERSION_HISTORY)
+    lines = [
+        f"Versioning (The Americans): {current_label}",
+        f"Prev: {prev_label}" if prev_label else "Prev: (none)",
+    ]
+    return [line[: max(0, width - 1)] for line in lines]
+
+
 def _draw_banner(stdscr, color_enabled: bool, color_pair: int = 1) -> int:
     import curses
     height, width = stdscr.getmaxyx()
@@ -2577,6 +2592,14 @@ def _draw_banner(stdscr, color_enabled: bool, color_pair: int = 1) -> int:
                 stdscr.addstr(y, 0, truncated)
             except curses.error:
                 pass
+        y += 1
+    for line in _banner_version_lines(width):
+        if y >= height:
+            break
+        try:
+            stdscr.addstr(y, 0, line[: max(0, width - 1)], curses.A_DIM)
+        except curses.error:
+            pass
         y += 1
     return y
 
