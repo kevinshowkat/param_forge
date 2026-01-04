@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import math
 import re
 import sys
 import threading
@@ -114,6 +115,13 @@ def _load_repo_dotenv() -> Path | None:
     return None
 
 
+def _env_flag(name: str) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return False
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _ensure_modulette_on_path() -> None:
     try:
         import modulette  # noqa: F401
@@ -190,15 +198,21 @@ _RAINBOW_COLORS = [
 
 ANTHROPIC_ENDPOINT = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_MODEL = "claude-opus-4-5-20251101"
-ANTHROPIC_MAX_TOKENS = 350
+ANTHROPIC_MAX_TOKENS = 1400
+ANTHROPIC_THINKING_BUDGET = 1024
 ANALYSIS_MAX_CHARS = 500
 RECEIPT_ANALYZER_ENV = "RECEIPT_ANALYZER"
-ANALYZER_CHOICES = ("anthropic", "openai")
+ANALYZER_CHOICES = ("anthropic", "openai", "council")
 DEFAULT_ANALYZER = "anthropic"
 OPENAI_ANALYZER_MODEL = "gpt-5.2"
 OPENAI_MAX_OUTPUT_TOKENS = 350
+GEMINI_ANALYZER_MODEL = "gemini-3-pro-preview"
+OPENAI_STREAM_ENV = "OPENAI_IMAGE_STREAM"
+OPENAI_RESPONSES_ENV = "OPENAI_IMAGE_USE_RESPONSES"
 OPENAI_RESPONSES_ENDPOINT = "https://api.openai.com/v1/responses"
 OPENAI_CHAT_ENDPOINT = "https://api.openai.com/v1/chat/completions"
+GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta"
+MAX_ROUNDS = 3
 
 _COST_ESTIMATE_CACHE: dict[tuple[str, str | None, str], str] = {}
 _PRICING_REFERENCE_CACHE: dict | None = None
@@ -379,6 +393,15 @@ def _normalize_provider_and_model(provider: str, model: str | None) -> tuple[str
     return provider_key, model
 
 
+def _is_openai_gpt_image(provider: str | None, model: str | None) -> bool:
+    if (provider or "").strip().lower() != "openai":
+        return False
+    model_key = (model or "").strip().lower()
+    if not model_key:
+        return True
+    return model_key.startswith("gpt-image")
+
+
 def _normalize_analyzer(value: str | None) -> str:
     if not value:
         return DEFAULT_ANALYZER
@@ -400,6 +423,8 @@ def _analyzer_display_name(analyzer: str) -> str:
     analyzer_key = analyzer.strip().lower()
     if analyzer_key == "openai":
         return "OpenAI GPT-5.2"
+    if analyzer_key == "council":
+        return "Council (GPT-5.2 + Claude Opus 4.5 + Gemini 3 Pro)"
     return "Claude Opus 4.5"
 
 
@@ -422,11 +447,127 @@ def _allowed_settings_for_provider(provider: str) -> list[str]:
     if provider == "imagen":
         return ["add_watermark", "person_generation"]
     if provider == "flux":
-        return ["seed", "poll_timeout", "request_timeout"]
+        return [
+            "endpoint",
+            "url",
+            "model",
+            "poll_interval",
+            "poll_timeout",
+            "request_timeout",
+            "download_timeout",
+            "prompt_upsampling",
+            "guidance",
+            "steps",
+            "safety_tolerance",
+        ]
     return []
 
 
-def _extract_setting_json(text: str) -> tuple[str, dict | None]:
+def _allowed_models_for_provider(provider: str | None, current_model: str | None = None) -> list[str]:
+    if not provider:
+        return [current_model] if current_model else []
+    provider_key, model_key = _normalize_provider_and_model(str(provider), current_model)
+    models = list(MODEL_CHOICES_BY_PROVIDER.get(provider_key, []))
+    if model_key and model_key not in models:
+        models.append(model_key)
+    return models
+
+
+def _model_options_line(provider: str, size: str, current_model: str | None) -> str:
+    models = _allowed_models_for_provider(provider, current_model)
+    if not models:
+        return ""
+    items: list[str] = []
+    for model in models:
+        cost = _estimate_cost_value(provider=provider, model=model, size=size)
+        if cost is not None:
+            items.append(f"{model} (~${_format_price(cost)})")
+        else:
+            items.append(str(model))
+    return "Model options (same provider): " + ", ".join(items)
+
+
+def _allowed_settings_for_receipt(receipt: dict, provider: str | None = None) -> list[str]:
+    allowed: set[str] = set()
+    blocked_top_level = {
+        "prompt",
+        "mode",
+        "out_dir",
+        "inputs",
+        "user",
+        "metadata",
+        "stream",
+        "partial_images",
+        "provider",
+    }
+    blocked_resolved = {"width", "height", "aspect_ratio"}
+    top_level_keys = {"size", "n", "seed", "output_format", "background", "model"}
+
+    provider_key = provider
+    if not provider_key and isinstance(receipt, dict):
+        resolved_provider = None
+        request_provider = None
+        resolved = receipt.get("resolved") if isinstance(receipt.get("resolved"), dict) else None
+        request = receipt.get("request") if isinstance(receipt.get("request"), dict) else None
+        if isinstance(resolved, dict):
+            resolved_provider = resolved.get("provider")
+        if isinstance(request, dict):
+            request_provider = request.get("provider")
+        provider_key = resolved_provider or request_provider
+    if provider_key:
+        provider_key, _ = _normalize_provider_and_model(str(provider_key), None)
+
+    for key in top_level_keys:
+        allowed.add(key)
+
+    if provider_key:
+        allowed.update(_allowed_settings_for_provider(provider_key))
+
+    request = receipt.get("request") if isinstance(receipt, dict) else None
+    if isinstance(request, dict):
+        for key in request.keys():
+            if key in blocked_top_level or key == "inputs":
+                continue
+            if key == "provider_options":
+                provider_options = request.get("provider_options")
+                if isinstance(provider_options, dict):
+                    allowed.update(str(opt_key) for opt_key in provider_options.keys())
+                continue
+            allowed.add(str(key))
+
+    resolved = receipt.get("resolved") if isinstance(receipt, dict) else None
+    if isinstance(resolved, dict):
+        provider_params = resolved.get("provider_params")
+        if isinstance(provider_params, dict):
+            for key in provider_params.keys():
+                if key in blocked_resolved:
+                    continue
+                if key == "image_size" and provider_key not in {"gemini"}:
+                    provider_options = (
+                        request.get("provider_options") if isinstance(request, dict) else None
+                    )
+                    if not (isinstance(provider_options, dict) and "image_size" in provider_options):
+                        continue
+                allowed.add(str(key))
+
+    return sorted({key for key in allowed if key not in blocked_top_level and key})
+
+
+_TOP_LEVEL_RECOMMENDATION_KEYS = {"size", "n", "seed", "output_format", "background", "model"}
+_BLOCKED_RECOMMENDATION_KEYS = {
+    "prompt",
+    "mode",
+    "out_dir",
+    "inputs",
+    "user",
+    "metadata",
+    "stream",
+    "partial_images",
+    "provider",
+}
+
+
+def _extract_setting_json(text: str) -> tuple[str, object | None]:
     match = re.search(r"<setting_json>(.*?)</setting_json>", text, flags=re.S)
     if not match:
         return text.strip(), None
@@ -440,13 +581,223 @@ def _extract_setting_json(text: str) -> tuple[str, dict | None]:
     return cleaned, recommendation
 
 
+def _parse_recommendation_payload(payload: object) -> tuple[object | None, str | None, bool]:
+    if payload is None:
+        return None, None, False
+    if isinstance(payload, dict):
+        stop_flag = bool(
+            payload.get("stop")
+            or payload.get("terminate")
+            or payload.get("local_max")
+            or payload.get("local_maximum")
+        )
+        reason = payload.get("reason") or payload.get("stop_reason") or payload.get("local_max_reason")
+        reason_text = str(reason).strip() if isinstance(reason, str) and reason.strip() else None
+        if "recommendations" in payload and isinstance(payload.get("recommendations"), list):
+            return payload.get("recommendations"), reason_text, stop_flag
+        if "setting_name" in payload:
+            return [payload], reason_text, stop_flag
+        return None, reason_text, stop_flag
+    if isinstance(payload, list):
+        return payload, None, False
+    return None, None, False
+
+
+def _normalize_recommendations(raw: object) -> list[dict]:
+    candidates: list[dict] = []
+    if isinstance(raw, dict):
+        candidates = [raw]
+    elif isinstance(raw, list):
+        candidates = [item for item in raw if isinstance(item, dict)]
+    else:
+        return []
+
+    cleaned: list[dict] = []
+    for rec in candidates:
+        name = str(rec.get("setting_name") or "").strip()
+        name_lower = name.lower()
+        if not name or name_lower in {"none", "null", "no_change", "no change", "n/a"}:
+            continue
+        if name_lower in _BLOCKED_RECOMMENDATION_KEYS:
+            continue
+        value = rec.get("setting_value")
+        if value is None:
+            continue
+        if isinstance(value, str) and value.strip().lower() in {"none", "null", "no_change", "no change", "n/a"}:
+            continue
+        target = rec.get("setting_target")
+        if not target:
+            target = "request" if name_lower in _TOP_LEVEL_RECOMMENDATION_KEYS else "provider_options"
+        if name_lower in _TOP_LEVEL_RECOMMENDATION_KEYS:
+            target = "request"
+        rec_clean = dict(rec)
+        rec_clean["setting_name"] = name
+        rec_clean["setting_target"] = str(target).strip()
+        cleaned.append(rec_clean)
+
+    seen: set[tuple[str, str]] = set()
+    deduped: list[dict] = []
+    for rec in cleaned:
+        key = (
+            str(rec.get("setting_target") or "").lower(),
+            str(rec.get("setting_name") or "").lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(rec)
+    return deduped[:3]
+
+
+def _coerce_setting_value(value: object) -> object:
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "false"}:
+            return lowered == "true"
+        try:
+            if "." in lowered:
+                return float(lowered)
+            return int(lowered)
+        except Exception:
+            return lowered
+    if isinstance(value, (int, float, bool)):
+        return value
+    if isinstance(value, list):
+        return [_coerce_setting_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(k).lower(): _coerce_setting_value(v) for k, v in value.items()}
+    return value
+
+
+def _values_equivalent(left: object, right: object) -> bool:
+    left_norm = _coerce_setting_value(left)
+    right_norm = _coerce_setting_value(right)
+    if isinstance(left_norm, (int, float)) and isinstance(right_norm, (int, float)):
+        return float(left_norm) == float(right_norm)
+    return left_norm == right_norm
+
+
+def _filter_noop_recommendations(
+    recs: list[dict],
+    resolved: dict | None,
+    request: dict | None,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+) -> list[dict]:
+    filtered: list[dict] = []
+    for rec in recs:
+        setting_name = str(rec.get("setting_name") or "").strip()
+        if not setting_name:
+            continue
+        setting_target = str(rec.get("setting_target") or "provider_options")
+        current_value = _lookup_current_setting_value_with_defaults(
+            setting_name,
+            setting_target,
+            resolved,
+            request,
+            provider,
+            model,
+        )
+        if current_value is None:
+            filtered.append(rec)
+            continue
+        if _values_equivalent(current_value, rec.get("setting_value")):
+            continue
+        filtered.append(rec)
+    return filtered
+
+
+def _filter_locked_size_recommendations(
+    recs: list[dict],
+    locked_size: str | None,
+) -> list[dict]:
+    if not locked_size:
+        return recs
+    locked_norm = _normalize_size(str(locked_size))
+    filtered: list[dict] = []
+    for rec in recs:
+        setting_name = str(rec.get("setting_name") or "").strip().lower()
+        if setting_name != "size":
+            filtered.append(rec)
+            continue
+        rec_value = rec.get("setting_value")
+        rec_norm = _normalize_size(str(rec_value))
+        if rec_norm == locked_norm:
+            filtered.append(rec)
+        # Skip recommendations that change the user-selected size/aspect ratio.
+    return filtered
+
+
+def _filter_model_recommendations(
+    recs: list[dict],
+    allowed_models: list[str],
+) -> list[dict]:
+    if not allowed_models:
+        return recs
+    allowed = {str(model).strip().lower() for model in allowed_models if model}
+    filtered: list[dict] = []
+    for rec in recs:
+        setting_name = str(rec.get("setting_name") or "").strip().lower()
+        if setting_name != "model":
+            filtered.append(rec)
+            continue
+        rec_value = str(rec.get("setting_value") or "").strip().lower()
+        if rec_value in allowed:
+            filtered.append(rec)
+    return filtered
+
+
+def _sanitize_recommendation_rationales(
+    recs: list[dict],
+    cost_line: str | None,
+    *,
+    provider: str | None = None,
+    size: str | None = None,
+    n: int | None = None,
+) -> list[dict]:
+    if not recs:
+        return recs
+    base_cost_token = _extract_price_token(cost_line)
+    updated: list[dict] = []
+    for rec in recs:
+        rec_copy = dict(rec)
+        rationale = rec_copy.get("rationale")
+        if isinstance(rationale, str):
+            cost_token = base_cost_token
+            setting_name = str(rec_copy.get("setting_name") or "").strip().lower()
+            if setting_name == "model" and provider and size:
+                try:
+                    rec_model = str(rec_copy.get("setting_value") or "").strip()
+                    rec_cost_line = _estimate_cost_only(
+                        provider=provider,
+                        model=rec_model or None,
+                        size=size,
+                        n=n or 1,
+                    )
+                    rec_cost_token = _extract_price_token(rec_cost_line)
+                    if rec_cost_token:
+                        cost_token = rec_cost_token
+                except Exception:
+                    pass
+            normalized = _normalize_rationale_cost(rationale, cost_token)
+            if normalized:
+                rec_copy["rationale"] = normalized
+            else:
+                rec_copy.pop("rationale", None)
+        updated.append(rec_copy)
+    return updated
+
+
 def _extract_cost_line(text: str) -> tuple[str, str | None]:
     lines = text.splitlines()
     cost_line = None
     remaining: list[str] = []
     for line in lines:
-        if line.strip().upper().startswith("COST:"):
-            cost_line = line.strip()
+        stripped = line.strip()
+        upper = stripped.upper()
+        if upper.startswith("COST"):
+            cost_line = stripped
             continue
         remaining.append(line)
     return "\n".join(remaining).strip(), cost_line
@@ -458,12 +809,6 @@ def _normalize_rec_line(text: str) -> str:
     for line in lines:
         if line.strip().upper().startswith("REC:"):
             rec = line.strip()[4:].strip()
-            for sep in [";", " • ", " / ", " | "]:
-                if sep in rec:
-                    rec = rec.split(sep, 1)[0].strip()
-                    break
-            if " or " in rec:
-                rec = rec.split(" or ", 1)[0].strip()
             updated.append(f"REC: {rec}")
         else:
             updated.append(line)
@@ -475,6 +820,126 @@ def _rec_line_text(text: str) -> str | None:
         if line.strip().upper().startswith("REC:"):
             return line.strip()[4:].strip().lower()
     return None
+
+
+def _extract_price_token(text: str | None) -> str | None:
+    if not text:
+        return None
+    match = re.search(r"\$[0-9]+(?:\.[0-9]+)?", text)
+    if match:
+        return match.group(0)
+    return None
+
+
+def _normalize_rationale_cost(rationale: str, cost_token: str | None) -> str | None:
+    trimmed = rationale.strip()
+    if not trimmed:
+        return None
+    contains_cost = bool(re.search(r"\b(cost|save|savings)\b", trimmed, flags=re.I)) or "$" in trimmed
+    if not contains_cost:
+        return trimmed
+    if not cost_token:
+        return None
+    if "$" in trimmed:
+        return re.sub(r"\$[0-9]+(?:\.[0-9]+)?", cost_token, trimmed)
+    return f"Local cost: {cost_token}/image."
+
+
+def _rewrite_rec_line(
+    text: str,
+    recommendations: list[dict],
+    stop_reason: str | None = None,
+) -> str:
+    if stop_reason:
+        rec_line = "REC: local maximum reached; export latest receipt."
+    elif recommendations:
+        parts: list[str] = []
+        for rec in recommendations:
+            name = str(rec.get("setting_name") or "").strip()
+            if not name:
+                continue
+            value = _format_setting_value(rec.get("setting_value"))
+            target = str(rec.get("setting_target") or "provider_options").strip().lower()
+            if target == "provider_options":
+                parts.append(f"{name}={value}")
+            else:
+                parts.append(f"{name}={value}")
+        rec_line = "REC: " + "; ".join(parts) if parts else "REC: no changes recommended."
+    else:
+        rec_line = "REC: no changes recommended."
+    lines = text.splitlines()
+    replaced = False
+    for idx, line in enumerate(lines):
+        if line.strip().upper().startswith("REC:"):
+            lines[idx] = rec_line
+            replaced = True
+            break
+    if not replaced:
+        lines.append(rec_line)
+    return "\n".join(lines).strip()
+
+
+def _strip_cost_prefix(cost_line: str | None) -> str | None:
+    if not cost_line:
+        return None
+    stripped = cost_line.strip()
+    if stripped.upper().startswith("COST:"):
+        stripped = stripped[5:].strip()
+    return stripped or None
+
+
+def _analysis_history_line(entry: dict) -> str:
+    round_index = entry.get("round")
+    settings = entry.get("settings") or "(no settings)"
+    elapsed = entry.get("elapsed")
+    cost_line = entry.get("cost")
+    recs = entry.get("recs")
+    accepted = entry.get("accepted")
+    parts: list[str] = []
+    if round_index is not None:
+        parts.append(f"Round {round_index}")
+    parts.append(str(settings))
+    if isinstance(elapsed, (int, float)):
+        parts.append(f"elapsed {elapsed:.1f}s")
+    cost_text = _strip_cost_prefix(cost_line)
+    if cost_text:
+        parts.append(f"cost {cost_text}")
+    if recs:
+        applied_text = "applied" if accepted else "not applied"
+        parts.append(f"recs {recs} ({applied_text})")
+    else:
+        parts.append("recs none")
+    return "; ".join(parts)
+
+
+def _format_analysis_history(history: list[dict]) -> str:
+    if not history:
+        return ""
+    lines = [_analysis_history_line(entry) for entry in history]
+    return "\n".join(lines).strip()
+
+
+def _append_analysis_history(
+    history: list[dict],
+    *,
+    round_index: int,
+    settings: dict[str, object] | None,
+    recommendations: object,
+    accepted: bool,
+    elapsed: float | None,
+    cost_line: str | None,
+) -> None:
+    summary = _recommendations_summary(recommendations)
+    history.append(
+        {
+            "round": round_index,
+            "settings": _format_call_settings_line(settings or {}),
+            "elapsed": elapsed,
+            "cost": cost_line,
+            "recs": summary,
+            "accepted": accepted,
+        }
+    )
 
 
 def _compress_analysis_to_limit(text: str, limit: int, *, analyzer: str | None = None) -> str:
@@ -614,38 +1079,88 @@ def _estimate_cost_only(
     return cost_line
 
 
-def _apply_recommendation(args: argparse.Namespace, recommendation: dict) -> bool:
-    setting_name = recommendation.get("setting_name")
-    if not setting_name:
+def _apply_recommendation(args: argparse.Namespace, recommendation: object) -> bool:
+    recs = _normalize_recommendations(recommendation)
+    if not recs:
         return False
-    setting_value = recommendation.get("setting_value")
-    if isinstance(setting_value, str):
-        lowered = setting_value.strip().lower()
-        if lowered in {"true", "false"}:
-            setting_value = lowered == "true"
+
+    applied = False
+    for rec in recs:
+        setting_name = rec.get("setting_name")
+        if not setting_name:
+            continue
+        setting_value = rec.get("setting_value")
+        if isinstance(setting_value, str):
+            lowered = setting_value.strip().lower()
+            if lowered in {"true", "false"}:
+                setting_value = lowered == "true"
+            else:
+                try:
+                    if "." in lowered:
+                        setting_value = float(lowered)
+                    else:
+                        setting_value = int(lowered)
+                except Exception:
+                    pass
+        setting_target = str(rec.get("setting_target") or "").strip().lower()
+        setting_name_lower = str(setting_name).strip().lower()
+
+        if setting_name_lower == "seed" or setting_name_lower in _TOP_LEVEL_RECOMMENDATION_KEYS:
+            if setting_name_lower == "seed":
+                try:
+                    args.seed = int(setting_value)
+                    applied = True
+                except Exception:
+                    continue
+            elif setting_name_lower == "n":
+                try:
+                    args.n = int(setting_value)
+                    applied = True
+                except Exception:
+                    continue
+            elif setting_name_lower == "size":
+                args.size = _normalize_size(str(setting_value))
+                applied = True
+            elif setting_name_lower == "model":
+                args.model = str(setting_value)
+                applied = True
+            elif setting_name_lower == "output_format":
+                setattr(args, "output_format", str(setting_value))
+                applied = True
+            elif setting_name_lower == "background":
+                setattr(args, "background", str(setting_value))
+                applied = True
+            continue
+
+        if setting_target not in {"provider_options", "provider", "options", ""}:
+            continue
+        options = getattr(args, "provider_options", None)
+        if not isinstance(options, dict):
+            options = {}
+            args.provider_options = options
+        options[str(setting_name)] = setting_value
+        applied = True
+    return applied
+
+
+def _recommendations_summary(recommendation: object) -> str:
+    recs = _normalize_recommendations(recommendation)
+    if not recs:
+        return ""
+    parts: list[str] = []
+    for rec in recs:
+        setting_name = rec.get("setting_name")
+        if not setting_name:
+            continue
+        setting_value = rec.get("setting_value")
+        setting_target = str(rec.get("setting_target") or "provider_options")
+        if setting_target == "provider_options":
+            parts.append(
+                f"provider_options.{setting_name}={_format_setting_value(setting_value)}"
+            )
         else:
-            try:
-                if "." in lowered:
-                    setting_value = float(lowered)
-                else:
-                    setting_value = int(lowered)
-            except Exception:
-                pass
-    setting_target = recommendation.get("setting_target", "provider_options")
-    if str(setting_name).lower() == "seed":
-        try:
-            args.seed = int(setting_value)
-            return True
-        except Exception:
-            return False
-    if setting_target != "provider_options":
-        return False
-    options = getattr(args, "provider_options", None)
-    if not isinstance(options, dict):
-        options = {}
-        args.provider_options = options
-    options[str(setting_name)] = setting_value
-    return True
+            parts.append(f"{setting_name}={_format_setting_value(setting_value)}")
+    return ", ".join(parts)
 
 
 def _interactive_args_raw(color_override: bool | None = None) -> argparse.Namespace:
@@ -750,10 +1265,14 @@ def _build_interactive_namespace(
         model=resolved_model,
         provider_options={},
         seed=None,
+        output_format=None,
+        background=None,
         analyzer=_resolve_receipt_analyzer(None),
         interactive=True,
         defaults=False,
         no_color=False,
+        openai_stream=_env_flag(OPENAI_STREAM_ENV),
+        openai_responses=_env_flag(OPENAI_RESPONSES_ENV),
     )
 
 
@@ -1071,7 +1590,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
             _load_repo_dotenv()
             _ensure_modulette_on_path()
             _ensure_api_keys(args.provider, _find_repo_dotenv(), allow_prompt=False)
-            from modulette import generate  # type: ignore
+            from modulette import generate, stream  # type: ignore
         except Exception as exc:
             result["exit_code"] = 1
             result["error"] = str(exc)
@@ -1089,6 +1608,12 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                 pass
             stdscr.getch()
             return
+        if not hasattr(args, "openai_stream"):
+            args.openai_stream = _env_flag(OPENAI_STREAM_ENV)
+        if not hasattr(args, "openai_responses"):
+            args.openai_responses = _env_flag(OPENAI_RESPONSES_ENV)
+        openai_stream, _ = _apply_openai_provider_flags(args)
+        use_stream = bool(openai_stream and _is_openai_gpt_image(args.provider, args.model))
         def _generate_once(
             round_index: int,
             prev_settings: dict[str, object] | None,
@@ -1159,9 +1684,10 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
             prompt_entries: dict[int, dict[str, object]] = {}
             max_prompt_width = max(20, width - 1)
             for idx, prompt in enumerate(args.prompt, start=1):
-                if y >= height - 2:
+                lines = _prompt_status_lines(idx, total_prompts, prompt, "pending", max_prompt_width)
+                if y + len(lines) >= height - 1:
                     remaining = total_prompts - idx + 1
-                    if remaining > 0:
+                    if remaining > 0 and y < height - 1:
                         summary = f"... ({remaining} more prompts; resize terminal to view)"
                         _safe_addstr(
                             stdscr,
@@ -1171,16 +1697,16 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                             curses.A_DIM,
                         )
                     break
-                line = _prompt_status_line(idx, total_prompts, prompt, "pending", max_prompt_width)
-                _safe_addstr(
-                    stdscr,
-                    y,
-                    0,
-                    line,
-                    _prompt_status_attr("pending", color_enabled),
-                )
-                prompt_entries[idx] = {"y": y, "prompt": prompt}
-                y += 1
+                for line in lines:
+                    _safe_addstr(
+                        stdscr,
+                        y,
+                        0,
+                        line,
+                        _prompt_status_attr("pending", color_enabled),
+                    )
+                    y += 1
+                prompt_entries[idx] = {"y": y - len(lines), "prompt": prompt, "lines": len(lines)}
             status_y = min(y + 1, height - 1)
             stdscr.refresh()
 
@@ -1188,16 +1714,17 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                 entry = prompt_entries.get(idx)
                 if entry:
                     y_line = int(entry["y"])
-                    line = _prompt_status_line(
+                    lines = _prompt_status_lines(
                         idx, total_prompts, prompt, "current", max_prompt_width
                     )
-                    _safe_addstr(
-                        stdscr,
-                        y_line,
-                        0,
-                        line,
-                        _prompt_status_attr("current", color_enabled),
-                    )
+                    for offset, line in enumerate(lines):
+                        _safe_addstr(
+                            stdscr,
+                            y_line + offset,
+                            0,
+                            line,
+                            _prompt_status_attr("current", color_enabled),
+                        )
                     stdscr.refresh()
 
                 result_holder: dict[str, object] = {}
@@ -1206,16 +1733,38 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
 
                 def _run_generate() -> None:
                     try:
-                        result_holder["results"] = generate(
-                            prompt=prompt,
-                            provider=args.provider,
-                            size=args.size,
-                            n=args.n,
-                            out_dir=Path(args.out),
-                            model=args.model,
-                            provider_options=args.provider_options,
-                            seed=args.seed,
-                        )
+                        if use_stream:
+                            results: list[object] = []
+                            for event in stream(
+                                prompt=prompt,
+                                provider=args.provider,
+                                size=args.size,
+                                n=args.n,
+                                out_dir=Path(args.out),
+                                model=args.model,
+                                provider_options=args.provider_options,
+                                seed=args.seed,
+                                output_format=getattr(args, "output_format", None),
+                                background=getattr(args, "background", None),
+                            ):
+                                if event.type == "error":
+                                    raise RuntimeError(event.message or "Streaming failed.")
+                                if event.type == "final" and event.result is not None:
+                                    results.append(event.result)
+                            result_holder["results"] = results
+                        else:
+                            result_holder["results"] = generate(
+                                prompt=prompt,
+                                provider=args.provider,
+                                size=args.size,
+                                n=args.n,
+                                out_dir=Path(args.out),
+                                model=args.model,
+                                provider_options=args.provider_options,
+                                seed=args.seed,
+                                output_format=getattr(args, "output_format", None),
+                                background=getattr(args, "background", None),
+                            )
                     except Exception as exc:
                         result_holder["error"] = exc
                     finally:
@@ -1234,11 +1783,11 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                         f"Prompt {idx}/{total_prompts} • Elapsed {elapsed:5.1f}s "
                         "(press Q to cancel)"
                     )
-                    _safe_addstr(
+                    _write_status_line(
                         stdscr,
                         status_y,
-                        0,
                         _truncate_text(status, max(20, width - 1)),
+                        width,
                     )
                     stdscr.refresh()
                     frame_idx += 1
@@ -1249,25 +1798,26 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
 
                 elapsed = time.monotonic() - start
                 last_elapsed = elapsed
-                _safe_addstr(
+                _write_status_line(
                     stdscr,
                     status_y,
-                    0,
                     _truncate_text(f"Done in {elapsed:5.1f}s", max(20, width - 1)),
+                    width,
                 )
                 stdscr.refresh()
                 if entry:
                     y_line = int(entry["y"])
-                    line = _prompt_status_line(
+                    lines = _prompt_status_lines(
                         idx, total_prompts, prompt, "done", max_prompt_width
                     )
-                    _safe_addstr(
-                        stdscr,
-                        y_line,
-                        0,
-                        line,
-                        _prompt_status_attr("done", color_enabled),
-                    )
+                    for offset, line in enumerate(lines):
+                        _safe_addstr(
+                            stdscr,
+                            y_line + offset,
+                            0,
+                            line,
+                            _prompt_status_attr("done", color_enabled),
+                        )
                     stdscr.refresh()
 
                 if "error" in result_holder:
@@ -1289,12 +1839,12 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                     images.append(Path(res.image_path))
                 if results:
                     for res_idx, res in enumerate(results, start=1):
-                        status = f"Stamping snapshot {res_idx}/{len(results)} (Claude scoring)..."
-                        _safe_addstr(
+                        status = f"Stamping snapshot {res_idx}/{len(results)} (Council scoring)..."
+                        _write_status_line(
                             stdscr,
                             status_y,
-                            0,
                             _truncate_text(status, max(20, width - 1)),
+                            width,
                             curses.A_DIM,
                         )
                         stdscr.refresh()
@@ -1344,8 +1894,8 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
             )
             history_block.append("Prompts (sequence):")
             for idx, prompt in enumerate(args.prompt, start=1):
-                history_block.append(
-                    _prompt_status_line(
+                history_block.extend(
+                    _prompt_status_lines(
                         idx,
                         total_prompts,
                         prompt,
@@ -1365,17 +1915,16 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                 history_block,
             )
 
-        reran_once = False
-        reran_twice = False
         auto_analyze_next = False
         stored_goals: list[str] | None = None
         stored_notes: str | None = None
         emphasis_line: str | None = None
         stored_cost: str | None = None
         stored_speed_benchmark: float | None = None
+        analysis_history: list[dict] = []
         compare_baseline: Path | None = None
-        compare_left_label: str | None = None
-        compare_right_label: str | None = None
+        compare_round_start: int | None = None
+        compare_round_end: int | None = None
         compare_next_open = False
         run_index = 1
         last_call_settings: dict[str, object] | None = None
@@ -1403,15 +1952,19 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                 return
             if images:
                 if compare_next_open and compare_baseline and images[-1].exists():
+                    left_label = _round_range_label(compare_round_start, compare_round_end)
+                    right_label = f"Round {run_index}"
                     composite = _compose_side_by_side(
                         compare_baseline,
                         images[-1],
-                        label_left=compare_left_label or "Round 1",
-                        label_right=compare_right_label or "Round 2",
+                        label_left=left_label,
+                        label_right=right_label,
                         out_dir=Path(args.out),
                     )
                     if composite:
                         _open_path(composite)
+                        compare_baseline = composite
+                        compare_round_end = run_index
                     else:
                         _open_path(images[-1])
                     compare_next_open = False
@@ -1421,7 +1974,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                 if auto_analyze_next:
                     if (
                         stored_goals
-                        and "minimize speed of render" in stored_goals
+                        and "minimize time to render" in stored_goals
                         and stored_speed_benchmark is not None
                         and last_elapsed is not None
                         and last_elapsed < stored_speed_benchmark
@@ -1435,7 +1988,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                             emphasis_line = f"{emphasis_line} {speed_note}"
                         else:
                             emphasis_line = speed_note
-                    recommendation, cost_line = _show_receipt_analysis_curses(
+                    recommendation, cost_line, accepted, stop_recommended = _show_receipt_analysis_curses(
                         stdscr,
                         receipt_path=receipts[-1],
                         provider=args.provider,
@@ -1447,30 +2000,56 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                         color_enabled=color_enabled,
                         user_goals=stored_goals,
                         user_notes=stored_notes,
+                        analysis_history=analysis_history,
                         emphasis_line=emphasis_line,
                         last_elapsed=last_elapsed,
                         last_cost=stored_cost,
                         benchmark_elapsed=stored_speed_benchmark,
                     )
+                    _append_analysis_history(
+                        analysis_history,
+                        round_index=run_index,
+                        settings=last_call_settings,
+                        recommendations=recommendation,
+                        accepted=accepted,
+                        elapsed=last_elapsed,
+                        cost_line=cost_line,
+                    )
                     if cost_line:
                         stored_cost = cost_line.replace("COST:", "").strip()
-                    if recommendation and not reran_twice:
+                    if stop_recommended:
+                        return
+                    if run_index >= MAX_ROUNDS:
+                        base_settings = last_call_settings or _capture_call_settings(args)
+                        _show_final_recommendation_curses(
+                            stdscr,
+                            settings=base_settings,
+                            recommendation=recommendation,
+                            user_goals=stored_goals,
+                            color_enabled=color_enabled,
+                        )
+                        return
+                    if accepted and recommendation:
                         if _apply_recommendation(args, recommendation):
-                            setting_name = recommendation.get("setting_name")
-                            setting_value = recommendation.get("setting_value")
                             goals_text = ", ".join(stored_goals) if stored_goals else "your goal"
-                            rationale = recommendation.get("rationale")
-                            emphasis_line = f"Net effect: {setting_name}={setting_value} → {goals_text}"
-                            if rationale:
-                                emphasis_line = f"{emphasis_line}. {rationale}"
-                            if stored_goals and "minimize speed of render" in stored_goals:
+                            summary = _recommendations_summary(recommendation)
+                            if summary:
+                                emphasis_line = f"Net effect: {summary} → {goals_text}"
+                            else:
+                                emphasis_line = f"Net effect: updates applied → {goals_text}"
+                            normalized = _normalize_recommendations(recommendation)
+                            if len(normalized) == 1:
+                                rationale = normalized[0].get("rationale")
+                                if isinstance(rationale, str) and rationale.strip():
+                                    emphasis_line = f"{emphasis_line}. {rationale.strip()}"
+                            if stored_goals and "minimize time to render" in stored_goals:
                                 stored_speed_benchmark = last_elapsed
                             if images:
-                                compare_baseline = images[-1]
-                                compare_left_label = f"Round {run_index}"
-                                compare_right_label = f"Round {run_index + 1}"
+                                if compare_baseline is None:
+                                    compare_baseline = images[-1]
+                                    compare_round_start = run_index
+                                    compare_round_end = run_index
                                 compare_next_open = True
-                            reran_twice = True
                             auto_analyze_next = True
                             run_index += 1
                             continue
@@ -1499,7 +2078,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                     user_goals, user_notes = goals_result
                     stored_goals = user_goals
                     stored_notes = user_notes
-                    recommendation, cost_line = _show_receipt_analysis_curses(
+                    recommendation, cost_line, accepted, stop_recommended = _show_receipt_analysis_curses(
                         stdscr,
                         receipt_path=receipts[-1],
                         provider=args.provider,
@@ -1511,30 +2090,56 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                         color_enabled=color_enabled,
                         user_goals=user_goals,
                         user_notes=user_notes,
+                        analysis_history=analysis_history,
                         last_elapsed=last_elapsed,
                         last_cost=stored_cost,
                         benchmark_elapsed=stored_speed_benchmark,
                     )
+                    _append_analysis_history(
+                        analysis_history,
+                        round_index=run_index,
+                        settings=last_call_settings,
+                        recommendations=recommendation,
+                        accepted=accepted,
+                        elapsed=last_elapsed,
+                        cost_line=cost_line,
+                    )
                     if cost_line:
                         stored_cost = cost_line.replace("COST:", "").strip()
-                    if recommendation and not reran_once:
+                    if stop_recommended:
+                        return
+                    if run_index >= MAX_ROUNDS:
+                        base_settings = last_call_settings or _capture_call_settings(args)
+                        _show_final_recommendation_curses(
+                            stdscr,
+                            settings=base_settings,
+                            recommendation=recommendation,
+                            user_goals=user_goals,
+                            color_enabled=color_enabled,
+                        )
+                        return
+                    if accepted and recommendation:
                         if _apply_recommendation(args, recommendation):
-                            setting_name = recommendation.get("setting_name")
-                            setting_value = recommendation.get("setting_value")
                             goals_text = ", ".join(user_goals) if user_goals else "your goal"
-                            rationale = recommendation.get("rationale")
-                            emphasis_line = f"Net effect: {setting_name}={setting_value} → {goals_text}"
-                            if rationale:
-                                emphasis_line = f"{emphasis_line}. {rationale}"
+                            summary = _recommendations_summary(recommendation)
+                            if summary:
+                                emphasis_line = f"Net effect: {summary} → {goals_text}"
+                            else:
+                                emphasis_line = f"Net effect: updates applied → {goals_text}"
+                            normalized = _normalize_recommendations(recommendation)
+                            if len(normalized) == 1:
+                                rationale = normalized[0].get("rationale")
+                                if isinstance(rationale, str) and rationale.strip():
+                                    emphasis_line = f"{emphasis_line}. {rationale.strip()}"
                             auto_analyze_next = True
-                            if user_goals and "minimize speed of render" in user_goals:
+                            if user_goals and "minimize time to render" in user_goals:
                                 stored_speed_benchmark = last_elapsed
                             if images:
-                                compare_baseline = images[-1]
-                                compare_left_label = f"Round {run_index}"
-                                compare_right_label = f"Round {run_index + 1}"
+                                if compare_baseline is None:
+                                    compare_baseline = images[-1]
+                                    compare_round_start = run_index
+                                    compare_round_end = run_index
                                 compare_next_open = True
-                            reran_once = True
                             run_index += 1
                             continue
                 return
@@ -1595,6 +2200,14 @@ def _safe_addstr(stdscr, y: int, x: int, text: str, attr: int = 0) -> None:
         pass
 
 
+def _write_status_line(stdscr, y: int, text: str, width: int, attr: int = 0) -> None:
+    if width <= 1:
+        _safe_addstr(stdscr, y, 0, text, attr)
+        return
+    padded = text.ljust(max(0, width - 1))
+    _safe_addstr(stdscr, y, 0, padded, attr)
+
+
 def _wait_for_non_mouse_key(stdscr) -> int:
     import curses
     while True:
@@ -1608,12 +2221,41 @@ def _wait_for_non_mouse_key(stdscr) -> int:
         return key
 
 
+def _print_lines_to_console(stdscr, title: str, lines: list[str]) -> None:
+    import curses
+    try:
+        curses.def_prog_mode()
+        curses.endwin()
+    except Exception:
+        pass
+    print(f"\n{title}")
+    if lines:
+        for line in lines:
+            print(line)
+    else:
+        print("(no content)")
+    try:
+        input("\nPress Enter to return...")
+    except EOFError:
+        pass
+    try:
+        curses.reset_prog_mode()
+        curses.curs_set(0)
+        stdscr.clear()
+        stdscr.refresh()
+    except Exception:
+        pass
+
+
 def _line_text_and_attr(line: object, *, color_enabled: bool) -> tuple[str, int]:
     import curses
     if isinstance(line, tuple) and len(line) == 2 and isinstance(line[0], str):
         text, tag = line
         if tag == "change":
             attr = curses.color_pair(3) | curses.A_BOLD if color_enabled else curses.A_BOLD
+            return text, attr
+        if tag == "goal":
+            attr = curses.color_pair(4) | curses.A_BOLD if color_enabled else curses.A_BOLD
             return text, attr
         if tag == "section":
             return text, curses.A_BOLD
@@ -1710,6 +2352,21 @@ def _prompt_status_line(index: int, total: int, prompt: str, status: str, max_wi
     return _truncate_text(line, max_width)
 
 
+def _prompt_status_lines(index: int, total: int, prompt: str, status: str, max_width: int) -> list[str]:
+    status_tag = {"pending": "[ ]", "current": "[>]", "done": "[x]"}
+    tag = status_tag.get(status, "[ ]")
+    prefix = f"{tag} {index}/{total}: "
+    if max_width <= len(prefix):
+        return [prefix.rstrip()]
+    wrapped = _wrap_text(prompt, max_width - len(prefix))
+    if not wrapped:
+        return [prefix.rstrip()]
+    lines = [f"{prefix}{wrapped[0]}"]
+    indent = " " * len(prefix)
+    lines.extend(f"{indent}{line}" for line in wrapped[1:])
+    return lines
+
+
 def _prompt_status_attr(status: str, color_enabled: bool) -> int:
     import curses
     if status == "current":
@@ -1729,13 +2386,29 @@ def _capture_call_settings(args: argparse.Namespace) -> dict[str, object]:
         "size": getattr(args, "size", None),
         "n": getattr(args, "n", None),
         "seed": getattr(args, "seed", None),
+        "output_format": getattr(args, "output_format", None),
+        "background": getattr(args, "background", None),
         "provider_options": dict(provider_options),
     }
 
 
+def _apply_openai_provider_flags(args: argparse.Namespace) -> tuple[bool, bool]:
+    openai_stream = bool(getattr(args, "openai_stream", False))
+    openai_responses = bool(getattr(args, "openai_responses", False))
+    if openai_responses and getattr(args, "provider", "") == "openai":
+        provider_options = getattr(args, "provider_options", None)
+        if not isinstance(provider_options, dict):
+            provider_options = {}
+            args.provider_options = provider_options
+        provider_options["use_responses"] = True
+    if openai_responses:
+        openai_stream = False
+    return openai_stream, openai_responses
+
+
 def _format_call_settings_line(settings: dict[str, object]) -> str:
     pairs: list[tuple[str, object]] = []
-    for key in ("provider", "model", "size", "n", "seed"):
+    for key in ("provider", "model", "size", "n", "seed", "output_format", "background"):
         value = settings.get(key)
         if value is not None:
             pairs.append((key, value))
@@ -1748,6 +2421,14 @@ def _format_call_settings_line(settings: dict[str, object]) -> str:
         else:
             line = f"provider_options: {options_line}"
     return line or "(no settings)"
+
+
+def _round_range_label(start: int | None, end: int | None) -> str:
+    if start is None or end is None:
+        return "Round ?"
+    if start == end:
+        return f"Round {start}"
+    return f"Rounds {start}-{end}"
 
 
 def _build_generation_header_lines(
@@ -1862,7 +2543,7 @@ def _clamp_score(value: object) -> int | None:
     return score
 
 
-def _parse_claude_scores(text: str) -> tuple[int | None, int | None]:
+def _parse_score_payload(text: str) -> tuple[int | None, int | None]:
     adherence = None
     quality = None
     match = re.search(r"\{.*\}", text, flags=re.S)
@@ -1885,7 +2566,7 @@ def _parse_claude_scores(text: str) -> tuple[int | None, int | None]:
     return adherence, quality
 
 
-def _score_image_with_claude(
+def _score_image_with_council(
     *,
     prompt: str,
     image_base64: str | None,
@@ -1893,7 +2574,13 @@ def _score_image_with_claude(
 ) -> tuple[int | None, int | None]:
     if not image_base64 or not image_mime:
         return None, None
-    if not os.getenv("ANTHROPIC_API_KEY"):
+    if not (
+        os.getenv("OPENAI_API_KEY")
+        or os.getenv("OPENAI_API_KEY_BACKUP")
+        or os.getenv("ANTHROPIC_API_KEY")
+        or os.getenv("GEMINI_API_KEY")
+        or os.getenv("GOOGLE_API_KEY")
+    ):
         return None, None
     score_prompt = (
         "You are a strict image evaluator. Given the prompt and the generated image, "
@@ -1903,16 +2590,19 @@ def _score_image_with_claude(
         f"Prompt:\n{prompt}"
     )
     try:
-        text, _ = _call_anthropic(
+        text, _ = _call_council(
             score_prompt,
-            max_tokens=120,
             enable_web_search=False,
             image_base64=image_base64,
             image_mime=image_mime,
+            chair_instructions=[
+                "You are the council chair. Synthesize the best final response.",
+                "Return ONLY JSON like: {\"adherence\": 0-100, \"quality\": 0-100}. Use integers. No extra text.",
+            ],
         )
     except Exception:
         return None, None
-    return _parse_claude_scores(text)
+    return _parse_score_payload(text)
 
 
 def _build_snapshot_lines(
@@ -1933,6 +2623,30 @@ def _build_snapshot_lines(
     ]
 
 
+def _snapshot_template_lines() -> list[str]:
+    return [
+        "render: 9999.9s",
+        "cost: $99.9999",
+        "prompt adherence: 100/100",
+        "LLM-rated quality: 100/100",
+    ]
+
+
+def _measure_text_metrics(draw, font, lines: list[str], line_spacing: int) -> tuple[int, int, int]:
+    if not lines:
+        return 0, 0, 0
+    widths: list[int] = []
+    heights: list[int] = []
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font)
+        widths.append(bbox[2] - bbox[0])
+        heights.append(bbox[3] - bbox[1])
+    max_w = max(widths) if widths else 0
+    line_height = max(heights) if heights else 0
+    total_h = line_height * len(lines) + line_spacing * (len(lines) - 1)
+    return max_w, line_height, total_h
+
+
 def _apply_snapshot_overlay(image_path: Path, lines: list[str]) -> bool:
     try:
         from PIL import Image, ImageDraw, ImageFont  # type: ignore
@@ -1945,55 +2659,124 @@ def _apply_snapshot_overlay(image_path: Path, lines: list[str]) -> bool:
     except Exception:
         return False
     base_font_size = 18
-    scale_factor = 10.0
+    base_scale = 2.0
+    baseline_area = 1024 * 1024
+    size_scale = math.sqrt((image.width * image.height) / baseline_area)
+    size_scale = max(0.75, min(4.0, size_scale))
+    scale_factor = base_scale * size_scale
     target_font_size = int(base_font_size * scale_factor)
     font = None
-    try:
-        font = ImageFont.truetype("Menlo.ttf", target_font_size)
-    except Exception:
+    is_truetype = False
+    selected_font = None
+    font_candidates = [
+        "Menlo.ttf",
+        "/System/Library/Fonts/Supplemental/Menlo.ttc",
+        "/System/Library/Fonts/Supplemental/Menlo-Regular.ttf",
+        "/Library/Fonts/Menlo.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/Library/Fonts/Arial.ttf",
+        "DejaVuSans.ttf",
+    ]
+    for candidate in font_candidates:
+        try:
+            font = ImageFont.truetype(candidate, target_font_size)
+            is_truetype = True
+            selected_font = candidate
+            break
+        except Exception:
+            continue
+    if font is None:
         font = ImageFont.load_default()
-    draw = ImageDraw.Draw(image)
-    max_w = 0
-    line_heights: list[int] = []
-    for line in lines:
-        bbox = draw.textbbox((0, 0), line, font=font)
-        width = bbox[2] - bbox[0]
-        height = bbox[3] - bbox[1]
-        max_w = max(max_w, width)
-        line_heights.append(max(10, height))
-    total_h = sum(line_heights) + int(4 * scale_factor) * (len(lines) - 1)
+    line_spacing = int(4 * scale_factor)
     padding = int(10 * scale_factor)
-    box_w = max_w + padding * 2
-    box_h = total_h + padding * 2
-    if isinstance(font, ImageFont.FreeTypeFont):
+    template_lines = _snapshot_template_lines()
+    if not is_truetype:
+        draw = ImageDraw.Draw(image)
+        max_w, line_height, total_h = _measure_text_metrics(draw, font, lines, line_spacing)
+        template_w, template_height, template_total_h = _measure_text_metrics(
+            draw,
+            font,
+            template_lines,
+            line_spacing,
+        )
+        max_w = max(max_w, template_w)
+        line_height = max(line_height, template_height)
+        total_h = max(total_h, template_total_h)
+        line_heights = [max(10, line_height)] * len(lines)
+        box_w = max_w + 10 * 2
+        box_h = total_h + 10 * 2
         max_w_allowed = int(image.width * 0.95)
         max_h_allowed = int(image.height * 0.95)
-        if box_w > max_w_allowed or box_h > max_h_allowed:
-            scale_w = max_w_allowed / max(1, box_w)
-            scale_h = max_h_allowed / max(1, box_h)
-            scale_factor = max(0.2, min(scale_w, scale_h)) * scale_factor
-            adjusted_size = max(8, int(base_font_size * scale_factor))
-            try:
-                font = ImageFont.truetype("Menlo.ttf", adjusted_size)
-            except Exception:
-                font = ImageFont.load_default()
-            max_w = 0
-            line_heights = []
-            for line in lines:
-                bbox = draw.textbbox((0, 0), line, font=font)
-                width = bbox[2] - bbox[0]
-                height = bbox[3] - bbox[1]
-                max_w = max(max_w, width)
-                line_heights.append(max(10, height))
-            padding = int(10 * scale_factor)
-            line_spacing = int(4 * scale_factor)
-            total_h = sum(line_heights) + line_spacing * (len(lines) - 1)
-            box_w = max_w + padding * 2
-            box_h = total_h + padding * 2
+        scale = min(
+            scale_factor,
+            max_w_allowed / max(1, box_w),
+            max_h_allowed / max(1, box_h),
+        )
+        scale = max(0.5, scale)
+        small_overlay = Image.new("RGBA", (box_w, box_h), (0, 0, 0, 0))
+        small_draw = ImageDraw.Draw(small_overlay)
+        small_draw.rectangle([0, 0, box_w, box_h], fill=(0, 0, 0, 160))
+        y = 10
+        for line, height in zip(lines, line_heights):
+            small_draw.text((10, y), line, fill=(255, 255, 255, 255), font=font)
+            y += height + 4
+        big_overlay = small_overlay.resize(
+            (int(box_w * scale), int(box_h * scale)),
+            Image.NEAREST,
+        )
+        overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+        overlay.paste(big_overlay, (0, 0), big_overlay)
+        combined = Image.alpha_composite(image, overlay)
+        suffix = image_path.suffix.lower()
+        if suffix in {".jpg", ".jpeg"}:
+            combined.convert("RGB").save(image_path, quality=95)
         else:
-            line_spacing = int(4 * scale_factor)
-    else:
-        line_spacing = int(4 * scale_factor)
+            combined.save(image_path)
+        return True
+
+    draw = ImageDraw.Draw(image)
+    max_w, line_height, total_h = _measure_text_metrics(draw, font, lines, line_spacing)
+    template_w, template_height, template_total_h = _measure_text_metrics(
+        draw,
+        font,
+        template_lines,
+        line_spacing,
+    )
+    max_w = max(max_w, template_w)
+    line_height = max(line_height, template_height)
+    total_h = max(total_h, template_total_h)
+    line_heights = [max(10, line_height)] * len(lines)
+    box_w = max_w + padding * 2
+    box_h = total_h + padding * 2
+    max_w_allowed = int(image.width * 0.95)
+    max_h_allowed = int(image.height * 0.95)
+    if (box_w > max_w_allowed or box_h > max_h_allowed) and selected_font:
+        scale = min(
+            max_w_allowed / max(1, box_w),
+            max_h_allowed / max(1, box_h),
+        )
+        adjusted_size = max(8, int(target_font_size * scale))
+        try:
+            font = ImageFont.truetype(selected_font, adjusted_size)
+        except Exception:
+            font = ImageFont.load_default()
+        scale_used = max(0.5, adjusted_size / base_font_size)
+        line_spacing = int(4 * scale_used)
+        padding = int(10 * scale_used)
+        draw = ImageDraw.Draw(image)
+        max_w, line_height, total_h = _measure_text_metrics(draw, font, lines, line_spacing)
+        template_w, template_height, template_total_h = _measure_text_metrics(
+            draw,
+            font,
+            template_lines,
+            line_spacing,
+        )
+        max_w = max(max_w, template_w)
+        line_height = max(line_height, template_height)
+        total_h = max(total_h, template_total_h)
+        line_heights = [max(10, line_height)] * len(lines)
+        box_w = max_w + padding * 2
+        box_h = total_h + padding * 2
 
     overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
     overlay_draw = ImageDraw.Draw(overlay)
@@ -2043,7 +2826,7 @@ def _apply_snapshot_for_result(
         image_base64, image_mime = _load_image_for_analyzer(image_path)
     except Exception:
         pass
-    adherence, quality = _score_image_with_claude(
+    adherence, quality = _score_image_with_council(
         prompt=prompt,
         image_base64=image_base64,
         image_mime=image_mime,
@@ -2059,7 +2842,7 @@ def _apply_snapshot_for_result(
 
 def _diff_call_settings(prev: dict[str, object], current: dict[str, object]) -> list[str]:
     diffs: list[str] = []
-    for key in ("provider", "model", "size", "n", "seed"):
+    for key in ("provider", "model", "size", "n", "seed", "output_format", "background"):
         prev_val = prev.get(key)
         curr_val = current.get(key)
         if prev_val != curr_val:
@@ -2167,12 +2950,72 @@ def _lookup_current_setting_value(
     return None
 
 
+def _flux_default_params(model: str | None) -> dict[str, object]:
+    model_key = (model or "").strip().lower()
+    if "dev" in model_key:
+        return {
+            "prompt_upsampling": False,
+            "safety_tolerance": 2,
+            "steps": 28,
+            "guidance": 3,
+        }
+    return {
+        "prompt_upsampling": False,
+        "safety_tolerance": 2,
+        "steps": 40,
+        "guidance": 2.5,
+    }
+
+
+def _default_provider_option(provider: str | None, model: str | None, key: str) -> object | None:
+    provider_key = (provider or "").strip().lower()
+    if provider_key in {"black forest labs", "bfl", "flux"}:
+        return _flux_default_params(model).get(key)
+    return None
+
+
+def _fill_defaults_for_display(
+    data: dict | None,
+    *,
+    provider: str | None,
+    model: str | None,
+) -> dict | None:
+    if not isinstance(data, dict) or not data:
+        return data
+    provider_key = (provider or "").strip().lower()
+    if provider_key not in {"black forest labs", "bfl", "flux"}:
+        return data
+    defaults = _flux_default_params(model)
+    updated = dict(data)
+    for key, value in list(updated.items()):
+        if value is None and key in defaults:
+            updated[key] = defaults[key]
+    return updated
+
+
+def _lookup_current_setting_value_with_defaults(
+    setting_name: str,
+    setting_target: str,
+    resolved: dict | None,
+    request: dict | None,
+    provider: str | None,
+    model: str | None,
+) -> object | None:
+    value = _lookup_current_setting_value(setting_name, setting_target, resolved, request)
+    if value is not None:
+        return value
+    if setting_target == "provider_options":
+        return _default_provider_option(provider, model, setting_name)
+    return None
+
+
 def _build_receipt_detail_lines(
     receipt: dict,
-    recommendation: dict | None,
+    recommendation: object,
     *,
     max_width: int,
     return_tags: bool = False,
+    stop_reason: str | None = None,
 ) -> list[object]:
     lines: list[object] = []
     def _append(line: str, tag: str | None = None) -> None:
@@ -2187,10 +3030,19 @@ def _build_receipt_detail_lines(
 
     resolved = receipt.get("resolved") if isinstance(receipt, dict) else None
     request = receipt.get("request") if isinstance(receipt, dict) else None
+    provider_value = None
+    model_value = None
+    if isinstance(resolved, dict):
+        provider_value = resolved.get("provider")
+        model_value = resolved.get("model")
+    if provider_value is None and isinstance(request, dict):
+        provider_value = request.get("provider")
+    if model_value is None and isinstance(request, dict):
+        model_value = request.get("model")
 
     _append("RENDER SETTINGS (RESOLVED)", "section")
     pairs: list[tuple[str, object]] = []
-    for key in ("provider", "model", "size", "n", "output_format", "seed"):
+    for key in ("provider", "model", "size", "n", "output_format", "background", "seed"):
         value = None
         if isinstance(resolved, dict):
             value = resolved.get(key)
@@ -2212,11 +3064,21 @@ def _build_receipt_detail_lines(
 
     if isinstance(resolved, dict):
         provider_params = resolved.get("provider_params")
+        provider_params = _fill_defaults_for_display(
+            provider_params if isinstance(provider_params, dict) else None,
+            provider=provider_value,
+            model=model_value,
+        )
         if isinstance(provider_params, dict) and provider_params:
             provider_line = f"provider_params: {_format_dict_inline(provider_params)}"
             _append_wrapped(provider_line)
     if isinstance(request, dict):
         provider_options = request.get("provider_options")
+        provider_options = _fill_defaults_for_display(
+            provider_options if isinstance(provider_options, dict) else None,
+            provider=provider_value,
+            model=model_value,
+        )
         if isinstance(provider_options, dict) and provider_options:
             options_line = f"requested provider_options: {_format_dict_inline(provider_options)}"
             _append_wrapped(options_line)
@@ -2230,34 +3092,46 @@ def _build_receipt_detail_lines(
         _append_wrapped(warning_line)
 
     _append("")
-    _append("RECOMMENDATION", "section")
-    if not recommendation or not recommendation.get("setting_name"):
+    if stop_reason:
+        _append("LOCAL MAXIMUM", "section")
+        _append_wrapped(stop_reason)
+        _append_wrapped("Recommendation: export the latest receipt and stop iterating.")
+        _append("")
+
+    _append("RECOMMENDATIONS", "section")
+    recommendations = _normalize_recommendations(recommendation)
+    if not recommendations:
         _append("none")
         return lines
 
-    setting_name = str(recommendation.get("setting_name") or "").strip()
-    setting_value = recommendation.get("setting_value")
-    setting_target = str(recommendation.get("setting_target") or "provider_options")
-    detail_pairs = [
-        ("setting_name", setting_name),
-        ("setting_value", setting_value),
-        ("target", setting_target),
-    ]
-    _append_wrapped(_format_kv_pairs(detail_pairs), "change")
-    current_value = _lookup_current_setting_value(setting_name, setting_target, resolved, request)
-    if setting_target == "provider_options":
-        next_line = (
-            f"next render: provider_options.{setting_name}="
-            f"{_format_setting_value(setting_value)}"
-        )
-    else:
-        next_line = f"next render: {setting_name}={_format_setting_value(setting_value)}"
-    if current_value is not None:
-        next_line += f" (was {_format_setting_value(current_value)})"
-    _append_wrapped(next_line, "change")
-    rationale = recommendation.get("rationale")
-    if isinstance(rationale, str) and rationale.strip():
-        _append_wrapped(f"rationale: {rationale.strip()}")
+    for idx, rec in enumerate(recommendations, start=1):
+        if len(recommendations) > 1:
+            _append(f"Recommendation {idx}", "section")
+        setting_name = str(rec.get("setting_name") or "").strip()
+        setting_value = rec.get("setting_value")
+        setting_target = str(rec.get("setting_target") or "provider_options")
+        detail_pairs = [
+            ("setting_name", setting_name),
+            ("setting_value", setting_value),
+            ("target", setting_target),
+        ]
+        _append_wrapped(_format_kv_pairs(detail_pairs), "change")
+        current_value = _lookup_current_setting_value(setting_name, setting_target, resolved, request)
+        if setting_target == "provider_options":
+            next_line = (
+                f"next render: provider_options.{setting_name}="
+                f"{_format_setting_value(setting_value)}"
+            )
+        else:
+            next_line = f"next render: {setting_name}={_format_setting_value(setting_value)}"
+        if current_value is not None:
+            next_line += f" (was {_format_setting_value(current_value)})"
+        _append_wrapped(next_line, "change")
+        rationale = rec.get("rationale")
+        if isinstance(rationale, str) and rationale.strip():
+            _append_wrapped(f"rationale: {rationale.strip()}")
+        if idx < len(recommendations):
+            _append("")
     return lines
 
 
@@ -2266,6 +3140,82 @@ def _export_analysis_text(receipt_path: Path, lines: list[str]) -> Path:
     out_path = receipt_path.with_name(f"{receipt_path.stem}-analysis-{stamp}.txt")
     out_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     return out_path
+
+
+def _settings_after_recommendation(
+    settings: dict[str, object],
+    recommendation: object,
+) -> dict[str, object]:
+    temp_args = argparse.Namespace(**settings)
+    if not hasattr(temp_args, "provider_options") or not isinstance(temp_args.provider_options, dict):
+        temp_args.provider_options = {}
+    _apply_recommendation(temp_args, recommendation)
+    return _capture_call_settings(temp_args)
+
+
+def _build_final_recommendation_lines(
+    settings: dict[str, object],
+    recommendation: object,
+    *,
+    user_goals: list[str] | None,
+    max_width: int,
+    return_tags: bool = False,
+) -> list[object]:
+    lines: list[object] = []
+
+    def _append(line: str, tag: str | None = None) -> None:
+        if tag and return_tags:
+            lines.append((line, tag))
+        else:
+            lines.append(line)
+
+    def _append_wrapped(text: str, tag: str | None = None) -> None:
+        for line in _wrap_text(text, max_width):
+            _append(line, tag)
+
+    _append("FINAL RECOMMENDED API CALL", "section")
+    goals_line = ", ".join(user_goals) if user_goals else "(not specified)"
+    _append_wrapped(f"Goals: {goals_line}", "goal")
+    recommended_settings = _settings_after_recommendation(settings, recommendation) if recommendation else settings
+    _append_wrapped(_format_call_settings_line(recommended_settings))
+    if recommendation:
+        diffs = _diff_call_settings(settings, recommended_settings)
+        if not diffs:
+            diffs = ["Change: none"]
+        for diff in diffs:
+            prefix = "Change: " if not diff.startswith("Change:") else ""
+            _append_wrapped(f"{prefix}{diff}", "change")
+    else:
+        _append_wrapped("No changes recommended.", "change")
+    return lines
+
+
+def _show_final_recommendation_curses(
+    stdscr,
+    *,
+    settings: dict[str, object],
+    recommendation: object,
+    user_goals: list[str] | None,
+    color_enabled: bool,
+) -> None:
+    import curses
+    height, width = stdscr.getmaxyx()
+    max_width = max(40, width - 2)
+    lines = _build_final_recommendation_lines(
+        settings,
+        recommendation,
+        user_goals=user_goals,
+        max_width=max_width,
+        return_tags=True,
+    )
+    _render_scrollable_text_with_banner(
+        stdscr,
+        title_line=f"Final recommendation (max {MAX_ROUNDS} rounds)",
+        body_lines=lines,
+        footer_line="Press Q or Enter to exit",
+        color_enabled=color_enabled,
+        footer_attr=curses.A_DIM,
+    )
 
 
 
@@ -2294,7 +3244,7 @@ def _prompt_freeform_curses(stdscr, prompt: str, *, color_enabled: bool) -> str:
 def _prompt_goal_selection_curses(stdscr, color_enabled: bool) -> tuple[list[str], str | None] | None:
     import curses
     options = [
-        "minimize speed of render",
+        "minimize time to render",
         "minimize cost of render",
         "maximize quality of render",
         "something else",
@@ -2498,12 +3448,13 @@ def _show_receipt_analysis_curses(
     color_enabled: bool,
     user_goals: list[str] | None = None,
     user_notes: str | None = None,
+    analysis_history: list[dict] | None = None,
     emphasis_line: str | None = None,
     allow_rerun: bool = True,
     last_elapsed: float | None = None,
     last_cost: str | None = None,
     benchmark_elapsed: float | None = None,
-) -> tuple[dict | None, str | None]:
+) -> tuple[list[dict] | None, str | None, bool, bool]:
     import curses
     analyzer_key = _normalize_analyzer(analyzer)
     cost_line: str | None = None
@@ -2529,6 +3480,11 @@ def _show_receipt_analysis_curses(
             f"Analyzing receipt with {_analyzer_display_name(analyzer_key)}..."[: max(0, width - 1)],
         )
         y += 1
+    if analyzer_key == "council" and y < height - 1:
+        note_text = "Note: Council analysis can take a few minutes."
+        note_attr = curses.A_DIM if hasattr(curses, "A_DIM") else 0
+        _safe_addstr(stdscr, y, 0, note_text[: max(0, width - 1)], note_attr)
+        y += 1
     if y < height - 1:
         model_label = model or "(default)"
         provider_line = f"Provider/Model: {_display_provider_name(provider) or provider} • {model_label}"
@@ -2536,9 +3492,10 @@ def _show_receipt_analysis_curses(
         y += 1
     if user_goals and y < height - 1:
         goals_text = "Goals: " + ", ".join(user_goals)
-        _safe_addstr(stdscr, y, 0, goals_text[: max(0, width - 1)], curses.A_BOLD)
+        goals_attr = curses.color_pair(4) | curses.A_BOLD if color_enabled else curses.A_BOLD
+        _safe_addstr(stdscr, y, 0, goals_text[: max(0, width - 1)], goals_attr)
         y += 1
-    if user_goals and "minimize speed of render" in user_goals and y < height - 1:
+    if user_goals and "minimize time to render" in user_goals and y < height - 1:
         if benchmark_elapsed is not None and last_elapsed is not None:
             speed_text = f"Speed benchmark: {benchmark_elapsed:.1f}s → latest {last_elapsed:.1f}s"
         else:
@@ -2559,6 +3516,7 @@ def _show_receipt_analysis_curses(
 
     def _run_analysis() -> None:
         try:
+            history_text = _format_analysis_history(analysis_history or [])
             result_holder["payload"] = _analyze_receipt_payload(
                 receipt_path=receipt_path,
                 provider=provider,
@@ -2569,6 +3527,7 @@ def _show_receipt_analysis_curses(
                 analyzer=analyzer_key,
                 user_goals=user_goals,
                 user_notes=user_notes,
+                history_text=history_text,
             )
         except Exception as exc:
             result_holder["error"] = exc
@@ -2598,10 +3557,18 @@ def _show_receipt_analysis_curses(
             footer_line="Press Q or Enter to exit",
             color_enabled=color_enabled,
         )
-        return None, pre_cost_line or cost_line
-    analysis, citations, recommendation, cost_line = result_holder.get("payload")  # type: ignore[misc]
+        return None, pre_cost_line or cost_line, False, False
+    analysis, citations, recommendation, cost_line, stop_reason = result_holder.get("payload")  # type: ignore[misc]
     if not cost_line and pre_cost_line:
         cost_line = pre_cost_line
+    recommendations = _normalize_recommendations(recommendation)
+    if not recommendations:
+        recommendation = None
+    else:
+        recommendation = recommendations
+    stop_recommended = bool(stop_reason)
+    if stop_recommended:
+        recommendation = None
 
     comparison_lines: list[str] = []
     if benchmark_elapsed is not None and last_elapsed is not None:
@@ -2630,6 +3597,7 @@ def _show_receipt_analysis_curses(
             recommendation,
             max_width=max(20, width - 2),
             return_tags=True,
+            stop_reason=stop_reason,
         )
     except Exception as exc:
         detail_lines = _wrap_text(f"Render settings unavailable: {exc}", max(20, width - 2))
@@ -2637,7 +3605,7 @@ def _show_receipt_analysis_curses(
     lines: list[str] = []
     if user_goals:
         goals_text = ", ".join(user_goals)
-        lines.append(f"User goals: {goals_text}")
+        lines.append((f"User goals: {goals_text}", "goal"))
         lines.append("")
     lines.append("MODEL ANALYSIS (LLM)")
     lines.append("")
@@ -2650,28 +3618,37 @@ def _show_receipt_analysis_curses(
         lines.append("")
         lines.extend(detail_lines)
 
+    rec_label = "recommendations" if recommendations and len(recommendations) > 1 else "recommendation"
     footer_line = (
-        "Open receipt (o) • Export text (t) • Accept recommendation (y) or quit (q) • "
+        "Open receipt (o) • Export text (t) • Print text (p) • "
+        f"Accept {rec_label} (y) or quit (q) • "
         "Up/Down/PgUp/PgDn to scroll"
     )
     footer_attr = curses.color_pair(4) | curses.A_BOLD if color_enabled else curses.A_BOLD
     hotkeys = None
     accept_keys = None
-    if allow_rerun and recommendation and recommendation.get("setting_name"):
+    if allow_rerun and recommendations and not stop_recommended:
         hotkeys = {
             "y": curses.color_pair(1) | curses.A_BOLD if color_enabled else curses.A_BOLD,
             "q": curses.color_pair(1) | curses.A_BOLD if color_enabled else curses.A_BOLD,
             "o": curses.color_pair(1) | curses.A_BOLD if color_enabled else curses.A_BOLD,
             "t": curses.color_pair(1) | curses.A_BOLD if color_enabled else curses.A_BOLD,
+            "p": curses.color_pair(1) | curses.A_BOLD if color_enabled else curses.A_BOLD,
         }
         accept_keys = {ord("y"), ord("Y")}
     else:
         hotkeys = {
             "o": curses.color_pair(1) | curses.A_BOLD if color_enabled else curses.A_BOLD,
             "t": curses.color_pair(1) | curses.A_BOLD if color_enabled else curses.A_BOLD,
+            "p": curses.color_pair(1) | curses.A_BOLD if color_enabled else curses.A_BOLD,
         }
     open_keys = {ord("o"), ord("O")}
-    action_keys = {ord("t"): "export", ord("T"): "export"}
+    action_keys = {
+        ord("t"): "export",
+        ord("T"): "export",
+        ord("p"): "print",
+        ord("P"): "print",
+    }
     while True:
         action = _render_scrollable_text_with_banner(
             stdscr,
@@ -2680,7 +3657,7 @@ def _show_receipt_analysis_curses(
             footer_line=(
                 footer_line
                 if accept_keys
-                else "Open receipt (o) • Export text (t) • Up/Down/PgUp/PgDn to scroll, Q or Enter to exit"
+                else "Open receipt (o) • Export text (t) • Print text (p) • Up/Down/PgUp/PgDn to scroll, Q or Enter to exit"
             ),
             color_enabled=color_enabled,
             emphasis_line=emphasis_line,
@@ -2712,6 +3689,7 @@ def _show_receipt_analysis_curses(
                             receipt_payload,
                             recommendation,
                             max_width=120,
+                            stop_reason=stop_reason,
                         )
                         if isinstance(line, str)
                     ]
@@ -2725,12 +3703,37 @@ def _show_receipt_analysis_curses(
             except Exception:
                 pass
             continue
+        if action == "print":
+            print_lines: list[str] = []
+            if user_goals:
+                print_lines.append(f"User goals: {', '.join(user_goals)}")
+                print_lines.append("")
+            print_lines.append("MODEL ANALYSIS (LLM)")
+            print_lines.append("")
+            if analysis:
+                print_lines.extend(_display_analysis_text(analysis).splitlines())
+            else:
+                print_lines.append("Receipt analysis returned no content.")
+            if receipt_payload is not None:
+                print_lines.append("")
+                for line in _build_receipt_detail_lines(
+                    receipt_payload,
+                    recommendation,
+                    max_width=120,
+                    stop_reason=stop_reason,
+                ):
+                    if isinstance(line, tuple):
+                        print_lines.append(line[0])
+                    else:
+                        print_lines.append(line)
+            _print_lines_to_console(stdscr, "Receipt analysis (copyable):", print_lines)
+            continue
         if action == "open":
             _open_path(receipt_path)
             continue
-        if allow_rerun and recommendation and recommendation.get("setting_name") and action == "accept":
-            return recommendation, cost_line
-        return None, cost_line
+        if allow_rerun and recommendations and action == "accept":
+            return recommendations, cost_line, True, stop_recommended
+        return recommendations, cost_line, False, stop_recommended
 
 
 def _draw_choice_line(
@@ -3210,6 +4213,7 @@ def _call_anthropic(
     model: str = ANTHROPIC_MODEL,
     max_tokens: int = ANTHROPIC_MAX_TOKENS,
     enable_web_search: bool = True,
+    enable_thinking: bool = True,
     image_base64: str | None = None,
     image_mime: str | None = None,
 ) -> tuple[str, list[dict[str, str]]]:
@@ -3234,6 +4238,12 @@ def _call_anthropic(
             }
         ],
     }
+    if enable_thinking:
+        if max_tokens > ANTHROPIC_THINKING_BUDGET and ANTHROPIC_THINKING_BUDGET >= 1024:
+            body["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": ANTHROPIC_THINKING_BUDGET,
+            }
     if enable_web_search:
         body["tools"] = [
             {
@@ -3313,6 +4323,25 @@ def _extract_openai_text(payload: dict) -> str:
     return ""
 
 
+def _extract_gemini_text(payload: dict) -> str:
+    candidates = payload.get("candidates")
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            content = candidate.get("content") if isinstance(candidate, dict) else None
+            if isinstance(content, dict):
+                parts = content.get("parts")
+                if isinstance(parts, list):
+                    for part in parts:
+                        if isinstance(part, dict):
+                            text = part.get("text")
+                            if isinstance(text, str) and text.strip():
+                                return text.strip()
+    output = payload.get("text")
+    if isinstance(output, str):
+        return output.strip()
+    return ""
+
+
 def _openai_request(
     url: str,
     *,
@@ -3386,6 +4415,7 @@ def _call_openai(
     max_output_tokens: int = OPENAI_MAX_OUTPUT_TOKENS,
     image_base64: str | None = None,
     image_mime: str | None = None,
+    enable_web_search: bool = False,
 ) -> tuple[str, list[dict[str, str]]]:
     api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY_BACKUP")
     if not api_key:
@@ -3401,11 +4431,14 @@ def _call_openai(
                     "image_url": f"data:{image_mime};base64,{image_base64}",
                 }
             )
-        return {
+        body: dict[str, object] = {
             "model": model,
             "input": [{"role": "user", "content": content}],
             "max_output_tokens": max_output_tokens,
         }
+        if enable_web_search:
+            body["tools"] = [{"type": "web_search"}]
+        return body
 
     def _chat_body(with_image: bool) -> dict[str, object]:
         content: list[dict[str, object]] = [{"type": "text", "text": prompt}]
@@ -3416,11 +4449,12 @@ def _call_openai(
                     "image_url": {"url": f"data:{image_mime};base64,{image_base64}"},
                 }
             )
-        return {
+        body: dict[str, object] = {
             "model": model,
             "messages": [{"role": "user", "content": content}],
             "max_tokens": max_output_tokens,
         }
+        return body
 
     def _attempt(url: str, body: dict[str, object]) -> tuple[str | None, int | None, str | None]:
         payload, code, message = _openai_request(url, body=body, api_key=api_key)
@@ -3440,6 +4474,10 @@ def _call_openai(
         if text is not None:
             return text, []
     if _is_openai_endpoint_error(code, message):
+        if enable_web_search:
+            detail = message or "unknown error"
+            code_label = f" ({code})" if code else ""
+            raise RuntimeError(f"OpenAI request failed{code_label}: {detail}")
         text, code, message = _attempt(OPENAI_CHAT_ENDPOINT, _chat_body(include_image))
         if text is not None:
             return text, []
@@ -3450,6 +4488,185 @@ def _call_openai(
     detail = message or "unknown error"
     code_label = f" ({code})" if code else ""
     raise RuntimeError(f"OpenAI request failed{code_label}: {detail}")
+
+
+def _call_gemini(
+    prompt: str,
+    *,
+    model: str = GEMINI_ANALYZER_MODEL,
+    image_base64: str | None = None,
+    image_mime: str | None = None,
+    enable_web_search: bool = False,
+) -> tuple[str, list[dict[str, str]]]:
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is required to analyze receipts with Gemini.")
+    parts: list[dict[str, object]] = [{"text": prompt}]
+    if image_base64 and image_mime:
+        parts.append(
+            {
+                "inline_data": {
+                    "mime_type": image_mime,
+                    "data": image_base64,
+                }
+            }
+        )
+    body = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {"responseMimeType": "text/plain"},
+    }
+    if enable_web_search:
+        body["tools"] = [{"google_search": {}}]
+    endpoint = f"{GEMINI_ENDPOINT}/models/{model}:generateContent?key={api_key}"
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"Gemini request failed ({exc.code}): {raw}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Gemini request failed: {exc.reason}") from exc
+    try:
+        payload = json.loads(raw)
+    except Exception as exc:
+        raise RuntimeError(f"Gemini response parse failed: {exc}") from exc
+    if isinstance(payload, dict) and payload.get("error"):
+        message = payload.get("error", {}).get("message", raw)
+        raise RuntimeError(f"Gemini request failed: {message}")
+    if isinstance(payload, dict):
+        text = _extract_gemini_text(payload)
+        if text:
+            return text, []
+    return str(payload).strip(), []
+
+
+def _call_council(
+    prompt: str,
+    *,
+    enable_web_search: bool = True,
+    image_base64: str | None = None,
+    image_mime: str | None = None,
+    fallback_prompt: str | None = None,
+    chair_instructions: list[str] | None = None,
+) -> tuple[str, list[dict[str, str]]]:
+    opinions: list[tuple[str, str]] = []
+    errors: list[str] = []
+    lock = threading.Lock()
+    ready = threading.Event()
+    completed = 0
+    total = 3
+    quorum = 2
+
+    def _mark_done() -> None:
+        nonlocal completed
+        completed += 1
+        if len(opinions) >= quorum or completed >= total:
+            ready.set()
+
+    def _record_success(label: str, text: str | None) -> None:
+        with lock:
+            if text:
+                opinions.append((label, text))
+            else:
+                errors.append(f"{label} returned empty response.")
+            _mark_done()
+
+    def _record_error(label: str, exc: Exception) -> None:
+        with lock:
+            errors.append(f"{label} failed: {exc}")
+            _mark_done()
+
+    def _run_openai() -> None:
+        try:
+            text, _ = _call_openai(
+                prompt,
+                image_base64=image_base64,
+                image_mime=image_mime,
+                enable_web_search=enable_web_search,
+            )
+            _record_success("OpenAI GPT-5.2 analyst", text)
+        except Exception as exc:
+            _record_error("OpenAI analyst", exc)
+
+    def _run_anthropic() -> None:
+        try:
+            text, _ = _call_anthropic(
+                prompt,
+                enable_web_search=enable_web_search,
+                image_base64=image_base64,
+                image_mime=image_mime,
+            )
+            _record_success("Claude Opus 4.5 analyst", text)
+        except Exception as exc:
+            _record_error("Claude analyst", exc)
+
+    def _run_gemini() -> None:
+        try:
+            text, _ = _call_gemini(
+                prompt,
+                image_base64=image_base64,
+                image_mime=image_mime,
+                enable_web_search=enable_web_search,
+            )
+            _record_success("Gemini 3 Pro analyst", text)
+        except Exception as exc:
+            _record_error("Gemini analyst", exc)
+
+    threads = [
+        threading.Thread(target=_run_openai, daemon=True),
+        threading.Thread(target=_run_anthropic, daemon=True),
+        threading.Thread(target=_run_gemini, daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+
+    ready.wait()
+    with lock:
+        opinions_snapshot = list(opinions)
+        errors_snapshot = list(errors)
+
+    if chair_instructions is None:
+        chair_instructions = [
+            "You are the council chair. Synthesize the best final response.",
+            "Follow the original instructions EXACTLY: output ONLY the final response in the required 4-line format plus <setting_json>.",
+            "Prefer step-change recommendations over incremental tweaks and honor the user goals.",
+    ]
+    council_sections: list[str] = [
+        *chair_instructions,
+        "",
+        "Original task:",
+        prompt,
+    ]
+    if opinions_snapshot:
+        council_sections.append("")
+        council_sections.append("Council feedback:")
+        for name, text in opinions_snapshot:
+            council_sections.append(f"{name}:\n{text}")
+    if errors_snapshot:
+        council_sections.append("")
+        council_sections.append("Notes:")
+        council_sections.extend(errors_snapshot)
+
+    chair_prompt = "\n".join(council_sections).strip()
+    try:
+        text, _ = _call_openai(
+            chair_prompt,
+            image_base64=image_base64,
+            image_mime=image_mime,
+            enable_web_search=enable_web_search,
+        )
+        return text, []
+    except Exception:
+        # Fall back to the best available opinion.
+        if opinions_snapshot:
+            return opinions_snapshot[0][1], []
+        raise
 
 
 def _is_anthropic_rate_limit_error(exc: Exception) -> bool:
@@ -3478,6 +4695,14 @@ def _call_analyzer(
             prompt,
             image_base64=image_base64,
             image_mime=image_mime,
+        )
+    if analyzer_key == "council":
+        return _call_council(
+            prompt,
+            enable_web_search=enable_web_search,
+            image_base64=image_base64,
+            image_mime=image_mime,
+            fallback_prompt=fallback_prompt,
         )
     try:
         return _call_anthropic(
@@ -3542,12 +4767,20 @@ def _build_receipt_analysis_prompt(
     allowed_settings: list[str],
     user_goals: list[str] | None,
     user_notes: str | None,
+    history_text: str | None = None,
+    model_options_line: str | None = None,
     enable_web_search: bool = True,
 ) -> str:
     explicit_lines = "\n".join(f"- {key}: {value}" for key, value in explicit_fields.items())
     allowed_line = ", ".join(allowed_settings) if allowed_settings else "(none)"
     goals_line = ", ".join(user_goals) if user_goals else "(not specified)"
     notes_line = user_notes.strip() if user_notes else ""
+    history_block = ""
+    if history_text:
+        history_block = f"Session history (previous rounds):\n{history_text}\n\n"
+    model_block = ""
+    if model_options_line:
+        model_block = f"{model_options_line}\n"
     summary = {
         "request": receipt.get("request"),
         "resolved": receipt.get("resolved"),
@@ -3570,17 +4803,31 @@ def _build_receipt_analysis_prompt(
         "ADH: brief prompt adherence summary (1 sentence).\n"
         "UNSET: list 2–4 most important unset params (short list).\n"
         "COST: estimated USD cost per image for this provider/model (short).\n"
-        "REC: exactly ONE short recommendation aligned to user goals.\n\n"
+        "REC: 1–3 short recommendations aligned to user goals. "
+        "If speed is a priority, you may suggest unconventional levers (e.g., output format/filetype, "
+        "compression, or size tradeoffs) in addition to standard settings. "
+        "Prefer step-change recommendations over incremental tweaks (avoid tiny deltas like steps 20→30); "
+        "think big and unconventional when it helps meet the goals.\n\n"
         f"Target prompt:\n{target_prompt}\n\n"
         f"Explicitly set in the flow:\n{explicit_lines}\n\n"
         f"User goals (multi-select): {goals_line}\n"
+        "If the user selected 'maximize quality of render', treat this as an optimization problem: "
+        "prioritize maximizing prompt adherence and LLM-rated image quality, even if it increases cost/time.\n"
         f"User notes: {notes_line or '(none)'}\n\n"
         f"{web_search_text}"
-        f"Allowed settings for recommendation (choose ONE for the rerun): {allowed_line}\n\n"
-        "At the end, output a JSON object wrapped in <setting_json>...</setting_json> with keys:\n"
-        "setting_name, setting_value, setting_target, rationale.\n"
-        "Use setting_target='provider_options' and setting_name from the allowed list. "
-        "If no safe recommendation, set setting_name to null.\n\n"
+        f"{history_block}"
+        f"{model_block}"
+        f"Allowed settings for recommendations (API settings for this model): {allowed_line}\n"
+        "Model changes must stay within the same provider and use the listed model options.\n"
+        "Use setting_target='provider_options' for provider-specific options, "
+        "and setting_target='request' for top-level settings like size, n, seed, "
+        "output_format, background, or model.\n\n"
+        "If you have reached a local maximum for the user's goals, you may signal stopping by "
+        "returning <setting_json>{\"stop\": true, \"reason\": \"...\", \"recommendations\": [...]}</setting_json> "
+        "(recommendations can be empty). When stop=true, recommend exporting the latest receipt.\n\n"
+        "At the end, output a JSON array (max 3 items) wrapped in <setting_json>...</setting_json> "
+        "with objects that include keys: setting_name, setting_value, setting_target, rationale. "
+        "If no safe recommendation, output an empty array.\n\n"
         "Receipt summary JSON:\n"
         f"{summary_json}"
     )
@@ -3594,12 +4841,20 @@ def _build_recommendation_only_prompt(
     model: str | None,
     user_goals: list[str] | None,
     user_notes: str | None,
+    history_text: str | None = None,
+    model_options_line: str | None = None,
     enable_web_search: bool = True,
 ) -> str:
     allowed_line = ", ".join(allowed_settings) if allowed_settings else "(none)"
     model_label = model or "(default)"
     goals_line = ", ".join(user_goals) if user_goals else "(not specified)"
     notes_line = user_notes.strip() if user_notes else ""
+    history_block = ""
+    if history_text:
+        history_block = f"Session history (previous rounds):\n{history_text}\n"
+    model_block = ""
+    if model_options_line:
+        model_block = f"{model_options_line}\n"
     web_search_text = ""
     if enable_web_search:
         web_search_text = (
@@ -3608,14 +4863,29 @@ def _build_recommendation_only_prompt(
         )
     return (
         "You are an expert image-generation assistant. "
-        "Based on the receipt summary, recommend exactly ONE API setting change to improve prompt adherence. "
+        "Based on the receipt summary, recommend 1–3 API setting changes to improve prompt adherence. "
         "Only choose from the allowed settings list. "
-        "Output ONLY a JSON object wrapped in <setting_json>...</setting_json> with keys: "
-        "setting_name, setting_value, setting_target, rationale.\n\n"
+        "Output ONLY a JSON array wrapped in <setting_json>...</setting_json> with objects that include keys: "
+        "setting_name, setting_value, setting_target, rationale. If no safe recommendation, output an empty array.\n\n"
         f"Provider: {provider}\nModel: {model_label}\n"
         f"User goals (multi-select): {goals_line}\n"
+        "If the user selected 'maximize quality of render', treat this as an optimization problem: "
+        "prioritize maximizing prompt adherence and LLM-rated image quality, even if it increases cost/time.\n"
         f"User notes: {notes_line or '(none)'}\n"
         f"{web_search_text}"
+        f"{history_block}"
+        f"{model_block}"
+        "If speed is a priority, consider unconventional levers (e.g., output format/filetype, "
+        "compression, or size tradeoffs) but still choose from the allowed list. "
+        "Prefer step-change recommendations over incremental tweaks (avoid tiny deltas like steps 20→30); "
+        "think big and unconventional when it helps meet the goals.\n"
+        "Model changes must stay within the same provider and use the listed model options.\n"
+        "Use setting_target='provider_options' for provider-specific options, "
+        "and setting_target='request' for top-level settings like size, n, seed, "
+        "output_format, background, or model.\n"
+        "If you have reached a local maximum for the user's goals, you may signal stopping by "
+        "returning <setting_json>{\"stop\": true, \"reason\": \"...\", \"recommendations\": [...]}</setting_json> "
+        "(recommendations can be empty). When stop=true, recommend exporting the latest receipt.\n"
         f"Allowed settings: {allowed_line}\n\n"
         f"Receipt summary JSON:\n{summary_json}"
     )
@@ -3632,7 +4902,8 @@ def _analyze_receipt_payload(
     analyzer: str | None = None,
     user_goals: list[str] | None = None,
     user_notes: str | None = None,
-) -> tuple[str, list[dict[str, str]], dict | None, str | None]:
+    history_text: str | None = None,
+) -> tuple[str, list[dict[str, str]], list[dict] | None, str | None, str | None]:
     analyzer_key = _normalize_analyzer(analyzer)
     receipt = _load_receipt_payload(receipt_path)
     image_path = None
@@ -3652,7 +4923,9 @@ def _analyze_receipt_payload(
         "out_dir": str(out_dir),
     }
     target_prompt = FIXED_PROMPT
-    allowed_settings = _allowed_settings_for_provider(provider)
+    allowed_settings = _allowed_settings_for_receipt(receipt, provider)
+    allowed_models = _allowed_models_for_provider(provider, model)
+    model_options_line = _model_options_line(provider, size, model)
     summary = {
         "request": receipt.get("request"),
         "resolved": receipt.get("resolved"),
@@ -3661,7 +4934,7 @@ def _analyze_receipt_payload(
         "result_metadata": receipt.get("result_metadata"),
     }
     summary_json = json.dumps(summary, indent=2, ensure_ascii=True)
-    allow_web_search = analyzer_key == "anthropic"
+    allow_web_search = analyzer_key in {"anthropic", "council"}
     prompt = _build_receipt_analysis_prompt(
         receipt=receipt,
         explicit_fields=explicit_fields,
@@ -3669,6 +4942,8 @@ def _analyze_receipt_payload(
         allowed_settings=allowed_settings,
         user_goals=user_goals,
         user_notes=user_notes,
+        history_text=history_text,
+        model_options_line=model_options_line,
         enable_web_search=allow_web_search,
     )
     fallback_prompt = None
@@ -3680,6 +4955,8 @@ def _analyze_receipt_payload(
             allowed_settings=allowed_settings,
             user_goals=user_goals,
             user_notes=user_notes,
+            history_text=history_text,
+            model_options_line=model_options_line,
             enable_web_search=False,
         )
     image_base64 = None
@@ -3704,22 +4981,38 @@ def _analyze_receipt_payload(
             analyzer=analyzer_key,
         )
     analysis_text = _normalize_rec_line(analysis_text)
-    cleaned_text, recommendation = _extract_setting_json(analysis_text)
+    cleaned_text, recommendation_payload = _extract_setting_json(analysis_text)
+    recs_payload, stop_reason, stop_recommended = _parse_recommendation_payload(recommendation_payload)
     cleaned_text = _normalize_rec_line(cleaned_text)
     rec_text = _rec_line_text(cleaned_text)
-    if recommendation:
-        setting_name = str(recommendation.get("setting_name") or "").strip().lower()
-        setting_value = str(recommendation.get("setting_value") or "").strip().lower()
-        if not setting_name or setting_name in {"none", "null", "no_change", "no change", "n/a"}:
-            recommendation = None
-        elif not setting_value or setting_value in {"none", "null", "no_change", "no change", "n/a"}:
-            recommendation = None
+    recommendations = _normalize_recommendations(recs_payload)
+    resolved = receipt.get("resolved") if isinstance(receipt, dict) else None
+    request = receipt.get("request") if isinstance(receipt, dict) else None
+    recommendations = _filter_noop_recommendations(
+        recommendations,
+        resolved,
+        request,
+        provider=provider,
+        model=model,
+    )
+    recommendations = _filter_locked_size_recommendations(recommendations, size)
+    recommendations = _filter_model_recommendations(recommendations, allowed_models)
     if rec_text and "no change" in rec_text:
-        recommendation = None
+        recommendations = []
     cleaned_text, cost_line = _extract_cost_line(cleaned_text)
-    if not cost_line:
-        cost_line = _estimate_cost_only(provider=provider, model=model, size=size, n=n)
-    if not recommendation or not recommendation.get("setting_name"):
+    local_cost_line = _estimate_cost_only(provider=provider, model=model, size=size, n=n)
+    cost_line = local_cost_line
+    recommendations = _sanitize_recommendation_rationales(
+        recommendations,
+        cost_line,
+        provider=provider,
+        size=size,
+        n=n,
+    )
+    if stop_recommended:
+        recommendations = []
+    cleaned_text = _rewrite_rec_line(cleaned_text, recommendations, stop_reason)
+    if not recommendations:
         fallback_prompt = _build_recommendation_only_prompt(
             summary_json=summary_json,
             allowed_settings=allowed_settings,
@@ -3727,6 +5020,8 @@ def _analyze_receipt_payload(
             model=model,
             user_goals=user_goals,
             user_notes=user_notes,
+            history_text=history_text,
+            model_options_line=model_options_line,
             enable_web_search=allow_web_search,
         )
         fallback_prompt_no_search = None
@@ -3738,6 +5033,8 @@ def _analyze_receipt_payload(
                 model=model,
                 user_goals=user_goals,
                 user_notes=user_notes,
+                history_text=history_text,
+                model_options_line=model_options_line,
                 enable_web_search=False,
             )
         fallback_text, _ = _call_analyzer(
@@ -3746,10 +5043,30 @@ def _analyze_receipt_payload(
             enable_web_search=allow_web_search,
             fallback_prompt=fallback_prompt_no_search,
         )
-        _, fallback_recommendation = _extract_setting_json(fallback_text)
-        if fallback_recommendation and fallback_recommendation.get("setting_name"):
-            recommendation = fallback_recommendation
-    return cleaned_text, citations, recommendation, cost_line
+        _, fallback_payload = _extract_setting_json(fallback_text)
+        recs_payload, fallback_stop_reason, fallback_stop = _parse_recommendation_payload(fallback_payload)
+        recommendations = _normalize_recommendations(recs_payload)
+        recommendations = _filter_noop_recommendations(
+            recommendations,
+            resolved,
+            request,
+            provider=provider,
+            model=model,
+        )
+        recommendations = _filter_locked_size_recommendations(recommendations, size)
+        recommendations = _filter_model_recommendations(recommendations, allowed_models)
+        recommendations = _sanitize_recommendation_rationales(
+            recommendations,
+            cost_line,
+            provider=provider,
+            size=size,
+            n=n,
+        )
+        if fallback_stop:
+            stop_reason = fallback_stop_reason or stop_reason
+            recommendations = []
+        cleaned_text = _rewrite_rec_line(cleaned_text, recommendations, stop_reason)
+    return cleaned_text, citations, recommendations or None, cost_line, stop_reason
 
 
 def _analyze_receipt(
@@ -3764,8 +5081,10 @@ def _analyze_receipt(
 ) -> None:
     analyzer_key = _normalize_analyzer(analyzer)
     print(f"\nAnalyzing receipt with {_analyzer_display_name(analyzer_key)}...")
+    if analyzer_key == "council":
+        print("Note: Council analysis can take a few minutes.")
     try:
-        analysis, citations, recommendation, _ = _analyze_receipt_payload(
+        analysis, citations, recommendation, _, stop_reason = _analyze_receipt_payload(
             receipt_path=receipt_path,
             provider=provider,
             model=model,
@@ -3783,6 +5102,7 @@ def _analyze_receipt(
             receipt_payload,
             recommendation,
             max_width=max(40, _term_width() - 2),
+            stop_reason=stop_reason,
         )
     except Exception:
         detail_lines = []
@@ -3792,7 +5112,7 @@ def _analyze_receipt(
     else:
         print("Receipt analysis returned no content.")
     if detail_lines:
-        print("\nReceipt settings & recommendation:")
+        print("\nReceipt settings & recommendations:")
         for line in detail_lines:
             if isinstance(line, str):
                 print(line)
@@ -3814,8 +5134,7 @@ def _run_generation(args: argparse.Namespace) -> int:
     _load_repo_dotenv()
     _ensure_modulette_on_path()
     args.analyzer = _resolve_receipt_analyzer(getattr(args, "analyzer", None))
-
-    from modulette import generate
+    from modulette import generate, stream
 
     normalized_provider, normalized_model = _normalize_provider_and_model(args.provider, args.model)
     args.provider = normalized_provider
@@ -3825,6 +5144,16 @@ def _run_generation(args: argparse.Namespace) -> int:
         args.provider_options = {}
     if not hasattr(args, "seed"):
         args.seed = None
+    if not hasattr(args, "output_format"):
+        args.output_format = None
+    if not hasattr(args, "background"):
+        args.background = None
+    if not hasattr(args, "openai_stream"):
+        args.openai_stream = _env_flag(OPENAI_STREAM_ENV)
+    if not hasattr(args, "openai_responses"):
+        args.openai_responses = _env_flag(OPENAI_RESPONSES_ENV)
+    openai_stream, openai_responses = _apply_openai_provider_flags(args)
+    use_stream = bool(openai_stream and _is_openai_gpt_image(args.provider, args.model))
     _ensure_api_keys(args.provider, _find_repo_dotenv())
     prompts = args.prompt or list(DEFAULT_PROMPTS)
     out_dir = Path(args.out).expanduser().resolve()
@@ -3844,16 +5173,37 @@ def _run_generation(args: argparse.Namespace) -> int:
         spinner.start()
         stopped = False
         try:
-            results = generate(
-                prompt=prompt,
-                provider=args.provider,
-                size=args.size,
-                n=args.n,
-                out_dir=out_dir,
-                model=args.model,
-                provider_options=args.provider_options,
-                seed=args.seed,
-            )
+            if use_stream:
+                results = []
+                for event in stream(
+                    prompt=prompt,
+                    provider=args.provider,
+                    size=args.size,
+                    n=args.n,
+                    out_dir=out_dir,
+                    model=args.model,
+                    provider_options=args.provider_options,
+                    seed=args.seed,
+                    output_format=args.output_format,
+                    background=args.background,
+                ):
+                    if event.type == "error":
+                        raise RuntimeError(event.message or "Streaming failed.")
+                    if event.type == "final" and event.result is not None:
+                        results.append(event.result)
+            else:
+                results = generate(
+                    prompt=prompt,
+                    provider=args.provider,
+                    size=args.size,
+                    n=args.n,
+                    out_dir=out_dir,
+                    model=args.model,
+                    provider_options=args.provider_options,
+                    seed=args.seed,
+                    output_format=args.output_format,
+                    background=args.background,
+                )
         except Exception as exc:
             spinner.stop()
             stopped = True
@@ -3874,7 +5224,7 @@ def _run_generation(args: argparse.Namespace) -> int:
             print(result.receipt_path)
             all_receipts.append(Path(result.receipt_path))
             last_image_path = Path(result.image_path)
-            print("Stamping snapshot (Claude scoring)...")
+            print("Stamping snapshot (Council scoring)...")
             _apply_snapshot_for_result(
                 image_path=Path(result.image_path),
                 receipt_path=Path(result.receipt_path),
@@ -3915,6 +5265,17 @@ def main() -> int:
     parser.add_argument("--size", default="portrait", help="Size (e.g., portrait, 1024x1024, 16:9)")
     parser.add_argument("--n", type=int, default=1, help="Number of images per prompt")
     parser.add_argument(
+        "--output-format",
+        dest="output_format",
+        default=None,
+        help="Optional output format (e.g., jpeg, png, webp)",
+    )
+    parser.add_argument(
+        "--background",
+        default=None,
+        help="Optional background (e.g., transparent or opaque)",
+    )
+    parser.add_argument(
         "--out",
         default="outputs/param_forge",
         help="Output directory (default: outputs/param_forge)",
@@ -3935,9 +5296,23 @@ def main() -> int:
         action="store_true",
         help="Disable ANSI colors in interactive mode.",
     )
+    parser.add_argument(
+        "--openai-stream",
+        action="store_true",
+        help="Use OpenAI streaming for gpt-image models.",
+    )
+    parser.add_argument(
+        "--openai-responses",
+        action="store_true",
+        help="Use OpenAI Responses API for gpt-image models.",
+    )
     args = parser.parse_args()
     if args.analyzer:
         os.environ[RECEIPT_ANALYZER_ENV] = args.analyzer
+    if args.openai_stream:
+        os.environ[OPENAI_STREAM_ENV] = "1"
+    if args.openai_responses:
+        os.environ[OPENAI_RESPONSES_ENV] = "1"
     if args.interactive or (len(sys.argv) == 1 and not args.defaults):
         color_override = False if args.no_color else None
         try:
