@@ -31,6 +31,7 @@ python scripts/param_forge.py
 Set the key for the provider you plan to use. You can export env vars or create a local `.env` file.
 
 - OpenAI: `OPENAI_API_KEY`
+- Anthropic (receipt analyzer default): `ANTHROPIC_API_KEY`
 - Gemini: `GEMINI_API_KEY` (or `GOOGLE_API_KEY`)
 - Flux: `BFL_API_KEY` (or `FLUX_API_KEY`)
 - Imagen: `GOOGLE_API_KEY` or Vertex credentials (for example `GOOGLE_APPLICATION_CREDENTIALS`)
@@ -53,6 +54,15 @@ Non-interactive defaults:
 python scripts/param_forge.py --defaults
 ```
 
+Receipt analyzer provider:
+- Default: Anthropic (`anthropic`).
+- Override with env var: `RECEIPT_ANALYZER=openai` (or `anthropic`).
+- Or pass `--analyzer openai` on the CLI.
+
 ## Notes
 - If curses can’t initialize (TERM issues or small terminal), the script falls back to a raw prompt flow.
 - Receipts are stored next to generated images in the output directory.
+- Pricing reference (per-image costs): docs/pricing_reference.md, docs/pricing_reference.json
+
+## Backlog
+- If you want that pre-cost call to run for any analysis (not just cost goal), say the word.

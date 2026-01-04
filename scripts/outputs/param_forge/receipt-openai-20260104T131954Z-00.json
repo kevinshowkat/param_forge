@@ -1,0 +1,93 @@
+{
+  "request": {
+    "prompt": "Portrait of a curious red fox peeking through tall meadow grass, soft morning light",
+    "mode": "generate",
+    "size": "square",
+    "n": 1,
+    "seed": null,
+    "output_format": null,
+    "background": null,
+    "inputs": {
+      "init_image": null,
+      "mask": null,
+      "reference_images": []
+    },
+    "provider": "openai",
+    "provider_options": {},
+    "user": null,
+    "out_dir": "/Users/mainframe/Desktop/projects/param_forge/scripts/outputs/param_forge",
+    "stream": false,
+    "partial_images": null,
+    "model": "gpt-image-1.5",
+    "metadata": {}
+  },
+  "resolved": {
+    "provider": "openai",
+    "model": "gpt-image-1.5",
+    "size": "1024x1024",
+    "width": 1024,
+    "height": 1024,
+    "output_format": "jpeg",
+    "background": null,
+    "seed": null,
+    "n": 1,
+    "user": null,
+    "prompt": "Portrait of a curious red fox peeking through tall meadow grass, soft morning light",
+    "inputs": {
+      "init_image": null,
+      "mask": null,
+      "reference_images": []
+    },
+    "stream": false,
+    "partial_images": null,
+    "provider_params": {
+      "size": "1024x1024",
+      "quality": "high",
+      "moderation": "low"
+    },
+    "warnings": []
+  },
+  "provider_request": {
+    "model": "gpt-image-1.5",
+    "prompt": "Portrait of a curious red fox peeking through tall meadow grass, soft morning light",
+    "image_count": 1,
+    "size": "1024x1024",
+    "output_format": "jpeg"
+  },
+  "provider_response": {
+    "created": 1767532804,
+    "background": "opaque",
+    "data": "<omitted>",
+    "output_format": "jpeg",
+    "quality": "high",
+    "size": "1024x1024",
+    "usage": {
+      "input_tokens": 22,
+      "input_tokens_details": {
+        "image_tokens": 0,
+        "text_tokens": 22
+      },
+      "output_tokens": 4542,
+      "total_tokens": 4564,
+      "output_tokens_details": {
+        "image_tokens": 4160,
+        "text_tokens": 382
+      }
+    }
+  },
+  "warnings": [],
+  "artifacts": {
+    "image_path": "/Users/mainframe/Desktop/projects/param_forge/scripts/outputs/param_forge/openai-20260104T131954Z-00.jpg",
+    "receipt_path": "/Users/mainframe/Desktop/projects/param_forge/scripts/outputs/param_forge/receipt-openai-20260104T131954Z-00.json"
+  },
+  "result_metadata": {
+    "provider_metadata": {
+      "payload": {
+        "revised_prompt": null,
+        "url": null
+      },
+      "metadata": {}
+    },
+    "provider_request_id": null
+  }
+}

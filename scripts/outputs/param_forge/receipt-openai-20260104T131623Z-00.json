@@ -1,0 +1,93 @@
+{
+  "request": {
+    "prompt": "Moss-covered forest floor with sunbeams through mist, macro detail",
+    "mode": "generate",
+    "size": "portrait",
+    "n": 1,
+    "seed": null,
+    "output_format": null,
+    "background": null,
+    "inputs": {
+      "init_image": null,
+      "mask": null,
+      "reference_images": []
+    },
+    "provider": "openai",
+    "provider_options": {},
+    "user": null,
+    "out_dir": "/Users/mainframe/Desktop/projects/param_forge/scripts/outputs/param_forge",
+    "stream": false,
+    "partial_images": null,
+    "model": "gpt-image-1.5",
+    "metadata": {}
+  },
+  "resolved": {
+    "provider": "openai",
+    "model": "gpt-image-1.5",
+    "size": "1024x1536",
+    "width": 1024,
+    "height": 1536,
+    "output_format": "jpeg",
+    "background": null,
+    "seed": null,
+    "n": 1,
+    "user": null,
+    "prompt": "Moss-covered forest floor with sunbeams through mist, macro detail",
+    "inputs": {
+      "init_image": null,
+      "mask": null,
+      "reference_images": []
+    },
+    "stream": false,
+    "partial_images": null,
+    "provider_params": {
+      "size": "1024x1536",
+      "quality": "high",
+      "moderation": "low"
+    },
+    "warnings": []
+  },
+  "provider_request": {
+    "model": "gpt-image-1.5",
+    "prompt": "Moss-covered forest floor with sunbeams through mist, macro detail",
+    "image_count": 1,
+    "size": "1024x1536",
+    "output_format": "jpeg"
+  },
+  "provider_response": {
+    "created": 1767532593,
+    "background": "opaque",
+    "data": "<omitted>",
+    "output_format": "jpeg",
+    "quality": "high",
+    "size": "1024x1536",
+    "usage": {
+      "input_tokens": 20,
+      "input_tokens_details": {
+        "image_tokens": 0,
+        "text_tokens": 20
+      },
+      "output_tokens": 6656,
+      "total_tokens": 6676,
+      "output_tokens_details": {
+        "image_tokens": 6240,
+        "text_tokens": 416
+      }
+    }
+  },
+  "warnings": [],
+  "artifacts": {
+    "image_path": "/Users/mainframe/Desktop/projects/param_forge/scripts/outputs/param_forge/openai-20260104T131623Z-00.jpg",
+    "receipt_path": "/Users/mainframe/Desktop/projects/param_forge/scripts/outputs/param_forge/receipt-openai-20260104T131623Z-00.json"
+  },
+  "result_metadata": {
+    "provider_metadata": {
+      "payload": {
+        "revised_prompt": null,
+        "url": null
+      },
+      "metadata": {}
+    },
+    "provider_request_id": null
+  }
+}

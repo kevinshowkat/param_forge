@@ -1,0 +1,128 @@
+{
+  "request": {
+    "prompt": "Generate an image of a California brown pelican riding a bicycle. The bicycle must have spokes and a correctly shaped bicycle frame. The pelican must have its characteristic large pouch, and there should be a clear indication of feathers. The pelican must clearly be pedaling the bicycle. The image should show the full breeding plumage of the Californian brown pelican.",
+    "mode": "generate",
+    "size": "4:5",
+    "n": 1,
+    "seed": null,
+    "output_format": null,
+    "background": null,
+    "inputs": {
+      "init_image": null,
+      "mask": null,
+      "reference_images": []
+    },
+    "provider": "gemini",
+    "provider_options": {},
+    "user": null,
+    "out_dir": "/Users/mainframe/Desktop/projects/param_forge/scripts/outputs/param_forge",
+    "stream": false,
+    "partial_images": null,
+    "model": "gemini-2.5-flash-image",
+    "metadata": {}
+  },
+  "resolved": {
+    "provider": "gemini",
+    "model": "gemini-2.5-flash-image",
+    "size": "4:5",
+    "width": null,
+    "height": null,
+    "output_format": "jpeg",
+    "background": null,
+    "seed": null,
+    "n": 1,
+    "user": null,
+    "prompt": "Generate an image of a California brown pelican riding a bicycle. The bicycle must have spokes and a correctly shaped bicycle frame. The pelican must have its characteristic large pouch, and there should be a clear indication of feathers. The pelican must clearly be pedaling the bicycle. The image should show the full breeding plumage of the Californian brown pelican.",
+    "inputs": {
+      "init_image": null,
+      "mask": null,
+      "reference_images": []
+    },
+    "stream": false,
+    "partial_images": null,
+    "provider_params": {
+      "aspect_ratio": "4:5",
+      "image_size": "2K"
+    },
+    "warnings": []
+  },
+  "provider_request": {
+    "model": "gemini-2.5-flash-image",
+    "prompt": "Generate an image of a California brown pelican riding a bicycle. The bicycle must have spokes and a correctly shaped bicycle frame. The pelican must have its characteristic large pouch, and there should be a clear indication of feathers. The pelican must clearly be pedaling the bicycle. The image should show the full breeding plumage of the Californian brown pelican.",
+    "config": {
+      "http_options": null,
+      "should_return_http_response": null,
+      "system_instruction": null,
+      "temperature": null,
+      "top_p": null,
+      "top_k": null,
+      "candidate_count": 1,
+      "max_output_tokens": null,
+      "stop_sequences": null,
+      "response_logprobs": null,
+      "logprobs": null,
+      "presence_penalty": null,
+      "frequency_penalty": null,
+      "seed": null,
+      "response_mime_type": null,
+      "response_schema": null,
+      "response_json_schema": null,
+      "routing_config": null,
+      "model_selection_config": null,
+      "safety_settings": [
+        {
+          "category": "HARM_CATEGORY_HARASSMENT",
+          "method": null,
+          "threshold": "OFF"
+        },
+        {
+          "category": "HARM_CATEGORY_HATE_SPEECH",
+          "method": null,
+          "threshold": "OFF"
+        },
+        {
+          "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+          "method": null,
+          "threshold": "OFF"
+        },
+        {
+          "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+          "method": null,
+          "threshold": "OFF"
+        }
+      ],
+      "tools": null,
+      "tool_config": null,
+      "labels": null,
+      "cached_content": null,
+      "response_modalities": [
+        "IMAGE"
+      ],
+      "media_resolution": null,
+      "speech_config": null,
+      "audio_timestamp": null,
+      "automatic_function_calling": null,
+      "thinking_config": null,
+      "image_config": {
+        "aspect_ratio": "4:5",
+        "image_size": "2K"
+      }
+    }
+  },
+  "provider_response": {
+    "model": "gemini-2.5-flash-image",
+    "candidates": 1
+  },
+  "warnings": [],
+  "artifacts": {
+    "image_path": "/Users/mainframe/Desktop/projects/param_forge/scripts/outputs/param_forge/gemini-20260104T151633Z-00.png",
+    "receipt_path": "/Users/mainframe/Desktop/projects/param_forge/scripts/outputs/param_forge/receipt-gemini-20260104T151633Z-00.json"
+  },
+  "result_metadata": {
+    "provider_metadata": {
+      "candidate_index": 0,
+      "mime_type": "image/png"
+    },
+    "provider_request_id": null
+  }
+}

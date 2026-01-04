@@ -1,0 +1,99 @@
+{
+  "request": {
+    "prompt": "Generate an image of a California brown pelican riding a bicycle. The bicycle must have spokes and a correctly shaped bicycle frame. The pelican must have its characteristic large pouch, and there should be a clear indication of feathers. The pelican must clearly be pedaling the bicycle. The image should show the full breeding plumage of the Californian brown pelican.",
+    "mode": "generate",
+    "size": "4:5",
+    "n": 1,
+    "seed": null,
+    "output_format": null,
+    "background": null,
+    "inputs": {
+      "init_image": null,
+      "mask": null,
+      "reference_images": []
+    },
+    "provider": "openai",
+    "provider_options": {
+      "quality": "low"
+    },
+    "user": null,
+    "out_dir": "/Users/mainframe/Desktop/projects/param_forge/scripts/outputs/param_forge",
+    "stream": false,
+    "partial_images": null,
+    "model": "gpt-image-1.5",
+    "metadata": {}
+  },
+  "resolved": {
+    "provider": "openai",
+    "model": "gpt-image-1.5",
+    "size": "1024x1536",
+    "width": 1024,
+    "height": 1536,
+    "output_format": "jpeg",
+    "background": null,
+    "seed": null,
+    "n": 1,
+    "user": null,
+    "prompt": "Generate an image of a California brown pelican riding a bicycle. The bicycle must have spokes and a correctly shaped bicycle frame. The pelican must have its characteristic large pouch, and there should be a clear indication of feathers. The pelican must clearly be pedaling the bicycle. The image should show the full breeding plumage of the Californian brown pelican.",
+    "inputs": {
+      "init_image": null,
+      "mask": null,
+      "reference_images": []
+    },
+    "stream": false,
+    "partial_images": null,
+    "provider_params": {
+      "size": "1024x1536",
+      "quality": "low",
+      "moderation": "low"
+    },
+    "warnings": [
+      "OpenAI size snapped to 1024x1536."
+    ]
+  },
+  "provider_request": {
+    "model": "gpt-image-1.5",
+    "prompt": "Generate an image of a California brown pelican riding a bicycle. The bicycle must have spokes and a correctly shaped bicycle frame. The pelican must have its characteristic large pouch, and there should be a clear indication of feathers. The pelican must clearly be pedaling the bicycle. The image should show the full breeding plumage of the Californian brown pelican.",
+    "image_count": 1,
+    "size": "1024x1536",
+    "output_format": "jpeg"
+  },
+  "provider_response": {
+    "created": 1767539330,
+    "background": "opaque",
+    "data": "<omitted>",
+    "output_format": "jpeg",
+    "quality": "low",
+    "size": "1024x1536",
+    "usage": {
+      "input_tokens": 79,
+      "input_tokens_details": {
+        "image_tokens": 0,
+        "text_tokens": 79
+      },
+      "output_tokens": 555,
+      "total_tokens": 634,
+      "output_tokens_details": {
+        "image_tokens": 408,
+        "text_tokens": 147
+      }
+    }
+  },
+  "warnings": [
+    "OpenAI size snapped to 1024x1536."
+  ],
+  "artifacts": {
+    "image_path": "/Users/mainframe/Desktop/projects/param_forge/scripts/outputs/param_forge/openai-20260104T150840Z-00.jpg",
+    "receipt_path": "/Users/mainframe/Desktop/projects/param_forge/scripts/outputs/param_forge/receipt-openai-20260104T150840Z-00.json"
+  },
+  "result_metadata": {
+    "provider_metadata": {
+      "payload": {
+        "revised_prompt": null,
+        "url": null
+      },
+      "metadata": {}
+    },
+    "provider_request_id": null
+  }
+}
