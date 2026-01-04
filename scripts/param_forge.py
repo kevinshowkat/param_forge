@@ -1092,11 +1092,34 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
         def _generate_once(
             round_index: int,
             prev_settings: dict[str, object] | None,
-        ) -> tuple[list[Path], list[Path], bool, int, float | None, dict[str, object]]:
+            history_lines: list[str],
+        ) -> tuple[
+            list[Path],
+            list[Path],
+            bool,
+            int,
+            float | None,
+            dict[str, object],
+            list[str],
+        ]:
             stdscr.erase()
             height, width = stdscr.getmaxyx()
             stdscr.timeout(80)
             y = _draw_banner(stdscr, color_enabled, 1)
+            if history_lines:
+                for line in history_lines:
+                    if y >= height - 2:
+                        break
+                    _safe_addstr(
+                        stdscr,
+                        y,
+                        0,
+                        line[: max(0, width - 1)],
+                        curses.A_DIM,
+                    )
+                    y += 1
+                if y < height - 1:
+                    y += 1
             current_settings = _capture_call_settings(args)
             y = _render_generation_header(
                 stdscr,
@@ -1258,7 +1281,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                     stdscr.refresh()
                     stdscr.timeout(-1)
                     stdscr.getch()
-                    return receipts, images, True, y + 2, last_elapsed, current_settings
+                    return receipts, images, True, y + 2, last_elapsed, current_settings, []
 
                 results = result_holder.get("results", [])
                 for res in results:
@@ -1295,10 +1318,43 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                     stdscr.refresh()
                     break
 
-                y += 2
-                if y >= height - 2:
-                    y = min(height - 2, max(0, height - 3))
+            y += 2
+            if y >= height - 2:
+                y = min(height - 2, max(0, height - 3))
 
+            if cancel_requested:
+                return (
+                    receipts,
+                    images,
+                    cancel_requested,
+                    min(y + 2, height - 2),
+                    last_elapsed,
+                    current_settings,
+                    [],
+                )
+
+            history_block: list[str] = []
+            history_block.extend(
+                _build_generation_header_lines(
+                    round_index=round_index,
+                    prev_settings=prev_settings,
+                    current_settings=current_settings,
+                    max_width=max_prompt_width,
+                )
+            )
+            history_block.append("Prompts (sequence):")
+            for idx, prompt in enumerate(args.prompt, start=1):
+                history_block.append(
+                    _prompt_status_line(
+                        idx,
+                        total_prompts,
+                        prompt,
+                        "done",
+                        max_prompt_width,
+                    )
+                )
+            if last_elapsed is not None:
+                history_block.append(f"Completed in {last_elapsed:.1f}s")
             return (
                 receipts,
                 images,
@@ -1306,6 +1362,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                 min(y + 2, height - 2),
                 last_elapsed,
                 current_settings,
+                history_block,
             )
 
         reran_once = False
@@ -1322,6 +1379,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
         compare_next_open = False
         run_index = 1
         last_call_settings: dict[str, object] | None = None
+        history_lines: list[str] = []
         while True:
             (
                 receipts,
@@ -1330,7 +1388,12 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                 prompt_y,
                 last_elapsed,
                 last_call_settings,
-            ) = _generate_once(run_index, last_call_settings)
+                history_block,
+            ) = _generate_once(run_index, last_call_settings, history_lines)
+            if history_block:
+                if history_lines:
+                    history_lines.append("")
+                history_lines.extend(history_block)
             stdscr.timeout(-1)
             if cancel_requested:
                 height, width = stdscr.getmaxyx()
@@ -1687,6 +1750,32 @@ def _format_call_settings_line(settings: dict[str, object]) -> str:
     return line or "(no settings)"
 
 
+def _build_generation_header_lines(
+    *,
+    round_index: int,
+    prev_settings: dict[str, object] | None,
+    current_settings: dict[str, object],
+    max_width: int,
+) -> list[str]:
+    lines: list[str] = []
+    if prev_settings:
+        title = f"Round {round_index} (API changes vs Round {round_index - 1})"
+    else:
+        title = f"Round {round_index} (baseline API call)"
+    lines.extend(_wrap_text(title, max_width))
+    if prev_settings:
+        diffs = _diff_call_settings(prev_settings, current_settings)
+        if not diffs:
+            diffs = ["Change: none"]
+        for diff in diffs:
+            prefix = "Change: " if not diff.startswith("Change:") else ""
+            lines.extend(_wrap_text(f"{prefix}{diff}", max_width))
+    else:
+        settings_line = _format_call_settings_line(current_settings)
+        lines.extend(_wrap_text(settings_line, max_width))
+    return lines
+
+
 def _estimate_cost_value(
     *,
     provider: str | None,
@@ -1741,6 +1830,24 @@ def _format_cost_value(cost: float | None) -> str:
     if cost is None:
         return "N/A"
     return f"${_format_price(float(cost), digits=4)}"
+
+
+def _display_analysis_text(text: str) -> str:
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        stripped = raw_line.lstrip()
+        prefix = raw_line[: len(raw_line) - len(stripped)]
+        upper = stripped.upper()
+        if upper.startswith("ADH:"):
+            body = stripped[4:].strip()
+            lines.append(f"{prefix}Prompt adherence notes: {body}".rstrip())
+            continue
+        if upper.startswith("UNSET:"):
+            body = stripped[6:].strip()
+            lines.append(f"{prefix}API settings unchanged: {body}".rstrip())
+            continue
+        lines.append(raw_line)
+    return "\n".join(lines)
 
 
 def _clamp_score(value: object) -> int | None:
@@ -1821,8 +1928,8 @@ def _build_snapshot_lines(
     return [
         f"render: {elapsed_text}",
         f"cost: {_format_cost_value(cost)}",
-        f"claude adh: {adherence_text}",
-        f"claude qual: {quality_text}",
+        f"prompt adherence: {adherence_text}",
+        f"LLM-rated quality: {quality_text}",
     ]
 
 
@@ -1837,13 +1944,15 @@ def _apply_snapshot_overlay(image_path: Path, lines: list[str]) -> bool:
         image = Image.open(image_path).convert("RGBA")
     except Exception:
         return False
+    base_font_size = 18
+    scale_factor = 10.0
+    target_font_size = int(base_font_size * scale_factor)
+    font = None
     try:
-        font = ImageFont.truetype("Menlo.ttf", 14)
+        font = ImageFont.truetype("Menlo.ttf", target_font_size)
     except Exception:
         font = ImageFont.load_default()
     draw = ImageDraw.Draw(image)
-    padding = 6
-    line_spacing = 2
     max_w = 0
     line_heights: list[int] = []
     for line in lines:
@@ -1852,9 +1961,39 @@ def _apply_snapshot_overlay(image_path: Path, lines: list[str]) -> bool:
         height = bbox[3] - bbox[1]
         max_w = max(max_w, width)
         line_heights.append(max(10, height))
-    total_h = sum(line_heights) + line_spacing * (len(lines) - 1)
+    total_h = sum(line_heights) + int(4 * scale_factor) * (len(lines) - 1)
+    padding = int(10 * scale_factor)
     box_w = max_w + padding * 2
     box_h = total_h + padding * 2
+    if isinstance(font, ImageFont.FreeTypeFont):
+        max_w_allowed = int(image.width * 0.95)
+        max_h_allowed = int(image.height * 0.95)
+        if box_w > max_w_allowed or box_h > max_h_allowed:
+            scale_w = max_w_allowed / max(1, box_w)
+            scale_h = max_h_allowed / max(1, box_h)
+            scale_factor = max(0.2, min(scale_w, scale_h)) * scale_factor
+            adjusted_size = max(8, int(base_font_size * scale_factor))
+            try:
+                font = ImageFont.truetype("Menlo.ttf", adjusted_size)
+            except Exception:
+                font = ImageFont.load_default()
+            max_w = 0
+            line_heights = []
+            for line in lines:
+                bbox = draw.textbbox((0, 0), line, font=font)
+                width = bbox[2] - bbox[0]
+                height = bbox[3] - bbox[1]
+                max_w = max(max_w, width)
+                line_heights.append(max(10, height))
+            padding = int(10 * scale_factor)
+            line_spacing = int(4 * scale_factor)
+            total_h = sum(line_heights) + line_spacing * (len(lines) - 1)
+            box_w = max_w + padding * 2
+            box_h = total_h + padding * 2
+        else:
+            line_spacing = int(4 * scale_factor)
+    else:
+        line_spacing = int(4 * scale_factor)
 
     overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
     overlay_draw = ImageDraw.Draw(overlay)
@@ -1959,27 +2098,16 @@ def _render_generation_header(
     import curses
     header_attr = curses.color_pair(4) | curses.A_BOLD if color_enabled else curses.A_BOLD
     change_attr = curses.color_pair(3) | curses.A_BOLD if color_enabled else curses.A_BOLD
-    if prev_settings:
-        title = f"Round {round_index} (API changes vs Round {round_index - 1})"
-    else:
-        title = f"Round {round_index} (baseline API call)"
-    for line in _wrap_text(title, max(20, width - 1)):
-        _safe_addstr(stdscr, y, 0, line[: max(0, width - 1)], header_attr)
+    header_lines = _build_generation_header_lines(
+        round_index=round_index,
+        prev_settings=prev_settings,
+        current_settings=current_settings,
+        max_width=max(20, width - 1),
+    )
+    for idx, line in enumerate(header_lines):
+        attr = header_attr if idx == 0 else change_attr
+        _safe_addstr(stdscr, y, 0, line[: max(0, width - 1)], attr)
         y += 1
-    if prev_settings:
-        diffs = _diff_call_settings(prev_settings, current_settings)
-        if not diffs:
-            diffs = ["Change: none"]
-        for diff in diffs:
-            prefix = "Change: " if not diff.startswith("Change:") else ""
-            for line in _wrap_text(f"{prefix}{diff}", max(20, width - 1)):
-                _safe_addstr(stdscr, y, 0, line[: max(0, width - 1)], change_attr)
-                y += 1
-    else:
-        settings_line = _format_call_settings_line(current_settings)
-        for line in _wrap_text(settings_line, max(20, width - 1)):
-            _safe_addstr(stdscr, y, 0, line[: max(0, width - 1)], change_attr)
-            y += 1
     return y
 
 
@@ -2507,10 +2635,15 @@ def _show_receipt_analysis_curses(
         detail_lines = _wrap_text(f"Render settings unavailable: {exc}", max(20, width - 2))
 
     lines: list[str] = []
+    if user_goals:
+        goals_text = ", ".join(user_goals)
+        lines.append(f"User goals: {goals_text}")
+        lines.append("")
     lines.append("MODEL ANALYSIS (LLM)")
     lines.append("")
     if analysis:
-        lines.extend(_wrap_text(analysis, max(20, width - 2)))
+        display_analysis = _display_analysis_text(analysis)
+        lines.extend(_wrap_text(display_analysis, max(20, width - 2)))
     else:
         lines.append("Receipt analysis returned no content.")
     if detail_lines:
@@ -2559,10 +2692,13 @@ def _show_receipt_analysis_curses(
         )
         if action == "export":
             export_lines: list[str] = []
+            if user_goals:
+                export_lines.append(f"User goals: {', '.join(user_goals)}")
+                export_lines.append("")
             if analysis:
                 export_lines.append("MODEL ANALYSIS (LLM)")
                 export_lines.append("")
-                export_lines.extend(analysis.splitlines())
+                export_lines.extend(_display_analysis_text(analysis).splitlines())
             else:
                 export_lines.append("MODEL ANALYSIS (LLM)")
                 export_lines.append("")
@@ -3652,7 +3788,7 @@ def _analyze_receipt(
         detail_lines = []
     print("\nMODEL ANALYSIS (LLM):")
     if analysis:
-        print(analysis)
+        print(_display_analysis_text(analysis))
     else:
         print("Receipt analysis returned no content.")
     if detail_lines:
