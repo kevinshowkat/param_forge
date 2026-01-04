@@ -441,7 +441,7 @@ def _display_provider_name(provider: object | None) -> str | None:
 
 def _allowed_settings_for_provider(provider: str) -> list[str]:
     if provider == "openai":
-        return ["quality", "moderation", "input_fidelity", "output_compression"]
+        return ["quality", "moderation", "input_fidelity", "output_compression", "use_responses"]
     if provider == "gemini":
         return ["image_size"]
     if provider == "imagen":
@@ -772,7 +772,11 @@ def _sanitize_recommendation_rationales(
                         cost_token = rec_cost_token
                 except Exception:
                     pass
-            normalized = _normalize_rationale_cost(rationale, cost_token)
+            normalized = _normalize_rationale_cost(
+                rationale,
+                cost_token,
+                force_simple=setting_name == "model",
+            )
             if normalized:
                 rec_copy["rationale"] = normalized
             else:
@@ -817,13 +821,31 @@ def _rec_line_text(text: str) -> str | None:
 def _extract_price_token(text: str | None) -> str | None:
     if not text:
         return None
-    match = re.search(r"\$[0-9]+(?:\.[0-9]+)?", text)
+    match = re.search(r"\$[0-9]+(?:\.[0-9]+)?(?:/1K)?", text, flags=re.I)
     if match:
         return match.group(0)
     return None
 
 
-def _normalize_rationale_cost(rationale: str, cost_token: str | None) -> str | None:
+def _normalize_cost_token(cost_token: str) -> str:
+    if "/1k" in cost_token.lower():
+        return cost_token
+    return f"{cost_token}/1K"
+
+
+def _rationale_needs_simple_cost(rationale: str) -> bool:
+    if re.search(r"\b(both|same|either|vs\.?|versus|compare|compared|equal|each)\b", rationale, flags=re.I):
+        return True
+    price_hits = re.findall(r"\$[0-9]+(?:\.[0-9]+)?(?:/1K)?", rationale, flags=re.I)
+    return len(price_hits) > 1
+
+
+def _normalize_rationale_cost(
+    rationale: str,
+    cost_token: str | None,
+    *,
+    force_simple: bool = False,
+) -> str | None:
     trimmed = rationale.strip()
     if not trimmed:
         return None
@@ -832,9 +854,17 @@ def _normalize_rationale_cost(rationale: str, cost_token: str | None) -> str | N
         return trimmed
     if not cost_token:
         return None
+    normalized_token = _normalize_cost_token(cost_token)
+    if force_simple or _rationale_needs_simple_cost(trimmed):
+        return f"Local cost estimate: {normalized_token} images."
     if "$" in trimmed:
-        return re.sub(r"\$[0-9]+(?:\.[0-9]+)?", cost_token, trimmed)
-    return f"Local cost: {cost_token}/image."
+        return re.sub(
+            r"\$[0-9]+(?:\.[0-9]+)?(?:/1K)?",
+            normalized_token,
+            trimmed,
+            flags=re.I,
+        )
+    return f"Local cost estimate: {normalized_token} images."
 
 
 def _rewrite_rec_line(
@@ -884,9 +914,13 @@ def _parse_cost_amount(cost_line: str | None) -> float | None:
     if not match:
         return None
     try:
-        return float(match.group(1))
+        value = float(match.group(1))
     except Exception:
         return None
+    lowered = cost_line.lower()
+    if "/1k" in lowered or "per 1k" in lowered or "per 1000" in lowered:
+        return value / 1000.0
+    return value
 
 
 def _analysis_history_line(entry: dict) -> str:
@@ -999,6 +1033,36 @@ def _quality_from_history(
     return baseline, latest
 
 
+def _adherence_from_history(
+    history: list[dict] | None,
+    current_adherence: int | None = None,
+) -> tuple[int | None, int | None]:
+    baseline = None
+    latest = None
+    for entry in history or []:
+        value = entry.get("adherence")
+        if isinstance(value, int):
+            if baseline is None:
+                baseline = value
+            latest = value
+    if current_adherence is not None:
+        latest = current_adherence
+        if baseline is None:
+            baseline = current_adherence
+    return baseline, latest
+
+
+def _baseline_metrics_from_history(history: list[dict] | None) -> tuple[float | None, str | None]:
+    if not history:
+        return None, None
+    first = history[0]
+    elapsed = first.get("elapsed")
+    cost_line = first.get("cost")
+    baseline_elapsed = float(elapsed) if isinstance(elapsed, (int, float)) else None
+    baseline_cost_line = str(cost_line) if isinstance(cost_line, str) else None
+    return baseline_elapsed, baseline_cost_line
+
+
 def _compress_analysis_to_limit(text: str, limit: int, *, analyzer: str | None = None) -> str:
     if len(text) <= limit:
         return text
@@ -1080,6 +1144,9 @@ def _estimate_cost_only(
     model_key = (model or "").strip().lower()
     cost_line: str | None = None
 
+    def _per_1k(value: float, digits: int = 3) -> str:
+        return f"${_format_price(float(value) * 1000.0, digits=digits)}/1K"
+
     if provider_key == "openai":
         model_key = model_key or "gpt-image-1"
         size_key = _openai_size_key(size)
@@ -1089,7 +1156,7 @@ def _estimate_cost_only(
             price = size_prices.get("medium") or size_prices.get("standard") or size_prices.get("low")
             if isinstance(price, (int, float)):
                 cost_line = (
-                    f"COST: ~${_format_price(float(price))}/image "
+                    f"COST: ~{_per_1k(float(price))} images "
                     f"({model_key}, {size_key}, medium)"
                 )
 
@@ -1099,14 +1166,14 @@ def _estimate_cost_only(
         if model_key == "gemini-2.5-flash-image":
             price = model_prices.get("standard") if isinstance(model_prices, dict) else None
             if isinstance(price, (int, float)):
-                cost_line = f"COST: ~${_format_price(float(price))}/image ({model_key}, standard)"
+                cost_line = f"COST: ~{_per_1k(float(price))} images ({model_key}, standard)"
         elif model_key == "gemini-3-pro-image-preview":
             tier = _gemini_size_tier(size)
             key = f"standard_{tier}"
             price = model_prices.get(key) if isinstance(model_prices, dict) else None
             if isinstance(price, (int, float)):
                 label = "1K/2K" if tier == "1k_2k" else "4K"
-                cost_line = f"COST: ~${_format_price(float(price))}/image ({model_key}, {label})"
+                cost_line = f"COST: ~{_per_1k(float(price))} images ({model_key}, {label})"
 
     elif provider_key == "imagen":
         model_key = model_key or "imagen-4"
@@ -1121,7 +1188,7 @@ def _estimate_cost_only(
                     if model_key.endswith("fast")
                     else "standard"
                 )
-                cost_line = f"COST: ~${_format_price(float(price))}/image ({model_key}, {label})"
+                cost_line = f"COST: ~{_per_1k(float(price))} images ({model_key}, {label})"
 
     elif provider_key == "flux":
         model_key = model_key or "flux-2"
@@ -1129,7 +1196,7 @@ def _estimate_cost_only(
         if isinstance(model_prices, dict):
             price = model_prices.get("from")
             if isinstance(price, (int, float)):
-                cost_line = f"COST: from ${_format_price(float(price))}/image ({model_key})"
+                cost_line = f"COST: from {_per_1k(float(price))} images ({model_key})"
 
     if cost_line:
         _COST_ESTIMATE_CACHE[cache_key] = cost_line
@@ -1161,6 +1228,8 @@ def _apply_recommendation(args: argparse.Namespace, recommendation: object) -> b
                     pass
         setting_target = str(rec.get("setting_target") or "").strip().lower()
         setting_name_lower = str(setting_name).strip().lower()
+        if setting_name_lower in {"use_responses", "openai_responses"} and setting_target == "request":
+            setting_target = "provider_options"
 
         if setting_name_lower == "seed" or setting_name_lower in _TOP_LEVEL_RECOMMENDATION_KEYS:
             if setting_name_lower == "seed":
@@ -1196,6 +1265,10 @@ def _apply_recommendation(args: argparse.Namespace, recommendation: object) -> b
             options = {}
             args.provider_options = options
         options[str(setting_name)] = setting_value
+        if str(setting_name_lower) in {"use_responses", "openai_responses"} and getattr(args, "provider", "") == "openai":
+            args.openai_responses = bool(setting_value)
+            if args.openai_responses:
+                args.openai_stream = False
         applied = True
     return applied
 
@@ -1669,13 +1742,12 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
             args.openai_stream = _env_flag(OPENAI_STREAM_ENV)
         if not hasattr(args, "openai_responses"):
             args.openai_responses = _env_flag(OPENAI_RESPONSES_ENV)
-        openai_stream, _ = _apply_openai_provider_flags(args)
-        use_stream = bool(openai_stream and _is_openai_gpt_image(args.provider, args.model))
         def _generate_once(
             round_index: int,
             prev_settings: dict[str, object] | None,
             history_lines: list[str],
             rationale_line: str | None,
+            header_lines_override: list[str] | None = None,
         ) -> tuple[
             list[Path],
             list[Path],
@@ -1704,6 +1776,8 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                     y += 1
                 if y < height - 1:
                     y += 1
+            openai_stream, _ = _apply_openai_provider_flags(args)
+            use_stream = bool(openai_stream and _is_openai_gpt_image(args.provider, args.model))
             current_settings = _capture_call_settings(args)
             y = _render_generation_header(
                 stdscr,
@@ -1714,6 +1788,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                 current_settings=current_settings,
                 color_enabled=color_enabled,
                 rationale_line=rationale_line,
+                header_lines_override=header_lines_override,
             )
             if y < height - 1:
                 try:
@@ -1993,6 +2068,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
         stored_speed_benchmark: float | None = None
         analysis_history: list[dict] = []
         baseline_settings: dict[str, object] | None = None
+        baseline_image: Path | None = None
         compare_baseline: Path | None = None
         compare_round_start: int | None = None
         compare_round_end: int | None = None
@@ -2024,6 +2100,8 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                 history_lines.extend(history_block)
             if baseline_settings is None and last_call_settings:
                 baseline_settings = dict(last_call_settings)
+            if baseline_image is None and run_index == 1 and images:
+                baseline_image = images[-1]
             stdscr.timeout(-1)
             if cancel_requested:
                 height, width = stdscr.getmaxyx()
@@ -2104,6 +2182,18 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                     if run_index >= MAX_ROUNDS:
                         base_settings = last_call_settings or _capture_call_settings(args)
                         quality_baseline, quality_current = _quality_from_history(analysis_history)
+                        adherence_baseline, adherence_current = _adherence_from_history(analysis_history)
+                        baseline_elapsed, baseline_cost_line = _baseline_metrics_from_history(analysis_history)
+                        recommended_settings = (
+                            _settings_after_recommendation(base_settings, recommendation)
+                            if recommendation
+                            else base_settings
+                        )
+                        validation_needed = False
+                        if baseline_settings:
+                            validation_needed = bool(
+                                _diff_call_settings(base_settings, recommended_settings)
+                            )
                         _show_final_recommendation_curses(
                             stdscr,
                             settings=base_settings,
@@ -2112,11 +2202,57 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                             color_enabled=color_enabled,
                             last_elapsed=last_elapsed,
                             cost_line=cost_line,
+                            baseline_elapsed=baseline_elapsed,
+                            baseline_cost_line=baseline_cost_line,
                             quality_baseline=quality_baseline,
                             quality_current=quality_current,
+                            adherence_baseline=adherence_baseline,
+                            adherence_current=adherence_current,
                             receipt_path=receipts[-1] if receipts else None,
                             baseline_settings=baseline_settings,
+                            force_quality_metrics=bool(stored_goals and "maximize quality of render" in stored_goals),
                         )
+                        if validation_needed and _prompt_yes_no_curses(
+                            stdscr,
+                            "Run final validation with the full recommended settings?",
+                            color_enabled=color_enabled,
+                        ):
+                            if recommendation:
+                                _apply_recommendation(args, recommendation)
+                            validation_settings = _capture_call_settings(args)
+                            header_override = _build_validation_header_lines(
+                                baseline_settings=baseline_settings or validation_settings,
+                                current_settings=validation_settings,
+                                max_width=max(20, width - 1),
+                            )
+                            (
+                                val_receipts,
+                                val_images,
+                                _,
+                                _,
+                                _,
+                                _,
+                                _,
+                                _,
+                            ) = _generate_once(
+                                MAX_ROUNDS + 1,
+                                None,
+                                [],
+                                None,
+                                header_override,
+                            )
+                            if baseline_image and val_images:
+                                composite = _compose_side_by_side(
+                                    baseline_image,
+                                    val_images[-1],
+                                    label_left="Round 1 baseline",
+                                    label_right="Final validation",
+                                    out_dir=Path(args.out),
+                                )
+                                if composite:
+                                    _open_path(composite)
+                                else:
+                                    _open_path(val_images[-1])
                         return
                     if accepted and recommendation:
                         if _apply_recommendation(args, recommendation):
@@ -2202,6 +2338,18 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                     if run_index >= MAX_ROUNDS:
                         base_settings = last_call_settings or _capture_call_settings(args)
                         quality_baseline, quality_current = _quality_from_history(analysis_history)
+                        adherence_baseline, adherence_current = _adherence_from_history(analysis_history)
+                        baseline_elapsed, baseline_cost_line = _baseline_metrics_from_history(analysis_history)
+                        recommended_settings = (
+                            _settings_after_recommendation(base_settings, recommendation)
+                            if recommendation
+                            else base_settings
+                        )
+                        validation_needed = False
+                        if baseline_settings:
+                            validation_needed = bool(
+                                _diff_call_settings(base_settings, recommended_settings)
+                            )
                         _show_final_recommendation_curses(
                             stdscr,
                             settings=base_settings,
@@ -2210,11 +2358,57 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                             color_enabled=color_enabled,
                             last_elapsed=last_elapsed,
                             cost_line=cost_line,
+                            baseline_elapsed=baseline_elapsed,
+                            baseline_cost_line=baseline_cost_line,
                             quality_baseline=quality_baseline,
                             quality_current=quality_current,
+                            adherence_baseline=adherence_baseline,
+                            adherence_current=adherence_current,
                             receipt_path=receipts[-1] if receipts else None,
                             baseline_settings=baseline_settings,
+                            force_quality_metrics=bool(user_goals and "maximize quality of render" in user_goals),
                         )
+                        if validation_needed and _prompt_yes_no_curses(
+                            stdscr,
+                            "Run final validation with the full recommended settings?",
+                            color_enabled=color_enabled,
+                        ):
+                            if recommendation:
+                                _apply_recommendation(args, recommendation)
+                            validation_settings = _capture_call_settings(args)
+                            header_override = _build_validation_header_lines(
+                                baseline_settings=baseline_settings or validation_settings,
+                                current_settings=validation_settings,
+                                max_width=max(20, width - 1),
+                            )
+                            (
+                                val_receipts,
+                                val_images,
+                                _,
+                                _,
+                                _,
+                                _,
+                                _,
+                                _,
+                            ) = _generate_once(
+                                MAX_ROUNDS + 1,
+                                None,
+                                [],
+                                None,
+                                header_override,
+                            )
+                            if baseline_image and val_images:
+                                composite = _compose_side_by_side(
+                                    baseline_image,
+                                    val_images[-1],
+                                    label_left="Round 1 baseline",
+                                    label_right="Final validation",
+                                    out_dir=Path(args.out),
+                                )
+                                if composite:
+                                    _open_path(composite)
+                                else:
+                                    _open_path(val_images[-1])
                         return
                     if accepted and recommendation:
                         if _apply_recommendation(args, recommendation):
@@ -2609,7 +2803,8 @@ def _estimate_cost_value(
 def _format_cost_value(cost: float | None) -> str:
     if cost is None:
         return "N/A"
-    return f"${_format_price(float(cost), digits=4)}"
+    per_1k = float(cost) * 1000.0
+    return f"${_format_price(per_1k, digits=3)}/1K"
 
 
 def _display_analysis_text(text: str) -> str:
@@ -2725,7 +2920,7 @@ def _build_snapshot_lines(
 def _snapshot_template_lines() -> list[str]:
     return [
         "render: 9999.9s",
-        "cost: $99.9999",
+        "cost: $99999/1K",
         "prompt adherence: 100/100",
         "LLM-rated quality: 100/100",
     ]
@@ -2978,16 +3173,20 @@ def _render_generation_header(
     current_settings: dict[str, object],
     color_enabled: bool,
     rationale_line: str | None = None,
+    header_lines_override: list[str] | None = None,
 ) -> int:
     import curses
     header_attr = curses.color_pair(4) | curses.A_BOLD if color_enabled else curses.A_BOLD
     change_attr = curses.color_pair(3) | curses.A_BOLD if color_enabled else curses.A_BOLD
-    header_lines = _build_generation_header_lines(
-        round_index=round_index,
-        prev_settings=prev_settings,
-        current_settings=current_settings,
-        max_width=max(20, width - 1),
-    )
+    if header_lines_override is None:
+        header_lines = _build_generation_header_lines(
+            round_index=round_index,
+            prev_settings=prev_settings,
+            current_settings=current_settings,
+            max_width=max(20, width - 1),
+        )
+    else:
+        header_lines = header_lines_override
     for idx, line in enumerate(header_lines):
         attr = header_attr if idx == 0 else change_attr
         _safe_addstr(stdscr, y, 0, line[: max(0, width - 1)], attr)
@@ -2997,6 +3196,21 @@ def _render_generation_header(
                 _safe_addstr(stdscr, y, 0, wrapped[: max(0, width - 1)], header_attr)
                 y += 1
     return y
+
+
+def _build_validation_header_lines(
+    *,
+    baseline_settings: dict[str, object],
+    current_settings: dict[str, object],
+    max_width: int,
+) -> list[str]:
+    lines: list[str] = []
+    lines.extend(_wrap_text("Final validation run (baseline comparison)", max_width))
+    baseline_line = f"Baseline: {_format_call_settings_line(baseline_settings)}"
+    lines.extend(_wrap_text(baseline_line, max_width))
+    current_line = f"Final settings: {_format_call_settings_line(current_settings)}"
+    lines.extend(_wrap_text(current_line, max_width))
+    return lines
 
 
 def _format_setting_value(value: object, *, depth: int = 0) -> str:
@@ -3111,6 +3325,8 @@ def _flux_default_params(model: str | None) -> dict[str, object]:
 
 def _default_provider_option(provider: str | None, model: str | None, key: str) -> object | None:
     provider_key = (provider or "").strip().lower()
+    if provider_key == "openai" and key == "use_responses":
+        return False
     if provider_key in {"black forest labs", "bfl", "flux"}:
         return _flux_default_params(model).get(key)
     return None
@@ -3338,8 +3554,14 @@ def _build_final_recommendation_lines(
     return_tags: bool = False,
     last_elapsed: float | None = None,
     cost_line: str | None = None,
+    baseline_settings: dict[str, object] | None = None,
+    baseline_elapsed: float | None = None,
+    baseline_cost_line: str | None = None,
     quality_baseline: int | None = None,
     quality_current: int | None = None,
+    adherence_baseline: int | None = None,
+    adherence_current: int | None = None,
+    force_quality_metrics: bool = False,
 ) -> list[object]:
     lines: list[object] = []
 
@@ -3358,73 +3580,108 @@ def _build_final_recommendation_lines(
     _append_wrapped(f"Goals: {goals_line}", "goal")
     recommended_settings = _settings_after_recommendation(settings, recommendation) if recommendation else settings
     _append_wrapped(_format_call_settings_line(recommended_settings))
+    baseline_diffs: list[str] = []
+    if baseline_settings:
+        baseline_diffs = _diff_call_settings(baseline_settings, recommended_settings)
     if recommendation:
         diffs = _diff_call_settings(settings, recommended_settings)
         if not diffs:
-            diffs = ["Change: none"]
+            if baseline_diffs:
+                diffs = ["Change: none (final settings already applied)"]
+            else:
+                diffs = ["Change: none"]
         for diff in diffs:
             prefix = "Change: " if not diff.startswith("Change:") else ""
             _append_wrapped(f"{prefix}{diff}", "change")
     else:
-        _append_wrapped("No changes recommended.", "change")
+        if baseline_diffs:
+            _append_wrapped("No changes recommended (final settings already applied).", "change")
+        else:
+            _append_wrapped("No changes recommended.", "change")
 
     goals = set(user_goals or [])
     if goals:
-        cost_current = _estimate_cost_value(
-            provider=str(settings.get("provider")) if settings.get("provider") else None,
-            model=str(settings.get("model")) if settings.get("model") else None,
-            size=str(settings.get("size")) if settings.get("size") else None,
+        reference_settings = baseline_settings or settings
+        cost_ref = _estimate_cost_value(
+            provider=str(reference_settings.get("provider"))
+            if reference_settings.get("provider")
+            else None,
+            model=str(reference_settings.get("model")) if reference_settings.get("model") else None,
+            size=str(reference_settings.get("size")) if reference_settings.get("size") else None,
         )
-        if cost_current is None:
-            cost_current = _parse_cost_amount(cost_line)
-        cost_next = _estimate_cost_value(
+        if cost_ref is None:
+            if baseline_settings and baseline_cost_line:
+                cost_ref = _parse_cost_amount(baseline_cost_line)
+            else:
+                cost_ref = _parse_cost_amount(cost_line)
+        cost_target = _estimate_cost_value(
             provider=str(recommended_settings.get("provider"))
             if recommended_settings.get("provider")
             else None,
             model=str(recommended_settings.get("model")) if recommended_settings.get("model") else None,
             size=str(recommended_settings.get("size")) if recommended_settings.get("size") else None,
         )
-        if cost_next is None and cost_current is not None:
-            cost_next = cost_current
+        if cost_target is None:
+            if not _diff_call_settings(recommended_settings, settings):
+                cost_target = _parse_cost_amount(cost_line) or cost_ref
+            elif baseline_settings and not _diff_call_settings(recommended_settings, baseline_settings):
+                cost_target = cost_ref
+        if cost_target is None and cost_ref is not None:
+            cost_target = cost_ref
 
-        time_current = last_elapsed
-        time_next = None
-        if (
-            time_current is not None
-            and cost_current is not None
-            and cost_next is not None
-            and cost_current > 0
-        ):
-            time_next = time_current * (cost_next / cost_current)
-        elif time_current is not None:
-            area_current = _size_area_estimate(settings.get("size"))
-            area_next = _size_area_estimate(recommended_settings.get("size"))
-            if area_current and area_next and area_current > 0:
-                time_next = time_current * (area_next / area_current)
+        time_ref = baseline_elapsed if baseline_elapsed is not None else last_elapsed
+        time_target = None
+        if time_ref is not None:
+            if last_elapsed is not None and not _diff_call_settings(recommended_settings, settings):
+                time_target = last_elapsed
+            elif cost_ref is not None and cost_target is not None and cost_ref > 0:
+                time_target = time_ref * (cost_target / cost_ref)
+            else:
+                area_ref = _size_area_estimate(reference_settings.get("size"))
+                area_target = _size_area_estimate(recommended_settings.get("size"))
+                if area_ref and area_target and area_ref > 0:
+                    time_target = time_ref * (area_target / area_ref)
 
         gain_lines: list[str] = []
-        if "minimize cost of render" in goals and cost_current is not None and cost_next is not None and cost_current > 0:
-            delta = (cost_next - cost_current) / cost_current
+        if (
+            "minimize cost of render" in goals
+            and cost_ref is not None
+            and cost_target is not None
+            and cost_ref > 0
+        ):
+            delta = (cost_target - cost_ref) / cost_ref
             if abs(delta) >= 0.005:
                 pct = abs(delta) * 100.0
                 direction = "decrease" if delta < 0 else "increase"
                 gain_lines.append(f"Cost: {pct:.0f}% {direction}")
-        if "minimize time to render" in goals and time_current is not None and time_next is not None and time_current > 0:
-            delta = (time_next - time_current) / time_current
+        if (
+            "minimize time to render" in goals
+            and time_ref is not None
+            and time_target is not None
+            and time_ref > 0
+        ):
+            delta = (time_target - time_ref) / time_ref
             if abs(delta) >= 0.005:
                 pct = abs(delta) * 100.0
                 direction = "decrease" if delta < 0 else "increase"
                 gain_lines.append(f"Time: {pct:.0f}% {direction}")
         if "maximize quality of render" in goals:
-            if "minimize cost of render" in goals or "minimize time to render" in goals:
-                gain_lines.append("Quality: secondary to cost/time goals")
-            elif quality_baseline is not None and quality_current is not None and quality_baseline > 0:
+            if quality_baseline is not None and quality_current is not None and quality_baseline > 0:
                 delta = quality_current - quality_baseline
                 pct = (delta / quality_baseline) * 100.0
                 direction = "increase" if delta >= 0 else "decrease"
                 gain_lines.append(f"Quality: {abs(pct):.0f}% {direction}")
-            else:
+            elif force_quality_metrics:
                 gain_lines.append("Quality: N/A (no baseline)")
+            else:
+                gain_lines.append("Quality: secondary to cost/time goals")
+            if adherence_baseline is not None and adherence_current is not None and adherence_baseline > 0:
+                delta = adherence_current - adherence_baseline
+                pct = (delta / adherence_baseline) * 100.0
+                direction = "increase" if delta >= 0 else "decrease"
+                gain_lines.append(f"Prompt adherence: {abs(pct):.0f}% {direction}")
+            elif force_quality_metrics:
+                gain_lines.append("Prompt adherence: N/A (no baseline)")
 
         if gain_lines:
             _append_wrapped("Expected gains:", "section")
@@ -3444,10 +3701,15 @@ def _show_final_recommendation_curses(
     color_enabled: bool,
     last_elapsed: float | None = None,
     cost_line: str | None = None,
+    baseline_elapsed: float | None = None,
+    baseline_cost_line: str | None = None,
     quality_baseline: int | None = None,
     quality_current: int | None = None,
+    adherence_baseline: int | None = None,
+    adherence_current: int | None = None,
     receipt_path: Path | None = None,
     baseline_settings: dict[str, object] | None = None,
+    force_quality_metrics: bool = False,
 ) -> None:
     import curses
     height, width = stdscr.getmaxyx()
@@ -3460,15 +3722,21 @@ def _show_final_recommendation_curses(
         return_tags=True,
         last_elapsed=last_elapsed,
         cost_line=cost_line,
+        baseline_settings=baseline_settings,
+        baseline_elapsed=baseline_elapsed,
+        baseline_cost_line=baseline_cost_line,
         quality_baseline=quality_baseline,
         quality_current=quality_current,
+        adherence_baseline=adherence_baseline,
+        adherence_current=adherence_current,
+        force_quality_metrics=force_quality_metrics,
     )
     if baseline_settings:
         recommended_settings = _settings_after_recommendation(settings, recommendation) if recommendation else settings
         diff_lines = _diff_call_settings(baseline_settings, recommended_settings)
         if diff_lines:
             lines.append("")
-            lines.append(("Changes vs Round 1 baseline", "section"))
+            lines.append(("Differences vs Round 1 baseline (final settings)", "section"))
             for diff in diff_lines:
                 prefix = "Change: " if not diff.startswith("Change:") else ""
                 for line in _wrap_text(f"{prefix}{diff}", max_width):
@@ -3575,6 +3843,25 @@ def _prompt_goal_selection_curses(stdscr, color_enabled: bool) -> tuple[list[str
             color_enabled=color_enabled,
         )
     return goals, notes
+
+
+def _prompt_yes_no_curses(stdscr, prompt: str, *, color_enabled: bool) -> bool:
+    import curses
+    while True:
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+        y = _draw_banner(stdscr, color_enabled, 1)
+        if y < height - 2:
+            _safe_addstr(stdscr, y, 0, prompt[: max(0, width - 1)], curses.A_BOLD)
+            y += 2
+        footer = "Press Y to run, N or Esc to cancel"
+        _safe_addstr(stdscr, min(height - 1, y), 0, footer[: max(0, width - 1)], curses.A_DIM)
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (ord("y"), ord("Y")):
+            return True
+        if key in (ord("n"), ord("N"), 27):
+            return False
 
 
 def _render_scrollable_text(
@@ -3739,6 +4026,15 @@ def _show_receipt_analysis_curses(
     pre_cost_line: str | None = None
     current_round = len(analysis_history or []) + 1
     rounds_left = max(0, MAX_ROUNDS - current_round)
+    baseline_elapsed: float | None = None
+    baseline_cost_text: str | None = None
+    if analysis_history:
+        first_entry = analysis_history[0]
+        first_elapsed = first_entry.get("elapsed")
+        if isinstance(first_elapsed, (int, float)):
+            baseline_elapsed = float(first_elapsed)
+        baseline_cost_text = _strip_cost_prefix(first_entry.get("cost"))
+
     if user_goals and "minimize cost of render" in user_goals and not last_cost:
         pre_cost_line = _estimate_cost_only(
             provider=provider,
@@ -3781,7 +4077,9 @@ def _show_receipt_analysis_curses(
         _safe_addstr(stdscr, y, 0, rounds_text[: max(0, width - 1)], rounds_attr)
         y += 1
     if user_goals and "minimize time to render" in user_goals and y < height - 1:
-        if benchmark_elapsed is not None and last_elapsed is not None:
+        if baseline_elapsed is not None and last_elapsed is not None:
+            speed_text = f"Speed baseline: {baseline_elapsed:.1f}s → latest {last_elapsed:.1f}s"
+        elif benchmark_elapsed is not None and last_elapsed is not None:
             speed_text = f"Speed benchmark: {benchmark_elapsed:.1f}s → latest {last_elapsed:.1f}s"
         else:
             speed_text = "Last render: unknown"
@@ -3791,7 +4089,9 @@ def _show_receipt_analysis_curses(
         y += 1
     if user_goals and "minimize cost of render" in user_goals and y < height - 1:
         cost_text = "Cost benchmark: estimating..."
-        if last_cost:
+        if baseline_cost_text:
+            cost_text = f"Cost baseline: {baseline_cost_text}"
+        elif last_cost:
             cost_text = f"Cost benchmark: {last_cost}"
         _safe_addstr(stdscr, y, 0, cost_text[: max(0, width - 1)], curses.A_BOLD)
         y += 1
@@ -3856,16 +4156,17 @@ def _show_receipt_analysis_curses(
     stop_recommended = False
 
     comparison_lines: list[str] = []
-    if benchmark_elapsed is not None and last_elapsed is not None:
-        comparison_lines.append(f"Speed: {benchmark_elapsed:.1f}s → {last_elapsed:.1f}s")
-    if (
-        user_goals
-        and "minimize cost of render" in user_goals
-        and last_cost
-        and cost_line
-    ):
-        latest_cost = str(cost_line).replace("COST:", "").strip()
-        comparison_lines.append(f"Cost: {last_cost} → {latest_cost}")
+    if user_goals and "minimize time to render" in user_goals:
+        if baseline_elapsed is not None and last_elapsed is not None:
+            comparison_lines.append(f"Speed (baseline): {baseline_elapsed:.1f}s → {last_elapsed:.1f}s")
+        elif benchmark_elapsed is not None and last_elapsed is not None:
+            comparison_lines.append(f"Speed: {benchmark_elapsed:.1f}s → {last_elapsed:.1f}s")
+    if user_goals and "minimize cost of render" in user_goals:
+        latest_cost = str(cost_line).replace("COST:", "").strip() if cost_line else None
+        if baseline_cost_text and latest_cost:
+            comparison_lines.append(f"Cost (baseline): {baseline_cost_text} → {latest_cost}")
+        elif last_cost and latest_cost:
+            comparison_lines.append(f"Cost: {last_cost} → {latest_cost}")
     if comparison_lines:
         side_by_side = "\n".join(comparison_lines)
         if emphasis_line:
@@ -3878,6 +4179,10 @@ def _show_receipt_analysis_curses(
     quality_baseline, quality_current = _quality_from_history(
         analysis_history or [],
         round_scores[1] if round_scores else None,
+    )
+    adherence_baseline, adherence_current = _adherence_from_history(
+        analysis_history or [],
+        round_scores[0] if round_scores else None,
     )
     try:
         receipt_payload = _load_receipt_payload(receipt_path)
@@ -3916,6 +4221,7 @@ def _show_receipt_analysis_curses(
             fallback_size=size,
             fallback_n=n,
         )
+        baseline_elapsed, baseline_cost_line = _baseline_metrics_from_history(analysis_history or [])
         lines.append("")
         lines.extend(
             _build_final_recommendation_lines(
@@ -3926,8 +4232,13 @@ def _show_receipt_analysis_curses(
                 return_tags=True,
                 last_elapsed=last_elapsed,
                 cost_line=cost_line,
+                baseline_elapsed=baseline_elapsed,
+                baseline_cost_line=baseline_cost_line,
                 quality_baseline=quality_baseline,
                 quality_current=quality_current,
+                adherence_baseline=adherence_baseline,
+                adherence_current=adherence_current,
+                force_quality_metrics=bool(user_goals and "maximize quality of render" in user_goals),
             )
         )
 
@@ -5110,6 +5421,14 @@ def _build_receipt_analysis_prompt(
             "Use the web_search tool to find model/provider settings and pricing that best achieve the user's goals. "
             "Base recommendations and cost estimate on documented settings for the selected provider/model. "
         )
+    provider_hint = explicit_fields.get("provider")
+    provider_key, _ = _normalize_provider_and_model(str(provider_hint), None) if provider_hint else ("", None)
+    call_path_text = ""
+    if provider_key == "openai":
+        call_path_text = (
+            "For OpenAI gpt-image models, you may recommend use_responses=true/false to switch between "
+            "the direct gpt-image endpoint and the Responses API. "
+        )
     remaining_rounds = max(0, max_rounds - current_round)
     return (
         "You are an expert image-generation assistant. An image output is attached. "
@@ -5118,7 +5437,7 @@ def _build_receipt_analysis_prompt(
         "Total response INCLUDING <setting_json> must be <=500 characters.\n\n"
         "ADH: brief prompt adherence summary (1 sentence).\n"
         "UNSET: list 2–4 most important unset params (short list).\n"
-        "COST: estimated USD cost per image for this provider/model (short).\n"
+        "COST: estimated USD cost per 1K images for this provider/model (short).\n"
         "REC: 1–3 short recommendations aligned to user goals. "
         "If speed is a priority, you may suggest unconventional levers (e.g., output format/filetype, "
         "compression, or size tradeoffs) in addition to standard settings. "
@@ -5136,6 +5455,7 @@ def _build_receipt_analysis_prompt(
         "those goals take precedence and quality becomes secondary.\n"
         f"User notes: {notes_line or '(none)'}\n\n"
         f"{web_search_text}"
+        f"{call_path_text}"
         f"{history_block}"
         f"{model_block}"
         f"Allowed settings for recommendations (API settings for this model): {allowed_line}\n"
@@ -5181,6 +5501,13 @@ def _build_recommendation_only_prompt(
             "Use the web_search tool to find model/provider settings that best achieve the user's goals. "
             "Base recommendations on documented settings for the selected provider/model.\n"
         )
+    provider_key, _ = _normalize_provider_and_model(str(provider), model)
+    call_path_text = ""
+    if provider_key == "openai":
+        call_path_text = (
+            "For OpenAI gpt-image models, you may recommend use_responses=true/false to switch between "
+            "the direct gpt-image endpoint and the Responses API.\n"
+        )
     remaining_rounds = max(0, max_rounds - current_round)
     return (
         "You are an expert image-generation assistant. "
@@ -5196,6 +5523,7 @@ def _build_recommendation_only_prompt(
         "those goals take precedence and quality becomes secondary.\n"
         f"User notes: {notes_line or '(none)'}\n"
         f"{web_search_text}"
+        f"{call_path_text}"
         f"{history_block}"
         f"{model_block}"
         "If speed is a priority, consider unconventional levers (e.g., output format/filetype, "
@@ -5248,6 +5576,21 @@ def _analyze_receipt_payload(
         "prompt": str(receipt.get("request", {}).get("prompt", "")),
         "out_dir": str(out_dir),
     }
+    provider_key, _ = _normalize_provider_and_model(provider, model)
+    if provider_key == "openai":
+        use_responses = None
+        resolved = receipt.get("resolved") if isinstance(receipt.get("resolved"), dict) else None
+        request = receipt.get("request") if isinstance(receipt.get("request"), dict) else None
+        for source in (
+            resolved.get("provider_params") if isinstance(resolved, dict) else None,
+            request.get("provider_options") if isinstance(request, dict) else None,
+        ):
+            if isinstance(source, dict) and "use_responses" in source:
+                use_responses = bool(source.get("use_responses"))
+                break
+        if use_responses is None:
+            use_responses = False
+        explicit_fields["use_responses"] = use_responses
     target_prompt = FIXED_PROMPT
     allowed_settings = _allowed_settings_for_receipt(receipt, provider)
     allowed_models = _allowed_models_for_provider(provider, model)
@@ -5458,6 +5801,10 @@ def _analyze_receipt(
                         return_tags=False,
                         last_elapsed=None,
                         cost_line=cost_line,
+                        baseline_settings=None,
+                        baseline_elapsed=None,
+                        baseline_cost_line=None,
+                        force_quality_metrics=False,
                     )
                     if isinstance(line, str)
                 ]
