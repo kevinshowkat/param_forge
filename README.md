@@ -2,6 +2,18 @@
 
 Interactive terminal UI to run Modulette image generation and collect receipts.
 
+## TL;DR
+Param Forge is a terminal UI for running text-to-image jobs across providers and saving reproducible receipts next to outputs.
+
+## Use cases
+- compare providers or models for a prompt set
+- iterate on prompt, size, and seed quickly
+- keep a local paper trail of inputs and parameters
+
+## Outputs
+- images and receipt files written to the output directory
+- receipts capture the prompts and provider parameters used
+
 ## Requirements
 - Python 3.9+
 - A TTY terminal (macOS Terminal.app, iTerm, etc.)
