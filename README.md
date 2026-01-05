@@ -1,6 +1,6 @@
 # Param Forge
 
-Interactive terminal UI to run Modulette image generation and collect receipts.
+Interactive terminal UI for multi-provider image generation and receipts.
 
 ## TL;DR
 Param Forge is a terminal UI for running text-to-image jobs across providers and saving reproducible receipts next to outputs.
@@ -17,7 +17,11 @@ Param Forge is a terminal UI for running text-to-image jobs across providers and
 ## Requirements
 - Python 3.9+
 - A TTY terminal (macOS Terminal.app, iTerm, etc.)
-- Modulette (image generation library)
+- Provider SDKs (install only what you need):
+  - OpenAI: `openai`
+  - Gemini/Imagen: `google-genai` + `google-auth`
+  - Flux (BFL): `requests`
+- Utilities: `python-dotenv`, `pillow`
 
 ## Quick start
 ```bash
@@ -26,15 +30,11 @@ cd param_forge
 python -m venv .venv
 source .venv/bin/activate
 pip install -U pip
-pip install python-dotenv
-
-# Option A: clone Modulette next to this repo
-#   (../Modulette relative to param_forge)
-# git clone <your Modulette repo> ../Modulette
-pip install -e ../Modulette
-
-# Option B: if Modulette is already available elsewhere
-# pip install -e /path/to/Modulette
+pip install python-dotenv pillow
+# Provider SDKs (choose what you need)
+pip install openai
+pip install google-genai google-auth
+pip install requests
 
 python scripts/param_forge.py
 ```
@@ -82,6 +82,3 @@ OpenAI image call options:
 - If curses can’t initialize (TERM issues or small terminal), the script falls back to a raw prompt flow.
 - Receipts are stored next to generated images in the output directory.
 - Pricing reference (per 1K images): docs/pricing_reference.md, docs/pricing_reference.json
-
-## Backlog
-- If you want that pre-cost call to run for any analysis (not just cost goal), say the word.

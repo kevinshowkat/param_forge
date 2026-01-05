@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate Modulette assets for social sharing (Param Forge).
+"""Param Forge: interactive terminal UI for multi-provider image generation + receipts.
 
 Usage:
   python scripts/param_forge.py \
@@ -8,9 +8,8 @@ Usage:
   python scripts/param_forge.py --defaults
 
 Notes:
-- Loads .env from the oscillo repo root.
-- Imports the local Modulette repo from /Users/mainframe/Desktop/projects/Modulette
-  if it's not installed.
+- Loads .env from the repo root.
+- Uses the bundled provider adapters (OpenAI, Gemini, Imagen, Flux).
 """
 
 from __future__ import annotations
@@ -125,26 +124,6 @@ def _env_flag(name: str) -> bool:
     if raw is None:
         return False
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _ensure_modulette_on_path() -> None:
-    try:
-        import modulette  # noqa: F401
-        return
-    except Exception:
-        pass
-
-    repo_root = Path(__file__).resolve().parents[1]
-    projects_root = repo_root.parent
-    modulette_path = projects_root / "Modulette"
-    if modulette_path.exists():
-        sys.path.insert(0, str(modulette_path))
-        return
-
-    raise RuntimeError(
-        "Could not import modulette. Install it with 'pip install -e ../Modulette' "
-        "or ensure /Users/mainframe/Desktop/projects/Modulette exists."
-    )
 
 
 def _supports_color() -> bool:
@@ -1729,9 +1708,8 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
         args.analyzer = _resolve_receipt_analyzer(getattr(args, "analyzer", None))
         try:
             _load_repo_dotenv()
-            _ensure_modulette_on_path()
             _ensure_api_keys(args.provider, _find_repo_dotenv(), allow_prompt=False)
-            from modulette import generate, stream  # type: ignore
+            from forge_image_api import generate, stream  # type: ignore
         except Exception as exc:
             result["exit_code"] = 1
             result["error"] = str(exc)
@@ -5886,9 +5864,8 @@ def _open_path(path: Path) -> None:
 
 def _run_generation(args: argparse.Namespace) -> int:
     _load_repo_dotenv()
-    _ensure_modulette_on_path()
     args.analyzer = _resolve_receipt_analyzer(getattr(args, "analyzer", None))
-    from modulette import generate, stream
+    from forge_image_api import generate, stream
 
     normalized_provider, normalized_model = _normalize_provider_and_model(args.provider, args.model)
     args.provider = normalized_provider
@@ -6007,7 +5984,9 @@ def _run_generation(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Param Forge: generate Modulette social share assets.")
+    parser = argparse.ArgumentParser(
+        description="Param Forge: interactive terminal UI for multi-provider image generation + receipts."
+    )
     parser.add_argument("--prompt", action="append", help="Prompt text (repeatable)")
     parser.add_argument("--provider", default="openai", help="Provider name")
     parser.add_argument(
