@@ -1,8 +1,8 @@
-# Image Pricing Reference (Param Forge)
+# Image Pricing Reference (PARAM FORGE)
 
 Last verified: 2026-01-04
 
-This file summarizes current per-image pricing for providers/models used by Param Forge.
+This file summarizes current per-image pricing for providers/models used by PARAM FORGE.
 Pricing can change; re-verify before production billing.
 
 ## OpenAI (GPT Image)

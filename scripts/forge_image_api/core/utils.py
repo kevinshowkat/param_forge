@@ -1,4 +1,4 @@
-"""Utility helpers for Param Forge."""
+"""Utility helpers for PARAM FORGE."""
 
 from __future__ import annotations
 

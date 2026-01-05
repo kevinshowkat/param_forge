@@ -1,4 +1,4 @@
-"""Core data contracts for Param Forge."""
+"""Core data contracts for PARAM FORGE."""
 
 from __future__ import annotations
 

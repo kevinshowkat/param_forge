@@ -1,4 +1,4 @@
-"""Receipt writer for Param Forge artifacts."""
+"""Receipt writer for PARAM FORGE artifacts."""
 
 from __future__ import annotations
 

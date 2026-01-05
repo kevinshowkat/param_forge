@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Param Forge: interactive terminal UI for multi-provider image generation + receipts.
+"""PARAM FORGE: interactive terminal UI for multi-provider image generation + receipts.
 
 Usage:
   python scripts/param_forge.py \
@@ -1278,7 +1278,7 @@ def _recommendations_summary(recommendation: object) -> str:
 
 
 def _interactive_args_raw(color_override: bool | None = None) -> argparse.Namespace:
-    print("Param Forge")
+    print("PARAM FORGE")
     for line in _version_text_lines():
         print(line)
     print("Test image-gen APIs and capture receipts that help configure calls.")
@@ -1304,7 +1304,7 @@ def _interactive_args_raw(color_override: bool | None = None) -> argparse.Namesp
 
 
 def _interactive_args_simple() -> argparse.Namespace:
-    print("Param Forge (simple mode)")
+    print("PARAM FORGE (simple mode)")
     for line in _version_text_lines():
         print(line)
     print("Type a number and press Enter. Press Enter to accept defaults.")
@@ -5985,7 +5985,7 @@ def _run_generation(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Param Forge: interactive terminal UI for multi-provider image generation + receipts."
+        description="PARAM FORGE: interactive terminal UI for multi-provider image generation + receipts."
     )
     parser.add_argument("--prompt", action="append", help="Prompt text (repeatable)")
     parser.add_argument("--provider", default="openai", help="Provider name")

@@ -1,9 +1,9 @@
-# Param Forge
+# PARAM FORGE
 
 Interactive terminal UI for multi-provider image generation and receipts.
 
 ## TL;DR
-Param Forge is a terminal UI for running text-to-image jobs across providers and saving reproducible receipts next to outputs.
+PARAM FORGE is a terminal UI for running text-to-image jobs across providers and saving reproducible receipts next to outputs.
 
 ## Use cases
 - compare providers or models for a prompt set
