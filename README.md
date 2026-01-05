@@ -85,3 +85,4 @@ OpenAI image call options:
 - If curses can’t initialize (TERM issues or small terminal), the script falls back to a raw prompt flow.
 - Receipts are stored next to generated images in the output directory.
 - Pricing reference (per 1K images): docs/pricing_reference.md, docs/pricing_reference.json
+- Experiment flow is not wired up yet (planned; not runnable in this release).
