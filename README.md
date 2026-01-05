@@ -17,11 +17,12 @@ Param Forge is a terminal UI for running text-to-image jobs across providers and
 ## Requirements
 - Python 3.9+
 - A TTY terminal (macOS Terminal.app, iTerm, etc.)
+- Base deps: `pip install -r requirements.txt`
 - Provider SDKs (install only what you need):
-  - OpenAI: `openai`
-  - Gemini/Imagen: `google-genai` + `google-auth`
-  - Flux (BFL): `requests`
-- Utilities: `python-dotenv`, `pillow`
+  - OpenAI: `pip install -r requirements-openai.txt`
+  - Gemini/Imagen: `pip install -r requirements-google.txt`
+  - Flux (BFL): `pip install -r requirements-flux.txt`
+- Receipt analyzers (optional): `pip install -r requirements-analyzers.txt`
 
 ## Quick start
 ```bash
@@ -30,11 +31,13 @@ cd param_forge
 python -m venv .venv
 source .venv/bin/activate
 pip install -U pip
-pip install python-dotenv pillow
+pip install -r requirements.txt
 # Provider SDKs (choose what you need)
-pip install openai
-pip install google-genai google-auth
-pip install requests
+pip install -r requirements-openai.txt
+pip install -r requirements-google.txt
+pip install -r requirements-flux.txt
+# Receipt analyzers (optional)
+pip install -r requirements-analyzers.txt
 
 python scripts/param_forge.py
 ```
