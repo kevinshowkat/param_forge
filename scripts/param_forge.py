@@ -70,6 +70,24 @@ SIZE_CHOICES = [
 ]
 OUT_DIR_CHOICES = ["outputs/param_forge", "outputs/param_forge_dated"]
 
+
+def _provider_display_label(provider: str) -> str:
+    provider_key = provider.strip().lower()
+    if provider_key == "google":
+        return "google (gemini/imagen)"
+    if provider_key in {"black forest labs", "bfl", "flux"}:
+        return "black forest labs (flux)"
+    return provider
+
+
+def _provider_display_choices() -> list[str]:
+    return [_provider_display_label(choice) for choice in PROVIDER_CHOICES]
+
+
+def _provider_from_display(label: str) -> str:
+    mapping = {_provider_display_label(choice): choice for choice in PROVIDER_CHOICES}
+    return mapping.get(label, label)
+
 _BANNER = [
     "██████╗  █████╗ ██████╗  █████╗ ███╗   ███╗",
     "██╔══██╗██╔══██╗██╔══██╗██╔══██╗████╗ ████║",
@@ -1294,7 +1312,8 @@ def _interactive_args_raw(color_override: bool | None = None) -> argparse.Namesp
                 print("Experiment mode coming next.")
                 continue
             break
-        provider = _select_from_list("Provider", PROVIDER_CHOICES, 0)
+        provider = _select_from_list("Provider", _provider_display_choices(), 0)
+        provider = _provider_from_display(provider)
         model = _select_from_list("Model", _model_choices_for(provider), 0)
         size_label = _select_from_list("Size", _size_label_choices(), 0)
         size = _size_value_from_label(size_label)
@@ -1315,7 +1334,8 @@ def _interactive_args_simple() -> argparse.Namespace:
             print("Experiment mode coming next.")
             continue
         break
-    provider = _prompt_choice("Provider", PROVIDER_CHOICES, 0)
+    provider = _prompt_choice("Provider", _provider_display_choices(), 0)
+    provider = _provider_from_display(provider)
     model = _prompt_choice("Model", _model_choices_for(provider), 0)
     size_label = _prompt_choice("Size", _size_label_choices(), 0)
     size = _size_value_from_label(size_label)
@@ -1449,6 +1469,7 @@ def _interactive_args_curses(stdscr, color_override: bool | None = None) -> argp
     count_value = 1
     out_idx = 0
     field_idx = 0
+    provider_display_choices = _provider_display_choices()
 
     while True:
         stdscr.erase()
@@ -1521,7 +1542,7 @@ def _interactive_args_curses(stdscr, color_override: bool | None = None) -> argp
                 stdscr,
                 y,
                 "Provider",
-                PROVIDER_CHOICES,
+                provider_display_choices,
                 provider_idx,
                 field_idx == 1,
                 field_idx,
@@ -5997,6 +6018,8 @@ def _run_generation(args: argparse.Namespace) -> int:
                     "Try --model gemini-2.5-flash-image or gemini-3-pro-image-preview, "
                     "or switch to --provider openai."
                 )
+            if args.defaults:
+                return 1
             raise
         finally:
             if not stopped:

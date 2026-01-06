@@ -15,7 +15,7 @@ PARAM FORGE is a terminal UI for running text-to-image jobs across providers and
 - receipts capture the prompts and provider parameters used
 
 ## Requirements
-- Python 3.9+
+- Python 3.10+
 - A TTY terminal (macOS Terminal.app, iTerm, etc.)
 - Base deps: `pip install -r requirements.txt`
 - Provider SDKs (install only what you need):
