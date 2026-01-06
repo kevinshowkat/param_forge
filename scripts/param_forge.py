@@ -1708,7 +1708,12 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
         args.analyzer = _resolve_receipt_analyzer(getattr(args, "analyzer", None))
         try:
             _load_repo_dotenv()
-            _ensure_api_keys(args.provider, _find_repo_dotenv(), allow_prompt=False)
+            _ensure_api_keys(
+                args.provider,
+                _find_repo_dotenv(),
+                allow_prompt=True,
+                prompt_func=lambda key, path: _prompt_for_key_curses(stdscr, key, path),
+            )
             from forge_image_api import generate, stream  # type: ignore
         except Exception as exc:
             result["exit_code"] = 1
@@ -4753,14 +4758,53 @@ def _prompt_for_key(key: str, dotenv_path: Path | None) -> bool:
     return True
 
 
-def _ensure_api_keys(provider: str, dotenv_path: Path | None, allow_prompt: bool = True) -> None:
+def _prompt_for_key_curses(stdscr, key: str, dotenv_path: Path | None) -> bool:
+    try:
+        import curses
+    except Exception:
+        return _prompt_for_key(key, dotenv_path)
+    try:
+        try:
+            curses.def_prog_mode()
+            curses.endwin()
+        except Exception:
+            pass
+        return _prompt_for_key(key, dotenv_path)
+    finally:
+        try:
+            curses.reset_prog_mode()
+            curses.curs_set(0)
+            stdscr.clear()
+            stdscr.refresh()
+        except Exception:
+            pass
+
+
+def _provider_key_hint(provider: str) -> str:
+    provider_key = provider.strip().lower()
+    if provider_key == "openai":
+        return "OPENAI_API_KEY (or OPENAI_API_KEY_BACKUP)"
+    if provider_key == "gemini":
+        return "GEMINI_API_KEY (or GOOGLE_API_KEY)"
+    if provider_key == "flux":
+        return "BFL_API_KEY (or FLUX_API_KEY)"
+    if provider_key == "imagen":
+        return "GOOGLE_API_KEY (or Vertex credentials like GOOGLE_APPLICATION_CREDENTIALS)"
+    return "the required API key"
+
+
+def _ensure_api_keys(
+    provider: str, dotenv_path: Path | None, allow_prompt: bool = True, prompt_func=None
+) -> None:
+    if prompt_func is None:
+        prompt_func = _prompt_for_key
     provider = provider.strip().lower()
     if provider == "openai":
         if os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY_BACKUP"):
             return
         if not allow_prompt:
             raise RuntimeError("OPENAI_API_KEY is required for OpenAI provider.")
-        if not _prompt_for_key("OPENAI_API_KEY", dotenv_path):
+        if not prompt_func("OPENAI_API_KEY", dotenv_path):
             raise RuntimeError("OPENAI_API_KEY is required for OpenAI provider.")
         return
     if provider == "gemini":
@@ -4768,7 +4812,7 @@ def _ensure_api_keys(provider: str, dotenv_path: Path | None, allow_prompt: bool
             return
         if not allow_prompt:
             raise RuntimeError("GEMINI_API_KEY (or GOOGLE_API_KEY) is required for Gemini provider.")
-        if not _prompt_for_key("GEMINI_API_KEY", dotenv_path):
+        if not prompt_func("GEMINI_API_KEY", dotenv_path):
             raise RuntimeError("GEMINI_API_KEY (or GOOGLE_API_KEY) is required for Gemini provider.")
         return
     if provider == "flux":
@@ -4776,7 +4820,7 @@ def _ensure_api_keys(provider: str, dotenv_path: Path | None, allow_prompt: bool
             return
         if not allow_prompt:
             raise RuntimeError("BFL_API_KEY (or FLUX_API_KEY) is required for Flux provider.")
-        if not _prompt_for_key("BFL_API_KEY", dotenv_path):
+        if not prompt_func("BFL_API_KEY", dotenv_path):
             raise RuntimeError("BFL_API_KEY (or FLUX_API_KEY) is required for Flux provider.")
         return
     if provider == "imagen":
@@ -4794,7 +4838,7 @@ def _ensure_api_keys(provider: str, dotenv_path: Path | None, allow_prompt: bool
             raise RuntimeError(
                 "GOOGLE_API_KEY (or Vertex credentials) is required for Imagen provider."
             )
-        if not _prompt_for_key("GOOGLE_API_KEY", dotenv_path):
+        if not prompt_func("GOOGLE_API_KEY", dotenv_path):
             raise RuntimeError(
                 "GOOGLE_API_KEY (or Vertex credentials) is required for Imagen provider."
             )
@@ -5885,7 +5929,15 @@ def _run_generation(args: argparse.Namespace) -> int:
         args.openai_responses = _env_flag(OPENAI_RESPONSES_ENV)
     openai_stream, openai_responses = _apply_openai_provider_flags(args)
     use_stream = bool(openai_stream and _is_openai_gpt_image(args.provider, args.model))
-    _ensure_api_keys(args.provider, _find_repo_dotenv())
+    allow_prompt = not bool(getattr(args, "defaults", False))
+    try:
+        _ensure_api_keys(args.provider, _find_repo_dotenv(), allow_prompt=allow_prompt)
+    except RuntimeError as exc:
+        if not allow_prompt:
+            print(f"Setup failed: {exc}")
+            print(f"Tip: set {_provider_key_hint(args.provider)} in your environment or .env, then rerun.")
+            return 1
+        raise
     prompts = args.prompt or list(DEFAULT_PROMPTS)
     out_dir = Path(args.out).expanduser().resolve()
 
