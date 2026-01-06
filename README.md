@@ -2,6 +2,8 @@
 
 Interactive terminal UI for multi-provider image generation and receipts.
 
+![PARAM FORGE terminal demo](preview.gif)
+
 ![Explore Mode — Feedback Loop](docs/explore_flow.svg)
 
 ## TL;DR
