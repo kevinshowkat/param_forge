@@ -2,6 +2,8 @@
 
 Interactive terminal UI for multi-provider image generation and receipts.
 
+![Explore Mode — Feedback Loop](docs/explore_flow.svg)
+
 ## TL;DR
 PARAM FORGE is a terminal UI for running text-to-image jobs across providers and saving reproducible receipts next to outputs.
 
@@ -86,3 +88,8 @@ OpenAI image call options:
 - Receipts are stored next to generated images in the output directory.
 - Pricing reference (per 1K images): docs/pricing_reference.md, docs/pricing_reference.json
 - Experiment flow is not wired up yet (planned; not runnable in this release).
+- Default prompt: a nod to Simon Willison's baseline SVG prompt for testing text-to-text models:
+  ```
+  https://x.com/simonw/status/1990859659595731046
+  https://simonwillison.net/2024/Oct/25/pelicans-on-a-bicycle/
+  ```
