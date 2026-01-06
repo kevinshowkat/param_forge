@@ -80,6 +80,13 @@ Receipt analyzer provider:
 - Or pass `--analyzer openai` on the CLI.
 - Note: `council` runs multiple analyzers and may take a few minutes.
 
+## Council analyzer
+Param Forge includes a **council** analyzer option that aggregates multiple LLMs and synthesizes a single recommendation. This is inspired by Andrej Karpathy’s LLM Council approach.
+- Reference: https://github.com/karpathy/llm-council
+- Enable: `--analyzer council` or `RECEIPT_ANALYZER=council`
+- Behavior: runs multiple models, compares their feedback, and outputs a consolidated set of parameter tweaks.
+- Note: council runs can take longer and incur more token usage than single-model analysis.
+
 OpenAI image call options:
 - `--openai-stream` (env: `OPENAI_IMAGE_STREAM=1`) to stream gpt-image models.
 - `--openai-responses` (env: `OPENAI_IMAGE_USE_RESPONSES=1`) to call gpt-image via the Responses API.
@@ -91,5 +98,5 @@ OpenAI image call options:
 - Pricing reference (per 1K images): docs/pricing_reference.md, docs/pricing_reference.json
 - Experiment flow is not wired up yet (planned; not runnable in this release).
 - Default prompt: a nod to Simon Willison's baseline SVG prompt for testing text-to-text models.
-- https://x.com/simonw/status/1990859659595731046
-- https://simonwillison.net/2024/Oct/25/pelicans-on-a-bicycle/
+  - https://x.com/simonw/status/1990859659595731046
+  - https://simonwillison.net/2024/Oct/25/pelicans-on-a-bicycle/
