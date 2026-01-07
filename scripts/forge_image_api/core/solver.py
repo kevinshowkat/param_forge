@@ -60,7 +60,7 @@ def _parse_ratio(value: str) -> Optional[Tuple[int, int]]:
     return w, h
 
 
-def _normalize_format(value: Optional[str], default: str) -> str:
+def _normalize_format(value: Optional[str], default: Optional[str]) -> Optional[str]:
     if not value:
         return default
     lowered = value.strip().lower()
@@ -71,6 +71,19 @@ def _normalize_format(value: Optional[str], default: str) -> str:
     if lowered in {"png", "webp"}:
         return lowered
     return default
+
+
+def _provider_default_output_format(provider: str, model: Optional[str]) -> str:
+    provider_key = provider.strip().lower()
+    if provider_key == "openai":
+        return "png"
+    if provider_key == "gemini":
+        return "png"
+    if provider_key == "imagen":
+        return "png"
+    if provider_key == "flux":
+        return "jpeg"
+    return "png"
 
 
 def _choose_openai_size(size: str, warnings: List[str]) -> Tuple[str, Optional[int], Optional[int]]:
@@ -197,7 +210,8 @@ def resolve_request(request: ImageRequest, provider: str) -> ResolvedRequest:
     provider = provider.strip().lower()
     caps = get_capabilities(provider)
 
-    output_format = _normalize_format(request.output_format, "jpeg")
+    requested_format = _normalize_format(request.output_format, None)
+    output_format = requested_format or _provider_default_output_format(provider, request.model)
     model = request.model or request.provider_options.get("model") if request.provider_options else request.model
 
     if provider == "openai":
@@ -302,8 +316,9 @@ def resolve_request(request: ImageRequest, provider: str) -> ResolvedRequest:
         provider_params = {
             "width": width,
             "height": height,
-            "output_format": output_format,
         }
+        if request.output_format:
+            provider_params["output_format"] = output_format
         if request.seed is not None:
             provider_params["seed"] = request.seed
         flux_model = model

@@ -160,11 +160,12 @@ class OpenAIAdapter:
     def generate(self, request: ImageRequest, resolved: ResolvedRequest) -> ProviderResponse:
         client = _client()
         model = resolved.model or DEFAULT_MODEL
-        output_format = resolved.output_format
+        output_format_effective = resolved.output_format
+        output_format_param = output_format_effective if request.output_format else None
         prompt = resolved.prompt
         out_dir = request.out_dir or Path.cwd()
         warnings = list(resolved.warnings)
-        allow_compression = _supports_output_compression(output_format)
+        allow_compression = _supports_output_compression(output_format_effective)
         if not allow_compression and resolved.provider_params.get("output_compression") is not None:
             warnings.append("OpenAI output_compression ignored for PNG output.")
 
@@ -190,8 +191,8 @@ class OpenAIAdapter:
                 tool_payload: Dict[str, Any] = {"type": "image_generation"}
                 if resolved.size:
                     tool_payload["size"] = resolved.size
-                if output_format:
-                    tool_payload["output_format"] = output_format
+                if output_format_param:
+                    tool_payload["output_format"] = output_format_param
                 quality = resolved.provider_params.get("quality")
                 if quality:
                     tool_payload["quality"] = quality
@@ -205,10 +206,11 @@ class OpenAIAdapter:
                     "prompt": prompt,
                     "image_count": resolved.n,
                     "size": resolved.size,
-                    "output_format": output_format,
                     "responses": True,
                     "tool": tool_payload,
                 }
+                if output_format_param:
+                    raw_request["output_format"] = output_format_param
 
                 responses: List[Any] = []
                 try:
@@ -246,8 +248,9 @@ class OpenAIAdapter:
                     "prompt": prompt,
                     "image_count": resolved.n,
                     "size": resolved.size,
-                    "output_format": output_format,
                 }
+                if output_format_param:
+                    raw_request["output_format"] = output_format_param
                 edit_kwargs: Dict[str, Any] = {
                     "model": model,
                     "prompt": prompt,
@@ -257,9 +260,10 @@ class OpenAIAdapter:
                     "size": resolved.size,
                     "user": resolved.user,
                     "quality": resolved.provider_params.get("quality", "high"),
-                    "output_format": output_format,
                     "background": resolved.background,
                 }
+                if output_format_param:
+                    edit_kwargs["output_format"] = output_format_param
                 if resolved.provider_params.get("input_fidelity") is not None:
                     edit_kwargs["input_fidelity"] = resolved.provider_params.get("input_fidelity")
                 if allow_compression and resolved.provider_params.get("output_compression") is not None:
@@ -271,8 +275,9 @@ class OpenAIAdapter:
                     "prompt": prompt,
                     "image_count": resolved.n,
                     "size": resolved.size,
-                    "output_format": output_format,
                 }
+                if output_format_param:
+                    raw_request["output_format"] = output_format_param
                 gen_kwargs: Dict[str, Any] = {
                     "model": model,
                     "prompt": prompt,
@@ -280,10 +285,11 @@ class OpenAIAdapter:
                     "size": resolved.size,
                     "user": resolved.user,
                     "quality": resolved.provider_params.get("quality", "high"),
-                    "output_format": output_format,
                     "moderation": resolved.provider_params.get("moderation", "low"),
                     "background": resolved.background,
                 }
+                if output_format_param:
+                    gen_kwargs["output_format"] = output_format_param
                 if resolved.provider_params.get("input_fidelity") is not None:
                     gen_kwargs["input_fidelity"] = resolved.provider_params.get("input_fidelity")
                 if allow_compression and resolved.provider_params.get("output_compression") is not None:
@@ -348,7 +354,7 @@ class OpenAIAdapter:
                         images.append(
                             ProviderImage(
                                 image_bytes=binary,
-                                mime_type=f"image/{output_format}",
+                                mime_type=f"image/{output_format_effective}",
                                 seed=metadata.get("seed"),
                                 width=metadata.get("width"),
                                 height=metadata.get("height"),
@@ -378,7 +384,7 @@ class OpenAIAdapter:
                 images.append(
                     ProviderImage(
                         image_bytes=binary,
-                        mime_type=f"image/{output_format}",
+                        mime_type=f"image/{output_format_effective}",
                         seed=metadata.get("seed"),
                         width=metadata.get("width"),
                         height=metadata.get("height"),
@@ -402,9 +408,10 @@ class OpenAIAdapter:
     def stream(self, request: ImageRequest, resolved: ResolvedRequest) -> Iterator[ProviderStreamEvent]:
         client = _client()
         model = resolved.model or DEFAULT_MODEL
-        output_format = resolved.output_format
+        output_format_effective = resolved.output_format
+        output_format_param = output_format_effective if request.output_format else None
         prompt = resolved.prompt
-        allow_compression = _supports_output_compression(output_format)
+        allow_compression = _supports_output_compression(output_format_effective)
 
         if request.mode == "edit":
             yield ProviderStreamEvent(
@@ -420,10 +427,11 @@ class OpenAIAdapter:
             "n": resolved.n,
             "size": resolved.size,
             "quality": resolved.provider_params.get("quality", "high"),
-            "output_format": output_format,
             "moderation": resolved.provider_params.get("moderation", "low"),
             "stream": True,
         }
+        if output_format_param:
+            stream_kwargs["output_format"] = output_format_param
         if resolved.user:
             stream_kwargs["user"] = resolved.user
         if resolved.background:
@@ -509,7 +517,7 @@ class OpenAIAdapter:
             metadata = payload.get("metadata") or {}
             provider_image = ProviderImage(
                 image_bytes=binary,
-                mime_type=f"image/{output_format}",
+                mime_type=f"image/{output_format_effective}",
                 seed=metadata.get("seed"),
                 width=metadata.get("width"),
                 height=metadata.get("height"),

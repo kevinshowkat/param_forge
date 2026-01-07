@@ -144,6 +144,22 @@ def _env_flag(name: str) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _retrieval_score_enabled(args: argparse.Namespace | None = None) -> bool:
+    raw = os.getenv(RETRIEVAL_SCORE_ENV)
+    if raw is not None:
+        return _env_flag(RETRIEVAL_SCORE_ENV)
+    if args is not None and getattr(args, "defaults", False):
+        return False
+    return True
+
+
+def _retrieval_packet_mode() -> str:
+    raw = os.getenv(RETRIEVAL_PACKET_ENV, RETRIEVAL_PACKET_DEFAULT).strip().lower()
+    if raw == "full":
+        return "full"
+    return "compact"
+
+
 def _supports_color() -> bool:
     return sys.stdout.isatty()
 
@@ -214,6 +230,9 @@ OPENAI_RESPONSES_ENV = "OPENAI_IMAGE_USE_RESPONSES"
 OPENAI_RESPONSES_ENDPOINT = "https://api.openai.com/v1/responses"
 OPENAI_CHAT_ENDPOINT = "https://api.openai.com/v1/chat/completions"
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta"
+RETRIEVAL_SCORE_ENV = "LLM_RETRIEVAL_SCORE"
+RETRIEVAL_PACKET_ENV = "LLM_RETRIEVAL_PACKET"
+RETRIEVAL_PACKET_DEFAULT = "compact"
 MAX_ROUNDS = 3
 
 _COST_ESTIMATE_CACHE: dict[tuple[str, str | None, str], str] = {}
@@ -503,7 +522,7 @@ def _allowed_settings_for_receipt(receipt: dict, provider: str | None = None) ->
         "provider",
     }
     blocked_resolved = {"width", "height", "aspect_ratio"}
-    top_level_keys = {"size", "n", "seed", "output_format", "background", "model"}
+    top_level_keys = {"size", "n", "seed", "output_format", "model"}
 
     provider_key = provider
     if not provider_key and isinstance(receipt, dict):
@@ -518,6 +537,9 @@ def _allowed_settings_for_receipt(receipt: dict, provider: str | None = None) ->
         provider_key = resolved_provider or request_provider
     if provider_key:
         provider_key, _ = _normalize_provider_and_model(str(provider_key), None)
+
+    if provider_key == "openai":
+        top_level_keys.add("background")
 
     for key in top_level_keys:
         allowed.add(key)
@@ -567,6 +589,25 @@ _BLOCKED_RECOMMENDATION_KEYS = {
     "partial_images",
     "provider",
 }
+
+
+def _filter_unsupported_top_level_recommendations(
+    recommendations: list[dict],
+    provider: str | None,
+) -> list[dict]:
+    if not provider:
+        return recommendations
+    provider_key, _ = _normalize_provider_and_model(str(provider), None)
+    if provider_key == "openai":
+        return recommendations
+    filtered: list[dict] = []
+    for rec in recommendations:
+        name = str(rec.get("setting_name") or "").strip().lower()
+        target = str(rec.get("setting_target") or "provider_options").strip().lower()
+        if target in {"request", "top_level", "request_settings", ""} and name == "background":
+            continue
+        filtered.append(rec)
+    return filtered
 
 
 def _extract_setting_json(text: str) -> tuple[str, object | None]:
@@ -967,6 +1008,7 @@ def _append_analysis_history(
     cost_line: str | None,
     adherence: int | None,
     quality: int | None,
+    retrieval: int | None = None,
 ) -> None:
     summary = _recommendations_summary(recommendations)
     history.append(
@@ -979,6 +1021,7 @@ def _append_analysis_history(
             "accepted": accepted,
             "adherence": adherence,
             "quality": quality,
+            "retrieval": retrieval,
         }
     )
 
@@ -1051,6 +1094,25 @@ def _adherence_from_history(
         latest = current_adherence
         if baseline is None:
             baseline = current_adherence
+    return baseline, latest
+
+
+def _retrieval_from_history(
+    history: list[dict] | None,
+    current_retrieval: int | None = None,
+) -> tuple[int | None, int | None]:
+    baseline = None
+    latest = None
+    for entry in history or []:
+        value = entry.get("retrieval")
+        if isinstance(value, int):
+            if baseline is None:
+                baseline = value
+            latest = value
+    if current_retrieval is not None:
+        latest = current_retrieval
+        if baseline is None:
+            baseline = current_retrieval
     return baseline, latest
 
 
@@ -1531,7 +1593,7 @@ def _interactive_args_curses(stdscr, color_override: bool | None = None) -> argp
             color_enabled,
         )
         hint = (
-            "Repeatable prompt runs with fixed knobs, receipt exports, and side-by-side rounds."
+            "Identify optimal API settings for your goal: lower cost, faster render, etc."
             if mode_idx == 0
             else "Start from a reference image to find the best provider/model/params and export one receipt."
         )
@@ -1990,23 +2052,48 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                     receipts.append(Path(res.receipt_path))
                     images.append(Path(res.image_path))
                 if results:
+                    retrieval_enabled = _retrieval_score_enabled(args)
                     for res_idx, res in enumerate(results, start=1):
-                        status = f"Stamping snapshot {res_idx}/{len(results)} (Council scoring)..."
-                        _write_status_line(
-                            stdscr,
-                            status_y,
-                            _truncate_text(status, max(20, width - 1)),
-                            width,
-                            curses.A_DIM,
-                        )
-                        stdscr.refresh()
-                        scores = _apply_snapshot_for_result(
-                            image_path=Path(res.image_path),
-                            receipt_path=Path(res.receipt_path),
-                            prompt=prompt,
-                            elapsed=elapsed,
-                            fallback_settings=_capture_call_settings(args),
-                        )
+                        scoring_label = "Council scoring"
+                        if retrieval_enabled:
+                            scoring_label = "Council scoring + retrieval"
+                        stamp_holder: dict[str, object] = {}
+                        stamp_done = threading.Event()
+
+                        def _run_stamp() -> None:
+                            try:
+                                stamp_holder["scores"] = _apply_snapshot_for_result(
+                                    image_path=Path(res.image_path),
+                                    receipt_path=Path(res.receipt_path),
+                                    prompt=prompt,
+                                    elapsed=elapsed,
+                                    fallback_settings=_capture_call_settings(args),
+                                    retrieval_enabled=retrieval_enabled,
+                                )
+                            except Exception as exc:
+                                stamp_holder["error"] = exc
+                            finally:
+                                stamp_done.set()
+
+                        threading.Thread(target=_run_stamp, daemon=True).start()
+                        frames = ["|", "/", "-", "\\"]
+                        frame_idx = 0
+                        while not stamp_done.is_set():
+                            status = (
+                                f"Stamping snapshot {res_idx}/{len(results)} "
+                                f"({scoring_label}) {frames[frame_idx % len(frames)]}"
+                            )
+                            _write_status_line(
+                                stdscr,
+                                status_y,
+                                _truncate_text(status, max(20, width - 1)),
+                                width,
+                                curses.A_DIM,
+                            )
+                            stdscr.refresh()
+                            frame_idx += 1
+                            time.sleep(0.1)
+                        scores = stamp_holder.get("scores") or (None, None)
                         adherence_scores.append(scores[0])
                         quality_scores.append(scores[1])
 
@@ -2181,6 +2268,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                         benchmark_elapsed=stored_speed_benchmark,
                         round_scores=round_scores,
                     )
+                    retrieval_score = _load_retrieval_score(receipts[-1]) if receipts else None
                     _append_analysis_history(
                         analysis_history,
                         round_index=run_index,
@@ -2191,83 +2279,11 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                         cost_line=cost_line,
                         adherence=round_scores[0],
                         quality=round_scores[1],
+                        retrieval=retrieval_score,
                     )
                     if cost_line:
                         stored_cost = cost_line.replace("COST:", "").strip()
                     if run_index >= MAX_ROUNDS:
-                        base_settings = last_call_settings or _capture_call_settings(args)
-                        quality_baseline, quality_current = _quality_from_history(analysis_history)
-                        adherence_baseline, adherence_current = _adherence_from_history(analysis_history)
-                        baseline_elapsed, baseline_cost_line = _baseline_metrics_from_history(analysis_history)
-                        recommended_settings = (
-                            _settings_after_recommendation(base_settings, recommendation)
-                            if recommendation
-                            else base_settings
-                        )
-                        validation_needed = False
-                        if baseline_settings:
-                            validation_needed = bool(
-                                _diff_call_settings(base_settings, recommended_settings)
-                            )
-                        _show_final_recommendation_curses(
-                            stdscr,
-                            settings=base_settings,
-                            recommendation=recommendation,
-                            user_goals=stored_goals,
-                            color_enabled=color_enabled,
-                            last_elapsed=last_elapsed,
-                            cost_line=cost_line,
-                            baseline_elapsed=baseline_elapsed,
-                            baseline_cost_line=baseline_cost_line,
-                            quality_baseline=quality_baseline,
-                            quality_current=quality_current,
-                            adherence_baseline=adherence_baseline,
-                            adherence_current=adherence_current,
-                            receipt_path=receipts[-1] if receipts else None,
-                            baseline_settings=baseline_settings,
-                            force_quality_metrics=bool(stored_goals and "maximize quality of render" in stored_goals),
-                        )
-                        if validation_needed and _prompt_yes_no_curses(
-                            stdscr,
-                            "Run final validation with the full recommended settings?",
-                            color_enabled=color_enabled,
-                        ):
-                            if recommendation:
-                                _apply_recommendation(args, recommendation)
-                            validation_settings = _capture_call_settings(args)
-                            header_override = _build_validation_header_lines(
-                                baseline_settings=baseline_settings or validation_settings,
-                                current_settings=validation_settings,
-                                max_width=max(20, width - 1),
-                            )
-                            (
-                                val_receipts,
-                                val_images,
-                                _,
-                                _,
-                                _,
-                                _,
-                                _,
-                                _,
-                            ) = _generate_once(
-                                MAX_ROUNDS + 1,
-                                None,
-                                [],
-                                None,
-                                header_override,
-                            )
-                            if baseline_image and val_images:
-                                composite = _compose_side_by_side(
-                                    baseline_image,
-                                    val_images[-1],
-                                    label_left="Round 1 baseline",
-                                    label_right="Final validation",
-                                    out_dir=Path(args.out),
-                                )
-                                if composite:
-                                    _open_path(composite)
-                                else:
-                                    _open_path(val_images[-1])
                         return
                     if accepted and recommendation:
                         if _apply_recommendation(args, recommendation):
@@ -2347,6 +2363,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                         cost_line=cost_line,
                         adherence=round_scores[0],
                         quality=round_scores[1],
+                        retrieval=_load_retrieval_score(receipts[-1]) if receipts else None,
                     )
                     if cost_line:
                         stored_cost = cost_line.replace("COST:", "").strip()
@@ -2354,6 +2371,11 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                         base_settings = last_call_settings or _capture_call_settings(args)
                         quality_baseline, quality_current = _quality_from_history(analysis_history)
                         adherence_baseline, adherence_current = _adherence_from_history(analysis_history)
+                        retrieval_current = _load_retrieval_score(receipts[-1]) if receipts else None
+                        retrieval_baseline, retrieval_current = _retrieval_from_history(
+                            analysis_history,
+                            retrieval_current,
+                        )
                         baseline_elapsed, baseline_cost_line = _baseline_metrics_from_history(analysis_history)
                         recommended_settings = (
                             _settings_after_recommendation(base_settings, recommendation)
@@ -2379,6 +2401,8 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                             quality_current=quality_current,
                             adherence_baseline=adherence_baseline,
                             adherence_current=adherence_current,
+                            retrieval_baseline=retrieval_baseline,
+                            retrieval_current=retrieval_current,
                             receipt_path=receipts[-1] if receipts else None,
                             baseline_settings=baseline_settings,
                             force_quality_metrics=bool(user_goals and "maximize quality of render" in user_goals),
@@ -2898,6 +2922,248 @@ def _parse_score_payload(text: str) -> tuple[int | None, int | None]:
     return adherence, quality
 
 
+_RETRIEVAL_AXIS_KEYS = (
+    "text_legibility",
+    "captionability",
+    "entity_richness",
+    "information_density",
+    "semantic_novelty",
+    "trust_signals",
+    "platform_fitness",
+)
+
+_RETRIEVAL_AXIS_WEIGHTS: dict[str, float] = {
+    "text_legibility": 0.2,
+    "captionability": 0.15,
+    "entity_richness": 0.15,
+    "information_density": 0.15,
+    "semantic_novelty": 0.1,
+    "trust_signals": 0.15,
+    "platform_fitness": 0.1,
+}
+
+
+def _extract_retrieval_json(text: str) -> object | None:
+    match = re.search(r"<retrieval_json>(.*?)</retrieval_json>", text, flags=re.S)
+    raw = match.group(1).strip() if match else text.strip()
+    if "```" in raw:
+        fence = re.search(r"```(?:json)?(.*?)```", raw, flags=re.S | re.I)
+        if fence:
+            raw = fence.group(1).strip()
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    match = re.search(r"\{.*\}", raw, flags=re.S)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except Exception:
+        return None
+
+
+def _extract_axis_scores_from_text(text: str) -> dict[str, int | None]:
+    axes: dict[str, int | None] = {}
+    for key in _RETRIEVAL_AXIS_KEYS:
+        pattern = rf"{re.escape(key)}[^0-9]{{0,10}}(\d{{1,3}})"
+        match = re.search(pattern, text, flags=re.I)
+        axes[key] = _clamp_score(match.group(1)) if match else None
+    return axes
+
+
+def _clean_text(value: object, max_len: int) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3].rstrip() + "..."
+
+
+def _clean_list(value: object, max_items: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    for item in value:
+        if item is None:
+            continue
+        text = str(item).strip()
+        if not text:
+            continue
+        items.append(text)
+        if len(items) >= max_items:
+            break
+    return items
+
+
+def _clean_claims(value: object, max_items: int) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    claims: list[dict[str, object]] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            text = _clean_text(entry, 140)
+            if text:
+                claims.append({"text": text, "confidence": 0.5})
+            if len(claims) >= max_items:
+                break
+            continue
+        text = _clean_text(entry.get("text"), 140)
+        if not text:
+            continue
+        confidence_raw = entry.get("confidence")
+        try:
+            confidence = float(confidence_raw)
+        except Exception:
+            confidence = 0.5
+        confidence = max(0.0, min(1.0, confidence))
+        claims.append({"text": text, "confidence": confidence})
+        if len(claims) >= max_items:
+            break
+    return claims
+
+
+def _normalize_retrieval_axes(value: object) -> dict[str, int | None]:
+    axes: dict[str, int | None] = {}
+    raw = value if isinstance(value, dict) else {}
+    for key in _RETRIEVAL_AXIS_KEYS:
+        axes[key] = _clamp_score(raw.get(key))
+    return axes
+
+
+def _compute_retrieval_score(axes: dict[str, int | None]) -> int | None:
+    weighted = 0.0
+    total = 0.0
+    for key, weight in _RETRIEVAL_AXIS_WEIGHTS.items():
+        score = axes.get(key)
+        if score is None:
+            continue
+        weighted += score * weight
+        total += weight
+    if total <= 0:
+        return None
+    return int(round(weighted / total))
+
+
+def _compact_retrieval_packet(packet: dict[str, object]) -> dict[str, object]:
+    return {
+        "alt_text_120": packet.get("alt_text_120"),
+        "caption_280": packet.get("caption_280"),
+        "entities": packet.get("entities"),
+        "claims": packet.get("claims"),
+        "questions_answered": packet.get("questions_answered"),
+        "flags": packet.get("flags"),
+    }
+
+
+def _build_retrieval_prompt(prompt: str) -> str:
+    return (
+        "You are evaluating an image for LLM-mediated retrieval and summarization. "
+        "Do NOT judge beauty. Focus on clarity, extractability, and usefulness.\n\n"
+        "Score each axis 0-100 (integers):\n"
+        "- text_legibility\n"
+        "- captionability\n"
+        "- entity_richness\n"
+        "- information_density\n"
+        "- semantic_novelty\n"
+        "- trust_signals\n"
+        "- platform_fitness\n\n"
+        "Then compute retrieval_score as a weighted average using weights:\n"
+        "text_legibility 0.20, captionability 0.15, entity_richness 0.15, "
+        "information_density 0.15, semantic_novelty 0.10, trust_signals 0.15, "
+        "platform_fitness 0.10.\n\n"
+        "Return JSON with keys: retrieval_score (int), axes (object with axis scores), "
+        "alt_text_120, caption_280, ocr_text, entities, claims, questions_answered, flags.\n"
+        "Axes object keys: text_legibility, captionability, entity_richness, information_density, "
+        "semantic_novelty, trust_signals, platform_fitness.\n\n"
+        "Also output a consumption packet:\n"
+        "- alt_text_120 (<=120 chars)\n"
+        "- caption_280 (<=280 chars)\n"
+        "- ocr_text (best effort; empty if none)\n"
+        "- entities (<=12 items)\n"
+        "- claims (<=5 objects {text, confidence 0-1})\n"
+        "- questions_answered (<=5 items)\n"
+        "- flags (<=6 items from: unreadable_text, low_contrast_text, ambiguous_subject, "
+        "cluttered_layout, artifacted_content, low_trust_layout, thumbnail_failure)\n\n"
+        "Return ONLY JSON wrapped in <retrieval_json>...</retrieval_json>.\n\n"
+        f"Prompt:\n{prompt}"
+    )
+
+
+def _score_retrieval_with_council(
+    *,
+    prompt: str,
+    image_base64: str | None,
+    image_mime: str | None,
+) -> dict[str, object] | None:
+    if not image_base64 or not image_mime:
+        return None
+    if not (
+        os.getenv("OPENAI_API_KEY")
+        or os.getenv("OPENAI_API_KEY_BACKUP")
+        or os.getenv("ANTHROPIC_API_KEY")
+        or os.getenv("GEMINI_API_KEY")
+        or os.getenv("GOOGLE_API_KEY")
+    ):
+        return None
+    prompt_text = _build_retrieval_prompt(prompt)
+    try:
+        text, _ = _call_council(
+            prompt_text,
+            enable_web_search=False,
+            image_base64=image_base64,
+            image_mime=image_mime,
+            chair_instructions=[
+                "You are the council chair. Synthesize a single JSON response.",
+                "Output ONLY <retrieval_json>...</retrieval_json>. No extra text.",
+            ],
+        )
+    except Exception:
+        return None
+    payload = _extract_retrieval_json(text)
+    if not isinstance(payload, dict):
+        axes = _extract_axis_scores_from_text(text)
+        retrieval_score = _compute_retrieval_score(axes)
+        if retrieval_score is None:
+            return None
+        return {
+            "score": retrieval_score,
+            "axes": axes,
+            "packet": {},
+            "packet_mode": "compact",
+            "model": "council",
+            "raw_text": _clean_text(text, 1200),
+        }
+    axes_payload = payload.get("axes")
+    if not isinstance(axes_payload, dict):
+        axes_payload = {key: payload.get(key) for key in _RETRIEVAL_AXIS_KEYS}
+    axes = _normalize_retrieval_axes(axes_payload)
+    retrieval_score = _clamp_score(payload.get("retrieval_score") or payload.get("score"))
+    if retrieval_score is None:
+        retrieval_score = _compute_retrieval_score(axes)
+    packet: dict[str, object] = {
+        "alt_text_120": _clean_text(payload.get("alt_text_120"), 120),
+        "caption_280": _clean_text(payload.get("caption_280"), 280),
+        "ocr_text": _clean_text(payload.get("ocr_text"), 800),
+        "entities": _clean_list(payload.get("entities"), 12),
+        "claims": _clean_claims(payload.get("claims"), 5),
+        "questions_answered": _clean_list(payload.get("questions_answered"), 5),
+        "flags": _clean_list(payload.get("flags"), 6),
+    }
+    packet_mode = _retrieval_packet_mode()
+    stored_packet = packet if packet_mode == "full" else _compact_retrieval_packet(packet)
+    return {
+        "score": retrieval_score,
+        "axes": axes,
+        "packet": stored_packet,
+        "packet_mode": packet_mode,
+        "model": "council",
+    }
+
+
 def _score_image_with_council(
     *,
     prompt: str,
@@ -2937,31 +3203,126 @@ def _score_image_with_council(
     return _parse_score_payload(text)
 
 
+def _compute_colorfulness(image) -> float:
+    pixels = list(image.getdata())
+    if not pixels:
+        return 0.0
+    total = len(pixels)
+    step = max(1, total // 50000)
+    mean_rg = 0.0
+    mean_yb = 0.0
+    var_rg = 0.0
+    var_yb = 0.0
+    count = 0
+    for idx in range(0, total, step):
+        r, g, b = pixels[idx]
+        rg = float(r) - float(g)
+        yb = 0.5 * (float(r) + float(g)) - float(b)
+        count += 1
+        delta_rg = rg - mean_rg
+        mean_rg += delta_rg / count
+        var_rg += delta_rg * (rg - mean_rg)
+        delta_yb = yb - mean_yb
+        mean_yb += delta_yb / count
+        var_yb += delta_yb * (yb - mean_yb)
+    if count <= 1:
+        return 0.0
+    std_rg = math.sqrt(var_rg / (count - 1))
+    std_yb = math.sqrt(var_yb / (count - 1))
+    mean_rg_abs = abs(mean_rg)
+    mean_yb_abs = abs(mean_yb)
+    return math.sqrt(std_rg * std_rg + std_yb * std_yb) + 0.3 * math.sqrt(
+        mean_rg_abs * mean_rg_abs + mean_yb_abs * mean_yb_abs
+    )
+
+
+def _compute_image_quality_metrics(image_path: Path) -> dict[str, object]:
+    try:
+        from PIL import Image, ImageFilter, ImageStat  # type: ignore
+    except Exception:
+        return {}
+    try:
+        image = Image.open(image_path).convert("RGB")
+    except Exception:
+        return {}
+    max_dim = 512
+    if max(image.width, image.height) > max_dim:
+        scale = max_dim / max(image.width, image.height)
+        new_size = (max(1, int(image.width * scale)), max(1, int(image.height * scale)))
+        image = image.resize(new_size, Image.BICUBIC)
+    luma = image.convert("L")
+    luma_stats = ImageStat.Stat(luma)
+    brightness = float(luma_stats.mean[0])
+    contrast = float(luma_stats.stddev[0])
+    edges = luma.filter(ImageFilter.FIND_EDGES)
+    edge_stats = ImageStat.Stat(edges)
+    sharpness = float(edge_stats.mean[0])
+    colorfulness = float(_compute_colorfulness(image))
+    return {
+        "brightness_luma_mean": round(brightness, 2),
+        "contrast_luma_std": round(contrast, 2),
+        "sharpness_edge_mean": round(sharpness, 2),
+        "colorfulness": round(colorfulness, 2),
+        "sampled_width": image.width,
+        "sampled_height": image.height,
+    }
+
+
+def _image_quality_gates(metrics: dict[str, object]) -> list[str]:
+    gates: list[str] = []
+    brightness = metrics.get("brightness_luma_mean")
+    contrast = metrics.get("contrast_luma_std")
+    sharpness = metrics.get("sharpness_edge_mean")
+    if isinstance(brightness, (int, float)):
+        if brightness < 40:
+            gates.append("too_dark")
+        elif brightness > 215:
+            gates.append("too_bright")
+    if isinstance(contrast, (int, float)) and contrast < 20:
+        gates.append("low_contrast")
+    if isinstance(sharpness, (int, float)) and sharpness < 3:
+        gates.append("low_sharpness")
+    return gates
+
+
 def _build_snapshot_lines(
     *,
     elapsed: float | None,
     cost: float | None,
     adherence: int | None,
     quality: int | None,
+    retrieval_score: int | None = None,
+    include_retrieval: bool = False,
+    retrieval_note: str | None = None,
 ) -> list[str]:
     elapsed_text = "N/A" if elapsed is None else f"{elapsed:.1f}s"
     adherence_text = "N/A" if adherence is None else f"{adherence}/100"
     quality_text = "N/A" if quality is None else f"{quality}/100"
-    return [
+    lines = [
         f"render: {elapsed_text}",
         f"cost: {_format_cost_value(cost)}",
         f"prompt adherence: {adherence_text}",
         f"LLM-rated quality: {quality_text}",
     ]
+    if include_retrieval:
+        if retrieval_score is None:
+            retrieval_text = retrieval_note or "N/A"
+        else:
+            retrieval_text = f"{retrieval_score}/100"
+        lines.append(f"LLM retrieval score: {retrieval_text}")
+    return lines
 
 
-def _snapshot_template_lines() -> list[str]:
-    return [
+def _snapshot_template_lines(include_retrieval: bool = False) -> list[str]:
+    lines = [
         "render: 9999.9s",
         "cost: $99999/1K",
         "prompt adherence: 100/100",
         "LLM-rated quality: 100/100",
     ]
+    if include_retrieval:
+        lines.append("LLM retrieval score: 100/100")
+    return lines
 
 
 def _measure_text_metrics(draw, font, lines: list[str], line_spacing: int) -> tuple[int, int, int]:
@@ -2979,7 +3340,9 @@ def _measure_text_metrics(draw, font, lines: list[str], line_spacing: int) -> tu
     return max_w, line_height, total_h
 
 
-def _apply_snapshot_overlay(image_path: Path, lines: list[str]) -> bool:
+def _apply_snapshot_overlay(
+    image_path: Path, lines: list[str], *, include_retrieval: bool = False
+) -> bool:
     try:
         from PIL import Image, ImageDraw, ImageFont  # type: ignore
     except Exception:
@@ -3021,7 +3384,7 @@ def _apply_snapshot_overlay(image_path: Path, lines: list[str]) -> bool:
         font = ImageFont.load_default()
     line_spacing = int(4 * scale_factor)
     padding = int(10 * scale_factor)
-    template_lines = _snapshot_template_lines()
+    template_lines = _snapshot_template_lines(include_retrieval=include_retrieval)
     if not is_truetype:
         draw = ImageDraw.Draw(image)
         max_w, line_height, total_h = _measure_text_metrics(draw, font, lines, line_spacing)
@@ -3126,6 +3489,68 @@ def _apply_snapshot_overlay(image_path: Path, lines: list[str]) -> bool:
     return True
 
 
+def _write_retrieval_metadata(receipt_path: Path, retrieval: dict[str, object]) -> None:
+    try:
+        payload = _load_receipt_payload(receipt_path)
+    except Exception:
+        return
+    if not isinstance(payload, dict):
+        return
+    meta = payload.get("result_metadata")
+    if not isinstance(meta, dict):
+        meta = {}
+        payload["result_metadata"] = meta
+    meta["llm_retrieval"] = retrieval
+    try:
+        receipt_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        return
+
+
+def _write_image_quality_metadata(
+    receipt_path: Path,
+    metrics: dict[str, object],
+    gates: list[str],
+) -> None:
+    if not metrics:
+        return
+    try:
+        payload = _load_receipt_payload(receipt_path)
+    except Exception:
+        return
+    if not isinstance(payload, dict):
+        return
+    meta = payload.get("result_metadata")
+    if not isinstance(meta, dict):
+        meta = {}
+        payload["result_metadata"] = meta
+    meta["image_quality_metrics"] = {
+        "metrics": metrics,
+        "gates": gates,
+        "version": "v1",
+    }
+    try:
+        receipt_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        return
+
+
+def _load_retrieval_score(receipt_path: Path) -> int | None:
+    try:
+        payload = _load_receipt_payload(receipt_path)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    meta = payload.get("result_metadata")
+    if not isinstance(meta, dict):
+        return None
+    retrieval = meta.get("llm_retrieval")
+    if not isinstance(retrieval, dict):
+        return None
+    return _clamp_score(retrieval.get("score"))
+
+
 def _apply_snapshot_for_result(
     *,
     image_path: Path,
@@ -3133,6 +3558,7 @@ def _apply_snapshot_for_result(
     prompt: str,
     elapsed: float | None,
     fallback_settings: dict[str, object],
+    retrieval_enabled: bool = True,
 ) -> tuple[int | None, int | None]:
     provider = fallback_settings.get("provider")
     model = fallback_settings.get("model")
@@ -3152,6 +3578,16 @@ def _apply_snapshot_for_result(
         model=str(model) if model else None,
         size=str(size) if size else None,
     )
+    quality_metrics: dict[str, object] = {}
+    quality_gates: list[str] = []
+    try:
+        quality_metrics = _compute_image_quality_metrics(image_path)
+        quality_gates = _image_quality_gates(quality_metrics) if quality_metrics else []
+    except Exception:
+        quality_metrics = {}
+        quality_gates = []
+    if quality_metrics:
+        _write_image_quality_metadata(receipt_path, quality_metrics, quality_gates)
     image_base64 = None
     image_mime = None
     try:
@@ -3163,13 +3599,41 @@ def _apply_snapshot_for_result(
         image_base64=image_base64,
         image_mime=image_mime,
     )
+    retrieval_payload = None
+    retrieval_score = None
+    retrieval_note = None
+    if retrieval_enabled:
+        if quality_gates:
+            retrieval_note = f"gated ({', '.join(quality_gates)})"
+            retrieval_payload = {
+                "score": None,
+                "axes": {},
+                "packet": {},
+                "packet_mode": _retrieval_packet_mode(),
+                "model": "quality_gate",
+                "gated": True,
+                "gate_reasons": quality_gates,
+            }
+            _write_retrieval_metadata(receipt_path, retrieval_payload)
+        else:
+            retrieval_payload = _score_retrieval_with_council(
+                prompt=prompt,
+                image_base64=image_base64,
+                image_mime=image_mime,
+            )
+            if isinstance(retrieval_payload, dict):
+                retrieval_score = _clamp_score(retrieval_payload.get("score"))
+                _write_retrieval_metadata(receipt_path, retrieval_payload)
     lines = _build_snapshot_lines(
         elapsed=elapsed,
         cost=cost_value,
         adherence=adherence,
         quality=quality,
+        retrieval_score=retrieval_score,
+        include_retrieval=retrieval_enabled,
+        retrieval_note=retrieval_note,
     )
-    _apply_snapshot_overlay(image_path, lines)
+    _apply_snapshot_overlay(image_path, lines, include_retrieval=retrieval_enabled)
     return adherence, quality
 
 
@@ -3179,9 +3643,14 @@ def _diff_call_settings(prev: dict[str, object], current: dict[str, object]) -> 
         prev_val = prev.get(key)
         curr_val = current.get(key)
         if prev_val != curr_val:
-            diffs.append(
-                f"{key}: {_format_setting_value(prev_val)} -> {_format_setting_value(curr_val)}"
-            )
+            prev_text = _format_setting_value(prev_val)
+            curr_text = _format_setting_value(curr_val)
+            if key == "output_format":
+                prev_default = _default_output_format_for_settings(prev) if prev_val is None else None
+                curr_default = _default_output_format_for_settings(current) if curr_val is None else None
+                prev_text = _format_setting_value_with_default(prev_val, prev_default)
+                curr_text = _format_setting_value_with_default(curr_val, curr_default)
+            diffs.append(f"{key}: {prev_text} -> {curr_text}")
     prev_opts = prev.get("provider_options")
     curr_opts = current.get("provider_options")
     if not isinstance(prev_opts, dict):
@@ -3268,6 +3737,49 @@ def _format_setting_value(value: object, *, depth: int = 0) -> str:
             return "{...}"
         return _format_dict_inline(value, depth=depth + 1)
     return str(value)
+
+
+def _default_output_format_for_settings(settings: dict[str, object]) -> str | None:
+    provider_raw = settings.get("provider")
+    if not isinstance(provider_raw, str) or not provider_raw.strip():
+        provider_raw = "openai"
+    model_raw = settings.get("model")
+    if not isinstance(model_raw, str):
+        model_raw = None
+    provider_key, model_key = _normalize_provider_and_model(provider_raw, model_raw)
+    size_value = settings.get("size")
+    if not isinstance(size_value, str) or not size_value.strip():
+        size_value = "1024x1024"
+    n_value = settings.get("n")
+    try:
+        n_value = int(n_value) if n_value is not None else 1
+    except Exception:
+        n_value = 1
+    try:
+        from forge_image_api.core.contracts import ImageRequest  # type: ignore
+        from forge_image_api.core.solver import resolve_request  # type: ignore
+    except Exception:
+        return None
+    try:
+        request = ImageRequest(prompt=".", size=str(size_value), n=n_value)
+        request.output_format = None
+        request.background = settings.get("background")
+        if model_key:
+            request.model = model_key
+        provider_options = settings.get("provider_options")
+        if isinstance(provider_options, dict):
+            request.provider_options = dict(provider_options)
+        resolved = resolve_request(request, provider_key)
+        return resolved.output_format
+    except Exception:
+        return None
+
+
+def _format_setting_value_with_default(value: object, default: object | None) -> str:
+    rendered = _format_setting_value(value)
+    if value is None and default is not None:
+        return f"{rendered} (default: {_format_setting_value(default)})"
+    return rendered
 
 
 def _size_area_estimate(size_value: object) -> float | None:
@@ -3599,6 +4111,8 @@ def _build_final_recommendation_lines(
     quality_current: int | None = None,
     adherence_baseline: int | None = None,
     adherence_current: int | None = None,
+    retrieval_baseline: int | None = None,
+    retrieval_current: int | None = None,
     force_quality_metrics: bool = False,
 ) -> list[object]:
     lines: list[object] = []
@@ -3643,7 +4157,21 @@ def _build_final_recommendation_lines(
             _append_wrapped("No changes recommended.", "change")
 
     goals = set(user_goals or [])
-    if goals:
+    if goals or any(
+        value is not None
+        for value in (
+            baseline_elapsed,
+            last_elapsed,
+            baseline_cost_line,
+            cost_line,
+            quality_baseline,
+            quality_current,
+            adherence_baseline,
+            adherence_current,
+            retrieval_baseline,
+            retrieval_current,
+        )
+    ):
         reference_settings = baseline_settings or settings
         cost_ref = _estimate_cost_value(
             provider=str(reference_settings.get("provider"))
@@ -3685,63 +4213,160 @@ def _build_final_recommendation_lines(
                 if area_ref and area_target and area_ref > 0:
                     time_target = time_ref * (area_target / area_ref)
 
-        gain_lines: list[str] = []
         wants_cost = "minimize cost of render" in goals
         wants_time = "minimize time to render" in goals
         wants_quality = "maximize quality of render" in goals
-        quality_secondary = wants_quality and (wants_cost or wants_time)
-        quality_delta_line = None
-        adherence_delta_line = None
-        if quality_baseline is not None and quality_current is not None and quality_baseline > 0:
-            delta = quality_current - quality_baseline
-            pct = (delta / quality_baseline) * 100.0
-            direction = "increase" if delta >= 0 else "decrease"
-            quality_delta_line = f"Quality: {abs(pct):.0f}% {direction}"
-        if adherence_baseline is not None and adherence_current is not None and adherence_baseline > 0:
-            delta = adherence_current - adherence_baseline
-            pct = (delta / adherence_baseline) * 100.0
-            direction = "increase" if delta >= 0 else "decrease"
-            adherence_delta_line = f"Prompt adherence: {abs(pct):.0f}% {direction}"
-        cost_delta_line = None
+        wants_retrieval = "maximize LLM retrieval score" in goals
+
+        def _fmt_seconds(value: float | None) -> str:
+            if value is None:
+                return "N/A"
+            return f"{value:.1f}s"
+
+        def _fmt_cost(value: float | None) -> str:
+            return _format_cost_value(value)
+
+        def _fmt_score(value: int | None) -> str:
+            if value is None:
+                return "N/A"
+            return f"{value}/100"
+
+        def _delta_label_pct(
+            delta: float | None,
+            *,
+            higher_label: str,
+            lower_label: str,
+            invert_sign: bool = False,
+        ) -> str:
+            if delta is None:
+                return "N/A"
+            pct = abs(delta) * 100.0
+            if invert_sign:
+                sign = "-" if delta > 0 else "+" if delta < 0 else ""
+            else:
+                sign = "+" if delta > 0 else "-" if delta < 0 else ""
+            if pct < 0.5:
+                return "flat"
+            if pct < 3:
+                return f"{sign}{pct:.0f}% (minimal, {higher_label if delta > 0 else lower_label})"
+            return f"{sign}{pct:.0f}% ({higher_label if delta > 0 else lower_label})"
+
+        def _delta_label_points(delta: int | None, *, positive_label: str, negative_label: str) -> str:
+            if delta is None:
+                return "N/A"
+            if delta == 0:
+                return "flat"
+            sign = "+" if delta > 0 else "-"
+            abs_delta = abs(delta)
+            if abs_delta == 1:
+                return f"{sign}1 pt (minimal, {positive_label if delta > 0 else negative_label})"
+            return f"{sign}{abs_delta} pts ({positive_label if delta > 0 else negative_label})"
+
+        metrics: list[dict[str, object]] = []
+
+        cost_delta = None
         if cost_ref is not None and cost_target is not None and cost_ref > 0:
-            delta = (cost_target - cost_ref) / cost_ref
-            if abs(delta) >= 0.005:
-                pct = abs(delta) * 100.0
-                direction = "decrease" if delta < 0 else "increase"
-                cost_delta_line = f"Cost: {pct:.0f}% {direction}"
-        time_delta_line = None
+            cost_delta = (cost_target - cost_ref) / cost_ref
+        metrics.append(
+            {
+                "key": "cost",
+                "label": "Cost",
+                "baseline": cost_ref,
+                "target": cost_target,
+                "delta": cost_delta,
+                "line": f"Cost: {_fmt_cost(cost_ref)} → {_fmt_cost(cost_target)}",
+                "delta_text": _delta_label_pct(
+                    cost_delta,
+                    higher_label="higher",
+                    lower_label="lower",
+                    invert_sign=True,
+                ),
+                "primary": wants_cost,
+            }
+        )
+
+        time_delta = None
         if time_ref is not None and time_target is not None and time_ref > 0:
-            delta = (time_target - time_ref) / time_ref
-            if abs(delta) >= 0.005:
-                pct = abs(delta) * 100.0
-                direction = "decrease" if delta < 0 else "increase"
-                time_delta_line = f"Time: {pct:.0f}% {direction}"
+            time_delta = (time_target - time_ref) / time_ref
+        metrics.append(
+            {
+                "key": "time",
+                "label": "Render time",
+                "baseline": time_ref,
+                "target": time_target,
+                "delta": time_delta,
+                "line": f"Render time: {_fmt_seconds(time_ref)} → {_fmt_seconds(time_target)}",
+                "delta_text": _delta_label_pct(
+                    time_delta,
+                    higher_label="slower",
+                    lower_label="faster",
+                    invert_sign=True,
+                ),
+                "primary": wants_time,
+            }
+        )
 
-        def _maybe_append(line: str | None, *, primary: bool, quality: bool = False) -> None:
-            if not line:
-                return
-            suffix = ""
-            if goals and not primary:
-                suffix = " (secondary)"
-            if quality and quality_secondary:
-                suffix = " (secondary)"
-            gain_lines.append(f"{line}{suffix}")
+        quality_delta = None
+        if quality_baseline is not None and quality_current is not None:
+            quality_delta = quality_current - quality_baseline
+        metrics.append(
+            {
+                "key": "quality",
+                "label": "LLM quality",
+                "baseline": quality_baseline,
+                "target": quality_current,
+                "delta": quality_delta,
+                "line": f"LLM quality: {_fmt_score(quality_baseline)} → {_fmt_score(quality_current)}",
+                "delta_text": _delta_label_points(quality_delta, positive_label="better", negative_label="worse"),
+                "primary": wants_quality,
+            }
+        )
 
-        _maybe_append(cost_delta_line, primary=wants_cost)
-        _maybe_append(time_delta_line, primary=wants_time)
-        if wants_quality:
-            _maybe_append(quality_delta_line or ("Quality: N/A (no baseline)" if force_quality_metrics else None), primary=not quality_secondary, quality=True)
-            _maybe_append(adherence_delta_line or ("Prompt adherence: N/A (no baseline)" if force_quality_metrics else None), primary=not quality_secondary, quality=True)
-        else:
-            _maybe_append(quality_delta_line, primary=False, quality=True)
-            _maybe_append(adherence_delta_line, primary=False, quality=True)
+        adherence_delta = None
+        if adherence_baseline is not None and adherence_current is not None:
+            adherence_delta = adherence_current - adherence_baseline
+        metrics.append(
+            {
+                "key": "adherence",
+                "label": "Prompt adherence",
+                "baseline": adherence_baseline,
+                "target": adherence_current,
+                "delta": adherence_delta,
+                "line": f"Prompt adherence: {_fmt_score(adherence_baseline)} → {_fmt_score(adherence_current)}",
+                "delta_text": _delta_label_points(adherence_delta, positive_label="better", negative_label="worse"),
+                "primary": wants_quality,
+            }
+        )
 
-        if gain_lines:
-            _append_wrapped("Expected gains:", "section")
-            for line in gain_lines:
-                _append_wrapped(line, "goal")
-        else:
-            _append_wrapped("Expected gains: none (no changes recommended).", "goal")
+        retrieval_delta = None
+        if retrieval_baseline is not None and retrieval_current is not None:
+            retrieval_delta = retrieval_current - retrieval_baseline
+        metrics.append(
+            {
+                "key": "retrieval",
+                "label": "LLM retrieval",
+                "baseline": retrieval_baseline,
+                "target": retrieval_current,
+                "delta": retrieval_delta,
+                "line": f"LLM retrieval: {_fmt_score(retrieval_baseline)} → {_fmt_score(retrieval_current)}",
+                "delta_text": _delta_label_points(retrieval_delta, positive_label="better", negative_label="worse"),
+                "primary": wants_retrieval,
+            }
+        )
+
+        order = {"time": 0, "cost": 1, "quality": 2, "adherence": 3, "retrieval": 4}
+        metrics.sort(
+            key=lambda item: (
+                0 if item.get("primary") else 1,
+                order.get(str(item.get("key")), 9),
+            )
+        )
+
+        _append_wrapped("Metric changes (baseline → suggested):", "section")
+        for metric in metrics:
+            line = f"{metric['line']} ({metric['delta_text']})"
+            tag = "goal" if metric.get("primary") else None
+            _append_wrapped(line, tag)
     return lines
 
 
@@ -3760,6 +4385,8 @@ def _show_final_recommendation_curses(
     quality_current: int | None = None,
     adherence_baseline: int | None = None,
     adherence_current: int | None = None,
+    retrieval_baseline: int | None = None,
+    retrieval_current: int | None = None,
     receipt_path: Path | None = None,
     baseline_settings: dict[str, object] | None = None,
     force_quality_metrics: bool = False,
@@ -3782,6 +4409,8 @@ def _show_final_recommendation_curses(
         quality_current=quality_current,
         adherence_baseline=adherence_baseline,
         adherence_current=adherence_current,
+        retrieval_baseline=retrieval_baseline,
+        retrieval_current=retrieval_current,
         force_quality_metrics=force_quality_metrics,
     )
     if baseline_settings:
@@ -3845,6 +4474,7 @@ def _prompt_goal_selection_curses(stdscr, color_enabled: bool) -> tuple[list[str
         "minimize time to render",
         "minimize cost of render",
         "maximize quality of render",
+        "maximize LLM retrieval score",
         "something else",
     ]
     selected = [False] * len(options)
@@ -4237,6 +4867,11 @@ def _show_receipt_analysis_curses(
         analysis_history or [],
         round_scores[0] if round_scores else None,
     )
+    retrieval_current = _load_retrieval_score(receipt_path)
+    retrieval_baseline, retrieval_current = _retrieval_from_history(
+        analysis_history or [],
+        retrieval_current,
+    )
     try:
         receipt_payload = _load_receipt_payload(receipt_path)
         detail_lines = _build_receipt_detail_lines(
@@ -4291,6 +4926,8 @@ def _show_receipt_analysis_curses(
                 quality_current=quality_current,
                 adherence_baseline=adherence_baseline,
                 adherence_current=adherence_current,
+                retrieval_baseline=retrieval_baseline,
+                retrieval_current=retrieval_current,
                 force_quality_metrics=bool(user_goals and "maximize quality of render" in user_goals),
             )
         )
@@ -5545,6 +6182,8 @@ def _build_receipt_analysis_prompt(
         "prioritize maximizing prompt adherence and LLM-rated image quality, even if it increases cost/time. "
         "However, if the user also selected 'minimize cost of render' or 'minimize time to render', "
         "those goals take precedence and quality becomes secondary.\n"
+        "If the user selected 'maximize LLM retrieval score', prioritize legibility, captionability, "
+        "and retrieval-focused clarity even if aesthetic quality softens, unless cost/time goals are selected.\n"
         f"User notes: {notes_line or '(none)'}\n\n"
         f"{web_search_text}"
         f"{call_path_text}"
@@ -5613,6 +6252,8 @@ def _build_recommendation_only_prompt(
         "prioritize maximizing prompt adherence and LLM-rated image quality, even if it increases cost/time. "
         "However, if the user also selected 'minimize cost of render' or 'minimize time to render', "
         "those goals take precedence and quality becomes secondary.\n"
+        "If the user selected 'maximize LLM retrieval score', prioritize legibility, captionability, "
+        "and retrieval-focused clarity even if aesthetic quality softens, unless cost/time goals are selected.\n"
         f"User notes: {notes_line or '(none)'}\n"
         f"{web_search_text}"
         f"{call_path_text}"
@@ -5763,6 +6404,7 @@ def _analyze_receipt_payload(
         provider=provider,
         model=model,
     )
+    recommendations = _filter_unsupported_top_level_recommendations(recommendations, provider)
     recommendations = _filter_locked_size_recommendations(recommendations, size)
     recommendations = _filter_model_recommendations(recommendations, allowed_models)
     if rec_text and "no change" in rec_text:
@@ -5897,6 +6539,8 @@ def _analyze_receipt(
                         baseline_elapsed=None,
                         baseline_cost_line=None,
                         force_quality_metrics=False,
+                        retrieval_baseline=None,
+                        retrieval_current=None,
                     )
                     if isinstance(line, str)
                 ]
@@ -5959,6 +6603,7 @@ def _run_generation(args: argparse.Namespace) -> int:
             print(f"Tip: set {_provider_key_hint(args.provider)} in your environment or .env, then rerun.")
             return 1
         raise
+    retrieval_enabled = _retrieval_score_enabled(args)
     prompts = args.prompt or list(DEFAULT_PROMPTS)
     out_dir = Path(args.out).expanduser().resolve()
 
@@ -6030,13 +6675,17 @@ def _run_generation(args: argparse.Namespace) -> int:
             print(result.receipt_path)
             all_receipts.append(Path(result.receipt_path))
             last_image_path = Path(result.image_path)
-            print("Stamping snapshot (Council scoring)...")
+            scoring_label = "Council scoring"
+            if retrieval_enabled:
+                scoring_label = "Council scoring + retrieval"
+            print(f"Stamping snapshot ({scoring_label})...")
             _apply_snapshot_for_result(
                 image_path=Path(result.image_path),
                 receipt_path=Path(result.receipt_path),
                 prompt=prompt,
                 elapsed=elapsed,
                 fallback_settings=_capture_call_settings(args),
+                retrieval_enabled=retrieval_enabled,
             )
 
     if last_image_path and sys.stdin.isatty():

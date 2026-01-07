@@ -147,11 +147,14 @@ class ImagenAdapter:
     name = "imagen"
 
     def generate(self, request: ImageRequest, resolved: ResolvedRequest) -> ProviderResponse:
-        output_mime = "image/jpeg" if resolved.output_format == "jpeg" else f"image/{resolved.output_format}"
+        output_format_effective = resolved.output_format
+        output_format_param = output_format_effective if request.output_format else None
+        output_mime = "image/jpeg" if output_format_effective == "jpeg" else f"image/{output_format_effective}"
         config_kwargs: Dict[str, Any] = {
             "number_of_images": resolved.n,
-            "output_mime_type": output_mime,
         }
+        if output_format_param:
+            config_kwargs["output_mime_type"] = output_mime
         if resolved.provider_params.get("image_size"):
             config_kwargs["image_size"] = resolved.provider_params.get("image_size")
         if resolved.provider_params.get("aspect_ratio"):

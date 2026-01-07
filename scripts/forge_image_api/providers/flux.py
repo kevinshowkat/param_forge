@@ -156,8 +156,10 @@ class FluxAdapter:
                 "prompt": resolved.prompt,
                 "width": resolved.provider_params.get("width"),
                 "height": resolved.provider_params.get("height"),
-                "output_format": resolved.provider_params.get("output_format"),
             }
+            output_format = resolved.provider_params.get("output_format")
+            if output_format:
+                payload["output_format"] = output_format
             if resolved.seed is not None:
                 payload["seed"] = resolved.seed
             payload.update({k: v for k, v in options.items() if k not in CONTROL_KEYS})
