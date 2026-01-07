@@ -153,6 +153,13 @@ def _retrieval_score_enabled(args: argparse.Namespace | None = None) -> bool:
     return True
 
 
+def _final_summary_enabled() -> bool:
+    raw = os.getenv(FINAL_SUMMARY_ENV)
+    if raw is None:
+        return True
+    return _env_flag(FINAL_SUMMARY_ENV)
+
+
 def _retrieval_packet_mode() -> str:
     raw = os.getenv(RETRIEVAL_PACKET_ENV, RETRIEVAL_PACKET_DEFAULT).strip().lower()
     if raw == "full":
@@ -233,6 +240,7 @@ GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta"
 RETRIEVAL_SCORE_ENV = "LLM_RETRIEVAL_SCORE"
 RETRIEVAL_PACKET_ENV = "LLM_RETRIEVAL_PACKET"
 RETRIEVAL_PACKET_DEFAULT = "compact"
+FINAL_SUMMARY_ENV = "FINAL_SUMMARY"
 MAX_ROUNDS = 3
 
 _COST_ESTIMATE_CACHE: dict[tuple[str, str | None, str], str] = {}
@@ -2284,6 +2292,43 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                     if cost_line:
                         stored_cost = cost_line.replace("COST:", "").strip()
                     if run_index >= MAX_ROUNDS:
+                        if _final_summary_enabled():
+                            base_settings = last_call_settings or _capture_call_settings(args)
+                            quality_baseline, quality_current = _quality_from_history(analysis_history)
+                            adherence_baseline, adherence_current = _adherence_from_history(analysis_history)
+                            retrieval_current = _load_retrieval_score(receipts[-1]) if receipts else None
+                            retrieval_baseline, retrieval_current = _retrieval_from_history(
+                                analysis_history,
+                                retrieval_current,
+                            )
+                            baseline_elapsed, baseline_cost_line = _baseline_metrics_from_history(analysis_history)
+                            summary_note = None
+                            if recommendation:
+                                summary_note = (
+                                    "Pending recommendations not applied; summary reflects last tested settings."
+                                )
+                            _show_final_recommendation_curses(
+                                stdscr,
+                                settings=base_settings,
+                                recommendation=recommendation,
+                                user_goals=stored_goals,
+                                color_enabled=color_enabled,
+                                last_elapsed=last_elapsed,
+                                cost_line=cost_line,
+                                baseline_elapsed=baseline_elapsed,
+                                baseline_cost_line=baseline_cost_line,
+                                quality_baseline=quality_baseline,
+                                quality_current=quality_current,
+                                adherence_baseline=adherence_baseline,
+                                adherence_current=adherence_current,
+                                retrieval_baseline=retrieval_baseline,
+                                retrieval_current=retrieval_current,
+                                receipt_path=receipts[-1] if receipts else None,
+                                baseline_settings=baseline_settings,
+                                force_quality_metrics=bool(stored_goals and "maximize quality of render" in stored_goals),
+                                summary_note=summary_note,
+                                metrics_settings=base_settings,
+                            )
                         return
                     if accepted and recommendation:
                         if _apply_recommendation(args, recommendation):
@@ -2368,86 +2413,43 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                     if cost_line:
                         stored_cost = cost_line.replace("COST:", "").strip()
                     if run_index >= MAX_ROUNDS:
-                        base_settings = last_call_settings or _capture_call_settings(args)
-                        quality_baseline, quality_current = _quality_from_history(analysis_history)
-                        adherence_baseline, adherence_current = _adherence_from_history(analysis_history)
-                        retrieval_current = _load_retrieval_score(receipts[-1]) if receipts else None
-                        retrieval_baseline, retrieval_current = _retrieval_from_history(
-                            analysis_history,
-                            retrieval_current,
-                        )
-                        baseline_elapsed, baseline_cost_line = _baseline_metrics_from_history(analysis_history)
-                        recommended_settings = (
-                            _settings_after_recommendation(base_settings, recommendation)
-                            if recommendation
-                            else base_settings
-                        )
-                        validation_needed = False
-                        if baseline_settings:
-                            validation_needed = bool(
-                                _diff_call_settings(base_settings, recommended_settings)
+                        if _final_summary_enabled():
+                            base_settings = last_call_settings or _capture_call_settings(args)
+                            quality_baseline, quality_current = _quality_from_history(analysis_history)
+                            adherence_baseline, adherence_current = _adherence_from_history(analysis_history)
+                            retrieval_current = _load_retrieval_score(receipts[-1]) if receipts else None
+                            retrieval_baseline, retrieval_current = _retrieval_from_history(
+                                analysis_history,
+                                retrieval_current,
                             )
-                        _show_final_recommendation_curses(
-                            stdscr,
-                            settings=base_settings,
-                            recommendation=recommendation,
-                            user_goals=user_goals,
-                            color_enabled=color_enabled,
-                            last_elapsed=last_elapsed,
-                            cost_line=cost_line,
-                            baseline_elapsed=baseline_elapsed,
-                            baseline_cost_line=baseline_cost_line,
-                            quality_baseline=quality_baseline,
-                            quality_current=quality_current,
-                            adherence_baseline=adherence_baseline,
-                            adherence_current=adherence_current,
-                            retrieval_baseline=retrieval_baseline,
-                            retrieval_current=retrieval_current,
-                            receipt_path=receipts[-1] if receipts else None,
-                            baseline_settings=baseline_settings,
-                            force_quality_metrics=bool(user_goals and "maximize quality of render" in user_goals),
-                        )
-                        if validation_needed and _prompt_yes_no_curses(
-                            stdscr,
-                            "Run final validation with the full recommended settings?",
-                            color_enabled=color_enabled,
-                        ):
+                            baseline_elapsed, baseline_cost_line = _baseline_metrics_from_history(analysis_history)
+                            summary_note = None
                             if recommendation:
-                                _apply_recommendation(args, recommendation)
-                            validation_settings = _capture_call_settings(args)
-                            header_override = _build_validation_header_lines(
-                                baseline_settings=baseline_settings or validation_settings,
-                                current_settings=validation_settings,
-                                max_width=max(20, width - 1),
-                            )
-                            (
-                                val_receipts,
-                                val_images,
-                                _,
-                                _,
-                                _,
-                                _,
-                                _,
-                                _,
-                            ) = _generate_once(
-                                MAX_ROUNDS + 1,
-                                None,
-                                [],
-                                None,
-                                header_override,
-                            )
-                            if baseline_image and val_images:
-                                composite = _compose_side_by_side(
-                                    baseline_image,
-                                    val_images[-1],
-                                    label_left="Round 1 baseline",
-                                    label_right="Final validation",
-                                    out_dir=Path(args.out),
+                                summary_note = (
+                                    "Pending recommendations not applied; summary reflects last tested settings."
                                 )
-                                if composite:
-                                    _open_path(composite)
-                                else:
-                                    _open_path(val_images[-1])
+                            _show_final_recommendation_curses(
+                                stdscr,
+                                settings=base_settings,
+                                recommendation=recommendation,
+                                user_goals=user_goals,
+                                color_enabled=color_enabled,
+                                last_elapsed=last_elapsed,
+                                cost_line=cost_line,
+                                baseline_elapsed=baseline_elapsed,
+                                baseline_cost_line=baseline_cost_line,
+                                quality_baseline=quality_baseline,
+                                quality_current=quality_current,
+                                adherence_baseline=adherence_baseline,
+                                adherence_current=adherence_current,
+                                retrieval_baseline=retrieval_baseline,
+                                retrieval_current=retrieval_current,
+                                receipt_path=receipts[-1] if receipts else None,
+                                baseline_settings=baseline_settings,
+                                force_quality_metrics=bool(user_goals and "maximize quality of render" in user_goals),
+                                summary_note=summary_note,
+                                metrics_settings=base_settings,
+                            )
                         return
                     if accepted and recommendation:
                         if _apply_recommendation(args, recommendation):
@@ -4172,6 +4174,7 @@ def _build_final_recommendation_lines(
     retrieval_baseline: int | None = None,
     retrieval_current: int | None = None,
     force_quality_metrics: bool = False,
+    metrics_settings: dict[str, object] | None = None,
 ) -> list[object]:
     lines: list[object] = []
 
@@ -4194,6 +4197,7 @@ def _build_final_recommendation_lines(
             "change",
         )
     recommended_settings = _settings_after_recommendation(settings, recommendation) if recommendation else settings
+    metric_settings = metrics_settings or recommended_settings
     _append_wrapped(_format_call_settings_line(recommended_settings))
     baseline_diffs: list[str] = []
     if baseline_settings:
@@ -4244,16 +4248,16 @@ def _build_final_recommendation_lines(
             else:
                 cost_ref = _parse_cost_amount(cost_line)
         cost_target = _estimate_cost_value(
-            provider=str(recommended_settings.get("provider"))
-            if recommended_settings.get("provider")
+            provider=str(metric_settings.get("provider"))
+            if metric_settings.get("provider")
             else None,
-            model=str(recommended_settings.get("model")) if recommended_settings.get("model") else None,
-            size=str(recommended_settings.get("size")) if recommended_settings.get("size") else None,
+            model=str(metric_settings.get("model")) if metric_settings.get("model") else None,
+            size=str(metric_settings.get("size")) if metric_settings.get("size") else None,
         )
         if cost_target is None:
-            if not _diff_call_settings(recommended_settings, settings):
+            if not _diff_call_settings(metric_settings, settings):
                 cost_target = _parse_cost_amount(cost_line) or cost_ref
-            elif baseline_settings and not _diff_call_settings(recommended_settings, baseline_settings):
+            elif baseline_settings and not _diff_call_settings(metric_settings, baseline_settings):
                 cost_target = cost_ref
         if cost_target is None and cost_ref is not None:
             cost_target = cost_ref
@@ -4261,13 +4265,13 @@ def _build_final_recommendation_lines(
         time_ref = baseline_elapsed if baseline_elapsed is not None else last_elapsed
         time_target = None
         if time_ref is not None:
-            if last_elapsed is not None and not _diff_call_settings(recommended_settings, settings):
+            if last_elapsed is not None and not _diff_call_settings(metric_settings, settings):
                 time_target = last_elapsed
             elif cost_ref is not None and cost_target is not None and cost_ref > 0:
                 time_target = time_ref * (cost_target / cost_ref)
             else:
                 area_ref = _size_area_estimate(reference_settings.get("size"))
-                area_target = _size_area_estimate(recommended_settings.get("size"))
+                area_target = _size_area_estimate(metric_settings.get("size"))
                 if area_ref and area_target and area_ref > 0:
                     time_target = time_ref * (area_target / area_ref)
 
@@ -4448,6 +4452,8 @@ def _show_final_recommendation_curses(
     receipt_path: Path | None = None,
     baseline_settings: dict[str, object] | None = None,
     force_quality_metrics: bool = False,
+    summary_note: str | None = None,
+    metrics_settings: dict[str, object] | None = None,
 ) -> None:
     import curses
     height, width = stdscr.getmaxyx()
@@ -4470,7 +4476,11 @@ def _show_final_recommendation_curses(
         retrieval_baseline=retrieval_baseline,
         retrieval_current=retrieval_current,
         force_quality_metrics=force_quality_metrics,
+        metrics_settings=metrics_settings,
     )
+    if summary_note:
+        insert_at = 1 if len(lines) > 1 else len(lines)
+        lines.insert(insert_at, (summary_note, "goal"))
     if baseline_settings:
         recommended_settings = _settings_after_recommendation(settings, recommendation) if recommendation else settings
         diff_lines = _diff_call_settings(baseline_settings, recommended_settings)
