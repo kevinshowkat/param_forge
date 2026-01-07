@@ -8,8 +8,8 @@
       .text { font: 400 15px "Menlo", "Courier New", monospace; fill: #1f1f1f; }
       .code { font: 400 14px "Menlo", "Courier New", monospace; fill: #1f1f1f; }
       .goals-box { fill: #3b0a45; stroke: #1f1f1f; stroke-width: 3; }
-      .goals-label { font: 800 22px "SF Pro Display", "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif; fill: #ffffff; }
-      .goals-code { font: 600 17px "SF Pro Text", "SF Pro Display", "Helvetica Neue", Helvetica, Arial, sans-serif; fill: #ffffff; }
+      .goals-label { font: 800 22px "SF Pro", "SF-Pro", "Helvetica Neue", Helvetica, Arial, sans-serif; fill: #ffffff; }
+      .goals-code { font: 600 17px "SF Pro", "SF-Pro", "Helvetica Neue", Helvetica, Arial, sans-serif; fill: #ffffff; }
       .node { stroke: #1f1f1f; stroke-width: 2; }
       .ring { fill: none; stroke: #1f1f1f; stroke-width: 2; stroke-dasharray: 8 8; }
       .arrow { stroke: #1f1f1f; stroke-width: 2.5; fill: none; marker-end: url(#arrowhead); }
