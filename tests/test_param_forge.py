@@ -116,6 +116,30 @@ class TestDiffCallSettings(unittest.TestCase):
             )
         )
 
+    def test_provider_option_default_annotation(self) -> None:
+        prev = {
+            "provider": "gemini",
+            "model": "gemini-2.5-flash-image",
+            "size": "1024x1024",
+            "n": 1,
+            "provider_options": {},
+        }
+        curr = {
+            "provider": "gemini",
+            "model": "gemini-2.5-flash-image",
+            "size": "1024x1024",
+            "n": 1,
+            "provider_options": {"image_size": "2K"},
+        }
+        diffs = param_forge._diff_call_settings(prev, curr)
+        self.assertTrue(
+            any(
+                diff.startswith("provider_options.image_size: null (default: 1K)")
+                and diff.endswith("-> 2K")
+                for diff in diffs
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

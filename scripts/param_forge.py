@@ -3639,17 +3639,24 @@ def _apply_snapshot_for_result(
 
 def _diff_call_settings(prev: dict[str, object], current: dict[str, object]) -> list[str]:
     diffs: list[str] = []
+    prev_resolved = _resolved_request_for_settings(prev)
+    curr_resolved = _resolved_request_for_settings(current)
     for key in ("provider", "model", "size", "n", "seed", "output_format", "background"):
         prev_val = prev.get(key)
         curr_val = current.get(key)
         if prev_val != curr_val:
-            prev_text = _format_setting_value(prev_val)
-            curr_text = _format_setting_value(curr_val)
-            if key == "output_format":
-                prev_default = _default_output_format_for_settings(prev) if prev_val is None else None
-                curr_default = _default_output_format_for_settings(current) if curr_val is None else None
-                prev_text = _format_setting_value_with_default(prev_val, prev_default)
-                curr_text = _format_setting_value_with_default(curr_val, curr_default)
+            prev_default = (
+                _default_setting_value_for_resolved(prev_resolved, key)
+                if prev_val is None
+                else None
+            )
+            curr_default = (
+                _default_setting_value_for_resolved(curr_resolved, key)
+                if curr_val is None
+                else None
+            )
+            prev_text = _format_setting_value_with_default(prev_val, prev_default)
+            curr_text = _format_setting_value_with_default(curr_val, curr_default)
             diffs.append(f"{key}: {prev_text} -> {curr_text}")
     prev_opts = prev.get("provider_options")
     curr_opts = current.get("provider_options")
@@ -3658,14 +3665,26 @@ def _diff_call_settings(prev: dict[str, object], current: dict[str, object]) -> 
     if not isinstance(curr_opts, dict):
         curr_opts = {}
     for key in sorted(set(prev_opts.keys()) | set(curr_opts.keys())):
-        if prev_opts.get(key) != curr_opts.get(key):
+        prev_val = prev_opts.get(key)
+        curr_val = curr_opts.get(key)
+        if prev_val != curr_val:
+            prev_default = (
+                _default_setting_value_for_resolved(prev_resolved, key, setting_target="provider_options")
+                if prev_val is None
+                else None
+            )
+            curr_default = (
+                _default_setting_value_for_resolved(curr_resolved, key, setting_target="provider_options")
+                if curr_val is None
+                else None
+            )
             diffs.append(
                 "provider_options."
                 + str(key)
                 + ": "
-                + _format_setting_value(prev_opts.get(key))
+                + _format_setting_value_with_default(prev_val, prev_default)
                 + " -> "
-                + _format_setting_value(curr_opts.get(key))
+                + _format_setting_value_with_default(curr_val, curr_default)
             )
     return diffs
 
@@ -3739,7 +3758,9 @@ def _format_setting_value(value: object, *, depth: int = 0) -> str:
     return str(value)
 
 
-def _default_output_format_for_settings(settings: dict[str, object]) -> str | None:
+def _resolved_request_for_settings(
+    settings: dict[str, object],
+) -> tuple[str, str | None, object] | None:
     provider_raw = settings.get("provider")
     if not isinstance(provider_raw, str) or not provider_raw.strip():
         provider_raw = "openai"
@@ -3762,17 +3783,54 @@ def _default_output_format_for_settings(settings: dict[str, object]) -> str | No
         return None
     try:
         request = ImageRequest(prompt=".", size=str(size_value), n=n_value)
-        request.output_format = None
+        request.output_format = settings.get("output_format")
         request.background = settings.get("background")
         if model_key:
             request.model = model_key
         provider_options = settings.get("provider_options")
         if isinstance(provider_options, dict):
             request.provider_options = dict(provider_options)
+        request.seed = settings.get("seed")
         resolved = resolve_request(request, provider_key)
-        return resolved.output_format
+        return provider_key, model_key, resolved
     except Exception:
         return None
+
+
+def _default_setting_value_for_resolved(
+    resolved_data: tuple[str, str | None, object] | None,
+    key: str,
+    *,
+    setting_target: str | None = None,
+) -> object | None:
+    if not resolved_data:
+        return None
+    provider_key, model_key, resolved = resolved_data
+    if setting_target == "provider_options":
+        provider_params = getattr(resolved, "provider_params", None)
+        if isinstance(provider_params, dict) and key in provider_params:
+            return provider_params.get(key)
+        return _default_provider_option(provider_key, model_key, key)
+    if key == "provider":
+        return getattr(resolved, "provider", None)
+    if key == "model":
+        return getattr(resolved, "model", None)
+    if key == "size":
+        return getattr(resolved, "size", None)
+    if key == "n":
+        return getattr(resolved, "n", None)
+    if key == "seed":
+        return getattr(resolved, "seed", None)
+    if key == "output_format":
+        return getattr(resolved, "output_format", None)
+    if key == "background":
+        return getattr(resolved, "background", None)
+    return None
+
+
+def _default_output_format_for_settings(settings: dict[str, object]) -> str | None:
+    resolved_data = _resolved_request_for_settings(settings)
+    return _default_setting_value_for_resolved(resolved_data, "output_format")
 
 
 def _format_setting_value_with_default(value: object, default: object | None) -> str:
