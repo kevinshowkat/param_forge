@@ -56,6 +56,7 @@ Set the key for the provider you plan to use. You can export env vars or create 
 - Imagen: `GOOGLE_API_KEY` or Vertex credentials (for example `GOOGLE_APPLICATION_CREDENTIALS`)
 
 Tip: If you run with the OpenAI provider and no key is found, the script will prompt you to set one and can save it to `.env`.
+Note: OpenAI image generation models (gpt-image-1.5 / gpt-image-1) may require API organization verification to access image generation.
 
 ## Usage
 Interactive (default when no args are provided):
