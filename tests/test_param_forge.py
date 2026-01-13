@@ -1,4 +1,6 @@
+import csv
 import importlib.util
+import json
 import pathlib
 import tempfile
 import unittest
@@ -139,6 +141,103 @@ class TestDiffCallSettings(unittest.TestCase):
                 for diff in diffs
             )
         )
+
+
+class TestPromptParsing(unittest.TestCase):
+    def test_load_prompts_txt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = pathlib.Path(tmpdir) / "prompts.txt"
+            path.write_text(
+                "\n".join(
+                    [
+                        "# comment",
+                        " First prompt ",
+                        "",
+                        "Second prompt",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            prompts = param_forge._load_prompts_file(path)
+            self.assertEqual(len(prompts), 2)
+            self.assertEqual(prompts[0]["id"], "p-0001")
+            self.assertEqual(prompts[0]["prompt"], "First prompt")
+            self.assertEqual(prompts[1]["id"], "p-0002")
+            self.assertEqual(prompts[1]["prompt"], "Second prompt")
+
+    def test_load_prompts_csv_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = pathlib.Path(tmpdir) / "prompts.csv"
+            metadata = json.dumps({"tone": "warm"})
+            with path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=["id", "prompt", "metadata", "extra"])
+                writer.writeheader()
+                writer.writerow({"id": "p-foo", "prompt": "Hello", "metadata": metadata, "extra": "x"})
+                writer.writerow({"id": "", "prompt": "World", "metadata": "", "extra": "y"})
+            prompts = param_forge._load_prompts_file(path)
+            self.assertEqual(len(prompts), 2)
+            self.assertEqual(prompts[0]["id"], "p-foo")
+            self.assertEqual(prompts[0]["metadata"]["tone"], "warm")
+            self.assertEqual(prompts[0]["metadata"]["extra"], "x")
+            self.assertEqual(prompts[1]["id"], "p-0002")
+            self.assertEqual(prompts[1]["metadata"]["extra"], "y")
+
+
+class TestMatrixExpansion(unittest.TestCase):
+    def test_expand_matrix_blocks_cartesian(self) -> None:
+        defaults = {"n": 1}
+        blocks = [
+            {
+                "provider": "openai",
+                "model": ["gpt-image-1.5", "gpt-image-1-mini"],
+                "size": ["1024x1024", "1024x1536"],
+                "seed": [1, 2],
+                "provider_options": {"quality": ["low", "high"]},
+            }
+        ]
+        expanded = param_forge._expand_matrix_blocks(blocks, defaults)
+        self.assertEqual(len(expanded), 16)
+        qualities = {item["provider_options"]["quality"] for item in expanded}
+        self.assertEqual(qualities, {"low", "high"})
+
+    def test_apply_excludes_nested(self) -> None:
+        params_list = [
+            {
+                "provider": "openai",
+                "model": "gpt-image-1.5",
+                "size": "1024x1024",
+                "provider_options": {"quality": "low"},
+            },
+            {
+                "provider": "openai",
+                "model": "gpt-image-1.5",
+                "size": "1024x1024",
+                "provider_options": {"quality": "high"},
+            },
+        ]
+        excludes = [{"provider": "openai", "provider_options": {"quality": "low"}}]
+        filtered = param_forge._apply_excludes(params_list, excludes)
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["provider_options"]["quality"], "high")
+
+    def test_build_experiment_jobs(self) -> None:
+        prompts = [{"id": "p-0001", "prompt": "Hello", "metadata": {"tag": "a"}}]
+        params_list = [
+            {
+                "provider": "openai",
+                "model": "gpt-image-1.5",
+                "size": "1024x1024",
+                "n": 2,
+                "provider_options": {"quality": "high"},
+            }
+        ]
+        jobs = param_forge._build_experiment_jobs(prompts=prompts, params_list=params_list)
+        self.assertEqual(len(jobs), 1)
+        job = jobs[0]
+        self.assertEqual(job["job_id"], "j-000001")
+        self.assertEqual(job["prompt_id"], "p-0001")
+        self.assertEqual(job["prompt_metadata"]["tag"], "a")
 
 
 if __name__ == "__main__":
