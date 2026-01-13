@@ -276,6 +276,9 @@ def resolve_request(request: ImageRequest, provider: str) -> ResolvedRequest:
 
     if provider == "imagen":
         ratio = _nearest_gemini_ratio(request.size, warnings)
+        if ratio == "4:5":
+            warnings.append("Imagen does not support 4:5; using 3:4 instead.")
+            ratio = "3:4"
         image_size = _resolve_image_size_hint(request.size)
         add_watermark = True
         if request.provider_options and request.provider_options.get("add_watermark") is not None:
