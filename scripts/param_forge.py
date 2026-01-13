@@ -4,6 +4,8 @@
 Usage:
   python scripts/param_forge.py \
     --provider openai --size portrait --n 1 --out outputs/param_forge
+  python scripts/param_forge.py experiment \
+    --prompts prompts.txt --matrix matrix.yaml --out runs/food_glam_v1
   python scripts/param_forge.py --interactive
   python scripts/param_forge.py --defaults
 
@@ -16,14 +18,20 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
+import csv
+import io
+import itertools
 import json
 import math
+import queue
 import re
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,6 +78,14 @@ SIZE_CHOICES = [
     ("1536x1024", "1536x1024"),
 ]
 OUT_DIR_CHOICES = ["outputs/param_forge", "outputs/param_forge_dated"]
+_EXPERIMENT_SCHEMA_VERSION = 1
+_EXPERIMENT_BUDGET_MODES = ("estimate", "strict", "off")
+_EXPERIMENT_DEFAULT_CONCURRENCY = 3
+_EXPERIMENT_MAX_RETRIES = 1
+_EXPERIMENT_PARAM_KEYS = ("provider", "model", "size", "seed", "n", "output_format", "background")
+_EXPERIMENT_LOG_SUPPRESS = (
+    "Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.",
+)
 
 
 def _provider_display_label(provider: str) -> str:
@@ -1397,20 +1413,23 @@ def _interactive_args_raw(color_override: bool | None = None) -> argparse.Namesp
     except Exception:
         return _interactive_args_simple()
     with _RawMode(fd, original):
+        experiment_selected = False
         while True:
             mode = _select_from_list("Mode", ["Explore", "Experiment"], 0)
             if mode.lower() == "experiment":
-                print("Experiment mode coming next.")
-                continue
+                experiment_selected = True
+                break
             break
-        provider = _select_from_list("Provider", _provider_display_choices(), 0)
-        provider = _provider_from_display(provider)
-        model = _select_from_list("Model", _model_choices_for(provider), 0)
-        prompt_text = _select_text("Prompt (press Enter to use default prompt)", DEFAULT_PROMPTS[0])
-        size_label = _select_from_list("Size", _size_label_choices(), 0)
-        size = _size_value_from_label(size_label)
-        n = _select_int("Images per prompt", 1, minimum=1, maximum=4)
-        out_choice = _select_from_list("Output dir", OUT_DIR_CHOICES, 0)
+    if experiment_selected:
+        return _interactive_experiment_args_simple()
+    provider = _select_from_list("Provider", _provider_display_choices(), 0)
+    provider = _provider_from_display(provider)
+    model = _select_from_list("Model", _model_choices_for(provider), 0)
+    prompt_text = _select_text("Prompt (press Enter to use default prompt)", DEFAULT_PROMPTS[0])
+    size_label = _select_from_list("Size", _size_label_choices(), 0)
+    size = _size_value_from_label(size_label)
+    n = _select_int("Images per prompt", 1, minimum=1, maximum=4)
+    out_choice = _select_from_list("Output dir", OUT_DIR_CHOICES, 0)
     return _build_interactive_namespace(provider, model, prompt_text, size, n, out_choice)
 
 
@@ -1423,8 +1442,7 @@ def _interactive_args_simple() -> argparse.Namespace:
     while True:
         mode = _prompt_choice("Mode", ["Explore", "Experiment"], 0)
         if mode.lower() == "experiment":
-            print("Experiment mode coming next.")
-            continue
+            return _interactive_experiment_args_simple()
         break
     provider = _prompt_choice("Provider", _provider_display_choices(), 0)
     provider = _provider_from_display(provider)
@@ -1453,6 +1471,48 @@ def _prompt_choice(label: str, choices: list[str], default_index: int = 0) -> st
             selected = int(response)
             if 1 <= selected <= len(choices):
                 return choices[selected - 1]
+
+
+def _prompt_multi_select(
+    label: str,
+    choices: list[str],
+    *,
+    default_indices: list[int] | None = None,
+) -> list[str]:
+    if default_indices is None:
+        default_indices = []
+    default_indices = [i for i in default_indices if 0 <= i < len(choices)]
+    default_display = ", ".join(str(i + 1) for i in default_indices) if default_indices else "none"
+    while True:
+        print(f"{label} (comma-separated numbers):")
+        for idx, choice in enumerate(choices, start=1):
+            marker = " (default)" if idx - 1 in default_indices else ""
+            print(f"  {idx}. {choice}{marker}")
+        try:
+            response = input(f"Select {label} [default {default_display}]: ").strip()
+        except EOFError:
+            raise KeyboardInterrupt from None
+        if response == "":
+            if default_indices:
+                return [choices[i] for i in default_indices]
+            return []
+        parts = [part.strip() for part in response.split(",") if part.strip()]
+        indices: list[int] = []
+        valid = True
+        for part in parts:
+            if not part.isdigit():
+                valid = False
+                break
+            value = int(part)
+            if not (1 <= value <= len(choices)):
+                valid = False
+                break
+            indices.append(value - 1)
+        if not valid:
+            print("Please enter valid numbers separated by commas.")
+            continue
+        selected = [choices[i] for i in indices]
+        return list(dict.fromkeys(selected))
         print("Invalid choice. Try again.")
 
 
@@ -1483,6 +1543,211 @@ def _prompt_text(label: str, default: str) -> str:
         if response == "":
             return default
         return response
+
+
+def _default_experiment_out_dir() -> str:
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    return f"runs/experiment_{stamp}"
+
+
+def _build_experiment_namespace(
+    *,
+    prompts_path: str | None,
+    prompt_text: str | None,
+    matrix_payload: dict | None,
+    matrix_path: str | None,
+    out_dir: str,
+    concurrency: int | None,
+    provider_concurrency: str | None,
+    budget: float | None,
+    budget_mode: str | None,
+    dry_run: bool,
+    resume: bool,
+) -> argparse.Namespace:
+    return argparse.Namespace(
+        mode="experiment",
+        prompts=prompts_path,
+        prompt_text=prompt_text,
+        matrix_payload=matrix_payload,
+        matrix=matrix_path,
+        out=out_dir,
+        concurrency=concurrency,
+        provider_concurrency=provider_concurrency,
+        budget=budget,
+        budget_mode=budget_mode,
+        dry_run=dry_run,
+        resume=resume,
+    )
+
+
+def _run_experiment_from_namespace(args: argparse.Namespace) -> int:
+    argv: list[str] = []
+    if getattr(args, "resume", False):
+        argv.append("--resume")
+    prompts_path = getattr(args, "prompts", None)
+    prompt_text = getattr(args, "prompt_text", None)
+    if not prompts_path and not getattr(args, "resume", False):
+        text = str(prompt_text or DEFAULT_PROMPTS[0]).strip()
+        if text:
+            run_dir = Path(str(args.out)).expanduser().resolve()
+            run_dir.mkdir(parents=True, exist_ok=True)
+            prompt_line = " ".join(text.splitlines()).strip()
+            filename = "prompts-inline.txt"
+            prompt_path = run_dir / filename
+            if prompt_path.exists():
+                stamp = time.strftime("%Y%m%d_%H%M%S")
+                prompt_path = run_dir / f"prompts-inline-{stamp}.txt"
+            prompt_path.write_text(prompt_line + "\n", encoding="utf-8")
+            prompts_path = str(prompt_path)
+    if prompts_path:
+        argv += ["--prompts", str(prompts_path)]
+    matrix_path = getattr(args, "matrix", None)
+    matrix_payload = getattr(args, "matrix_payload", None)
+    if not matrix_path and matrix_payload and not getattr(args, "resume", False):
+        run_dir = Path(str(args.out)).expanduser().resolve()
+        run_dir.mkdir(parents=True, exist_ok=True)
+        filename = "matrix-inline.json"
+        out_path = run_dir / filename
+        if out_path.exists():
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            out_path = run_dir / f"matrix-inline-{stamp}.json"
+        out_path.write_text(json.dumps(matrix_payload, indent=2) + "\n", encoding="utf-8")
+        matrix_path = str(out_path)
+    if matrix_path:
+        argv += ["--matrix", str(matrix_path)]
+    argv += ["--out", str(args.out)]
+    if getattr(args, "concurrency", None) is not None:
+        argv += ["--concurrency", str(args.concurrency)]
+    if getattr(args, "provider_concurrency", None):
+        argv += ["--provider-concurrency", str(args.provider_concurrency)]
+    if getattr(args, "budget", None) is not None:
+        argv += ["--budget", str(args.budget)]
+    if getattr(args, "budget_mode", None):
+        argv += ["--budget-mode", str(args.budget_mode)]
+    if getattr(args, "dry_run", False):
+        argv.append("--dry-run")
+    cancel_event = getattr(args, "cancel_event", None)
+    return _run_experiment_cli(argv, cancel_event=cancel_event)
+
+
+def _interactive_experiment_args_simple() -> argparse.Namespace:
+    print("PARAM FORGE (experiment)")
+    for line in _version_text_lines():
+        print(line)
+    prompts_path: str | None = None
+    prompt_text: str | None = None
+    matrix_payload: dict | None = None
+    source = _prompt_choice("Prompt source", ["single prompt", "prompts file"], 0)
+    if source == "prompts file":
+        while True:
+            prompts_path = _prompt_text("Prompts file (.txt/.csv)", "")
+            if not prompts_path:
+                print("Prompts file is required.")
+                continue
+            if not Path(prompts_path).expanduser().exists():
+                print(f"Prompts file not found: {prompts_path}")
+                continue
+            break
+    else:
+        prompt_text = _prompt_text("Prompt (press Enter to use default prompt)", DEFAULT_PROMPTS[0])
+    matrix_path: str | None = None
+    matrix_source = _prompt_choice("Matrix source", ["auto (select providers/models)", "matrix file"], 0)
+    if matrix_source == "matrix file":
+        while True:
+            matrix_path = _prompt_text("Matrix file (.yaml/.json)", "matrix.yaml")
+            if not matrix_path:
+                print("Matrix file is required.")
+                continue
+            if not Path(matrix_path).expanduser().exists():
+                print(f"Matrix file not found: {matrix_path}")
+                continue
+            break
+    else:
+        provider_display = _prompt_multi_select(
+            "Providers",
+            _provider_display_choices(),
+            default_indices=[0],
+        )
+        provider_keys = [_provider_from_display(item) for item in provider_display]
+        matrix_blocks: list[dict[str, object]] = []
+        for provider_key in provider_keys:
+            models = _prompt_multi_select(
+                f"Models for {provider_key}",
+                _model_choices_for(provider_key),
+                default_indices=[0],
+            )
+            if not models:
+                continue
+            matrix_blocks.append(
+                {
+                    "provider": provider_key,
+                    "model": models,
+                }
+            )
+        if not matrix_blocks:
+            print("No models selected; defaulting to openai gpt-image-1.5.")
+            matrix_blocks = [{"provider": "openai", "model": ["gpt-image-1.5"]}]
+        size_label = _prompt_choice("Size", _size_label_choices(), 0)
+        size_value = _size_value_from_label(size_label)
+        n_value = _prompt_int("Images per prompt", 1, minimum=1, maximum=4)
+        matrix_payload = {
+            "version": 1,
+            "defaults": {"n": n_value},
+            "matrix": [],
+        }
+        for block in matrix_blocks:
+            matrix_payload["matrix"].append(
+                {
+                    "provider": block["provider"],
+                    "model": block["model"],
+                    "size": [size_value],
+                }
+            )
+    out_dir = _prompt_text("Output run directory", _default_experiment_out_dir())
+    resume = False
+    while True:
+        manifest_path = Path(out_dir).expanduser().resolve() / "run.json"
+        if manifest_path.exists():
+            choice = _prompt_choice("run.json exists. Resume?", ["yes", "no"], 0)
+            if choice.lower().startswith("y"):
+                resume = True
+                break
+            out_dir = _prompt_text("Output run directory", _default_experiment_out_dir())
+            continue
+        break
+    concurrency = _prompt_int("Concurrency", _EXPERIMENT_DEFAULT_CONCURRENCY, minimum=1, maximum=64)
+    provider_concurrency = _prompt_text(
+        "Provider concurrency (optional, e.g. openai=1,gemini=2)",
+        "",
+    )
+    budget = None
+    while True:
+        budget_text = _prompt_text("Budget USD (blank for none)", "")
+        if not budget_text:
+            break
+        try:
+            budget = float(budget_text)
+            if budget < 0:
+                raise ValueError("negative budget")
+            break
+        except Exception:
+            print("Enter a non-negative number (or leave blank).")
+    budget_mode = _prompt_choice("Budget mode", list(_EXPERIMENT_BUDGET_MODES), 0)
+    dry_run_choice = _prompt_choice("Dry run", ["no", "yes"], 0)
+    dry_run = dry_run_choice.lower().startswith("y")
+    return _build_experiment_namespace(
+        prompts_path=prompts_path,
+        out_dir=out_dir,
+        concurrency=concurrency,
+        provider_concurrency=provider_concurrency or None,
+        budget=budget,
+        budget_mode=budget_mode,
+        dry_run=dry_run,
+        resume=resume,
+        prompt_text=prompt_text,
+        matrix_payload=matrix_payload,
+        matrix_path=matrix_path,
+    )
 
 
 def _build_interactive_namespace(
@@ -1640,7 +1905,7 @@ def _interactive_args_curses(stdscr, color_override: bool | None = None) -> argp
         hint = (
             "Identify optimal API settings for your goal: lower cost, faster render, etc."
             if mode_idx == 0
-            else "Start from a reference image to find the best provider/model/params and export one receipt."
+            else "Batch-run prompt sets across a matrix."
         )
         _safe_addstr(stdscr, y, 4, hint[: max(0, width - 5)], curses.A_BOLD)
         y += 2
@@ -1795,19 +2060,7 @@ def _interactive_args_curses(stdscr, color_override: bool | None = None) -> argp
         if key in (10, 13, curses.KEY_ENTER, ord("\t")):
             if field_idx == 0:
                 if mode_idx == 1:
-                    stdscr.erase()
-                    height, width = stdscr.getmaxyx()
-                    _safe_addstr(stdscr, min(height - 2, 0), 0, "Test mode coming next."[:width])
-                    _safe_addstr(
-                        stdscr,
-                        max(0, height - 1),
-                        0,
-                        "Press any key to return."[:width],
-                        curses.A_DIM,
-                    )
-                    stdscr.refresh()
-                    _wait_for_non_mouse_key(stdscr)
-                    continue
+                    return _interactive_experiment_args_curses(stdscr, color_enabled=color_enabled)
                 field_idx = 1
                 continue
             if field_idx == 3:
@@ -1867,6 +2120,13 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
         result["ran"] = True
         if args is None:
             result["exit_code"] = 1
+            return
+        if getattr(args, "mode", "") == "experiment":
+            result["exit_code"] = _run_experiment_curses(
+                stdscr,
+                args=args,
+                color_enabled=color_enabled,
+            )
             return
         result["view_out_dir"] = Path(args.out)
         args.analyzer = _resolve_receipt_analyzer(getattr(args, "analyzer", None))
@@ -2597,6 +2857,11 @@ def _run_raw_fallback(reason: str | None, color_override: bool | None) -> int:
     except Exception as exc:
         print(f"Raw prompt failed ({exc}). Falling back to simple prompts.")
         args = _interactive_args_simple()
+    if getattr(args, "mode", "") == "experiment":
+        exit_code = _run_experiment_from_namespace(args)
+        if exit_code == 0:
+            _maybe_open_viewer(Path(args.out))
+        return exit_code
     exit_code = _run_generation(args)
     if exit_code == 0:
         _maybe_open_viewer(Path(args.out))
@@ -4709,6 +4974,739 @@ def _prompt_prompt_curses(
     stdscr.timeout(80)
     text = buffer.strip()
     return text or default_prompt
+
+
+def _show_notice_curses(stdscr, title: str, message: str, *, color_enabled: bool) -> None:
+    import curses
+    stdscr.erase()
+    height, width = stdscr.getmaxyx()
+    y = _draw_banner(stdscr, color_enabled, 1)
+    if y < height - 1:
+        _safe_addstr(stdscr, y, 0, title[: max(0, width - 1)], curses.A_BOLD)
+        y += 2
+    for line in _wrap_text(message, max(20, width - 2)):
+        if y >= height - 1:
+            break
+        _safe_addstr(stdscr, y, 0, line[: max(0, width - 1)])
+        y += 1
+    _safe_addstr(
+        stdscr,
+        max(0, height - 1),
+        0,
+        "Press any key to continue."[: max(0, width - 1)],
+        curses.A_DIM,
+    )
+    stdscr.refresh()
+    _wait_for_non_mouse_key(stdscr)
+
+
+def _prompt_text_curses(
+    stdscr,
+    *,
+    title: str,
+    default_value: str,
+    color_enabled: bool,
+) -> str | None:
+    import curses
+    stdscr.erase()
+    height, width = stdscr.getmaxyx()
+    y = _draw_banner(stdscr, color_enabled, 1)
+    _safe_addstr(stdscr, min(height - 2, y), 0, title[: max(0, width - 1)], curses.A_BOLD)
+    y = min(height - 2, y + 2)
+    if default_value:
+        default_line = _truncate_text(default_value, max(0, width - 1))
+        if default_line:
+            _safe_addstr(
+                stdscr,
+                min(height - 2, y),
+                0,
+                f"Default: {default_line}"[: max(0, width - 1)],
+                curses.A_DIM,
+            )
+            y = min(height - 2, y + 2)
+    _safe_addstr(
+        stdscr,
+        min(height - 2, y),
+        0,
+        "Enter text (Esc to cancel)."[: max(0, width - 1)],
+        curses.A_DIM,
+    )
+    input_y = min(height - 1, y + 1)
+    buffer = ""
+    try:
+        curses.curs_set(1)
+    except curses.error:
+        pass
+    stdscr.timeout(-1)
+    while True:
+        stdscr.move(input_y, 0)
+        stdscr.clrtoeol()
+        display = buffer
+        max_len = max(1, width - 1)
+        if len(display) > max_len:
+            display = display[-max_len:]
+        _safe_addstr(stdscr, input_y, 0, display[: max(0, width - 1)])
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (27,):
+            buffer = ""
+            return None
+        if key in (10, 13, curses.KEY_ENTER):
+            break
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            buffer = buffer[:-1]
+            continue
+        if 32 <= key <= 126:
+            buffer += chr(key)
+            continue
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    stdscr.timeout(80)
+    text = buffer.strip()
+    return text or default_value
+
+
+def _prompt_choice_curses(
+    stdscr,
+    *,
+    title: str,
+    choices: list[str],
+    default_index: int,
+    color_enabled: bool,
+) -> str | None:
+    import curses
+    idx = default_index
+    while True:
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+        y = _draw_banner(stdscr, color_enabled, 1)
+        _safe_addstr(stdscr, min(height - 2, y), 0, title[: max(0, width - 1)], curses.A_BOLD)
+        y = min(height - 2, y + 2)
+        for i, choice in enumerate(choices):
+            if y >= height - 1:
+                break
+            attr = curses.A_DIM
+            if i == idx:
+                attr = curses.color_pair(2) | curses.A_BOLD if color_enabled else curses.A_BOLD
+            _safe_addstr(stdscr, y, 2, choice[: max(0, width - 3)], attr)
+            y += 1
+        _safe_addstr(
+            stdscr,
+            max(0, height - 1),
+            0,
+            "Up/Down: move • Enter: select • Q/Esc: cancel"[: max(0, width - 1)],
+            curses.A_DIM,
+        )
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (ord("q"), ord("Q"), 27):
+            return None
+        if key in (curses.KEY_UP, ord("k"), ord("K")):
+            idx = (idx - 1) % len(choices)
+            continue
+        if key in (curses.KEY_DOWN, ord("j"), ord("J")):
+            idx = (idx + 1) % len(choices)
+            continue
+        if key in (10, 13, curses.KEY_ENTER):
+            return choices[idx]
+
+
+def _prompt_multi_select_curses(
+    stdscr,
+    *,
+    title: str,
+    choices: list[str],
+    default_indices: list[int] | None,
+    color_enabled: bool,
+) -> list[str] | None:
+    import curses
+    if default_indices is None:
+        default_indices = []
+    selected = [i in default_indices for i in range(len(choices))]
+    idx = 0
+    while True:
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+        y = _draw_banner(stdscr, color_enabled, 1)
+        _safe_addstr(stdscr, min(height - 2, y), 0, title[: max(0, width - 1)], curses.A_BOLD)
+        y = min(height - 2, y + 2)
+        for i, choice in enumerate(choices):
+            if y >= height - 1:
+                break
+            marker = "[x]" if selected[i] else "[ ]"
+            line = f"{marker} {choice}"
+            attr = curses.A_DIM
+            if i == idx:
+                attr = curses.color_pair(2) | curses.A_BOLD if color_enabled else curses.A_BOLD
+            _safe_addstr(stdscr, y, 2, line[: max(0, width - 3)], attr)
+            y += 1
+        _safe_addstr(
+            stdscr,
+            max(0, height - 1),
+            0,
+            "Space: toggle • Enter: continue • Q/Esc: cancel"[: max(0, width - 1)],
+            curses.A_DIM,
+        )
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (ord("q"), ord("Q"), 27):
+            return None
+        if key in (curses.KEY_UP, ord("k"), ord("K")):
+            idx = (idx - 1) % len(choices)
+            continue
+        if key in (curses.KEY_DOWN, ord("j"), ord("J")):
+            idx = (idx + 1) % len(choices)
+            continue
+        if key in (ord(" "),):
+            selected[idx] = not selected[idx]
+            continue
+        if key in (10, 13, curses.KEY_ENTER):
+            result = [choice for i, choice in enumerate(choices) if selected[i]]
+            return result
+
+
+class _QueueWriter(io.TextIOBase):
+    def __init__(self, sink: queue.SimpleQueue[str]) -> None:
+        super().__init__()
+        self._sink = sink
+        self._buffer = ""
+
+    def write(self, s: str) -> int:
+        if not s:
+            return 0
+        self._buffer += s
+        while "\n" in self._buffer:
+            line, rest = self._buffer.split("\n", 1)
+            if not any(token in line for token in _EXPERIMENT_LOG_SUPPRESS):
+                self._sink.put(line)
+            self._buffer = rest
+        return len(s)
+
+    def flush(self) -> None:
+        if self._buffer:
+            if not any(token in self._buffer for token in _EXPERIMENT_LOG_SUPPRESS):
+                self._sink.put(self._buffer)
+            self._buffer = ""
+
+
+def _experiment_progress_from_manifest(manifest: dict) -> dict[str, int]:
+    counts = {"total": 0, "pending": 0, "running": 0, "success": 0, "failed": 0, "skipped": 0}
+    jobs = manifest.get("jobs")
+    if not isinstance(jobs, list):
+        return counts
+    counts["total"] = len(jobs)
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        status = str(job.get("status") or "pending")
+        if status in counts:
+            counts[status] += 1
+        else:
+            counts["pending"] += 1
+    return counts
+
+
+def _normalize_provider_from_model(provider: str | None, model: str | None) -> str | None:
+    if provider:
+        provider_key, _ = _normalize_provider_and_model(str(provider), str(model) if model else None)
+        return provider_key
+    if model:
+        model_key = str(model).lower()
+        if "imagen" in model_key:
+            return "imagen"
+        if "gemini" in model_key:
+            return "gemini"
+        if "flux" in model_key:
+            return "flux"
+        if "gpt-image" in model_key or "openai" in model_key:
+            return "openai"
+    return None
+
+
+def _extract_providers_from_matrix_payload(payload: dict) -> set[str]:
+    providers: set[str] = set()
+    for key in ("matrix", "include"):
+        blocks = payload.get(key)
+        if isinstance(blocks, dict):
+            blocks = [blocks]
+        if not isinstance(blocks, list):
+            continue
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            provider_raw = block.get("provider")
+            models_raw = block.get("model")
+            models = _normalize_to_list(models_raw) if models_raw is not None else []
+            if provider_raw is None and models:
+                for model in models:
+                    normalized = _normalize_provider_from_model(None, str(model))
+                    if normalized:
+                        providers.add(normalized)
+                continue
+            provider_key = _normalize_provider_from_model(str(provider_raw) if provider_raw else None, None)
+            if provider_key == "gemini" and models:
+                # Separate gemini vs imagen if models are mixed under google.
+                for model in models:
+                    normalized = _normalize_provider_from_model(str(provider_raw), str(model))
+                    if normalized:
+                        providers.add(normalized)
+                continue
+            if provider_key:
+                providers.add(provider_key)
+    return providers
+
+
+def _run_experiment_curses(
+    stdscr,
+    *,
+    args: argparse.Namespace,
+    color_enabled: bool,
+) -> int:
+    import curses
+    run_dir = Path(str(args.out)).expanduser().resolve()
+    manifest_path = run_dir / "run.json"
+    cancel_event = threading.Event()
+    setattr(args, "cancel_event", cancel_event)
+    _load_repo_dotenv()
+    providers: set[str] = set()
+    if getattr(args, "resume", False) and manifest_path.exists():
+        try:
+            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+            jobs = existing.get("jobs") if isinstance(existing, dict) else None
+            if isinstance(jobs, list):
+                for job in jobs:
+                    if not isinstance(job, dict):
+                        continue
+                    params = job.get("params") if isinstance(job.get("params"), dict) else {}
+                    provider = params.get("provider")
+                    if provider:
+                        providers.add(str(provider))
+        except Exception:
+            providers = set()
+    if not providers:
+        matrix_payload = getattr(args, "matrix_payload", None)
+        matrix_path = getattr(args, "matrix", None)
+        if matrix_payload and isinstance(matrix_payload, dict):
+            providers = _extract_providers_from_matrix_payload(matrix_payload)
+        elif matrix_path:
+            try:
+                payload = _load_matrix_file(Path(str(matrix_path)).expanduser().resolve())
+                if isinstance(payload, dict):
+                    providers = _extract_providers_from_matrix_payload(payload)
+            except Exception:
+                providers = set()
+    if not providers:
+        providers = {"openai"}
+    for provider in sorted(providers):
+        try:
+            _ensure_api_keys(
+                provider,
+                _find_repo_dotenv(),
+                allow_prompt=True,
+                prompt_func=lambda key, path: _prompt_for_key_curses(stdscr, key, path),
+            )
+        except RuntimeError as exc:
+            _show_notice_curses(stdscr, "Setup failed", str(exc), color_enabled=color_enabled)
+            return 1
+    log_queue: queue.SimpleQueue[str] = queue.SimpleQueue()
+    log_lines: list[str] = []
+    max_log_lines = 6
+    done_event = threading.Event()
+    exit_code_holder: dict[str, int] = {"code": 1}
+
+    def _runner() -> None:
+        writer = _QueueWriter(log_queue)
+        with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
+            exit_code_holder["code"] = _run_experiment_from_namespace(args)
+        done_event.set()
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+
+    while True:
+        while True:
+            try:
+                line = log_queue.get_nowait()
+            except Exception:
+                break
+            if line is None:
+                break
+            log_lines.append(str(line))
+            if len(log_lines) > max_log_lines:
+                log_lines = log_lines[-max_log_lines:]
+
+        manifest: dict | None = None
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception:
+                manifest = None
+
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+        y = _draw_banner(stdscr, color_enabled, 1)
+        title = "Experiment run"
+        _safe_addstr(stdscr, min(height - 2, y), 0, title[: max(0, width - 1)], curses.A_BOLD)
+        y = min(height - 2, y + 2)
+
+        if manifest and isinstance(manifest, dict):
+            inputs = manifest.get("inputs") if isinstance(manifest.get("inputs"), dict) else {}
+            summary = manifest.get("summary") if isinstance(manifest.get("summary"), dict) else {}
+            limits = manifest.get("limits") if isinstance(manifest.get("limits"), dict) else {}
+            prompt_count = inputs.get("prompt_count")
+            jobs_count = inputs.get("expanded_jobs")
+            images_count = inputs.get("planned_images")
+            plan_line = f"prompts={prompt_count} jobs={jobs_count} images={images_count}"
+            _safe_addstr(stdscr, y, 0, plan_line[: max(0, width - 1)], curses.A_BOLD)
+            y += 1
+            budget = limits.get("budget_usd")
+            budget_mode = limits.get("budget_mode")
+            concurrency = limits.get("concurrency")
+            line = f"concurrency={concurrency} budget={budget} mode={budget_mode}"
+            _safe_addstr(stdscr, y, 0, line[: max(0, width - 1)])
+            y += 1
+            est_cost = summary.get("estimated_cost_usd")
+            _safe_addstr(stdscr, y, 0, f"estimated_cost_usd={est_cost}"[: max(0, width - 1)])
+            y += 1
+            progress = _experiment_progress_from_manifest(manifest)
+            progress_line = (
+                f"pending={progress['pending']} running={progress['running']} "
+                f"ok={progress['success']} failed={progress['failed']} skipped={progress['skipped']}"
+            )
+            _safe_addstr(stdscr, y, 0, progress_line[: max(0, width - 1)], curses.A_BOLD)
+            y += 2
+        else:
+            _safe_addstr(stdscr, y, 0, "Planning run..."[: max(0, width - 1)], curses.A_DIM)
+            y += 2
+
+        if log_lines and y < height - 1:
+            _safe_addstr(stdscr, y, 0, "Log:"[: max(0, width - 1)], curses.A_DIM)
+            y += 1
+            for line in log_lines:
+                if y >= height - 1:
+                    break
+                _safe_addstr(stdscr, y, 0, line[: max(0, width - 1)], curses.A_DIM)
+                y += 1
+
+        footer = "Running... (Q to cancel)"
+        if cancel_event.is_set():
+            footer = "Cancelling... waiting for in-flight jobs"
+        if done_event.is_set():
+            if cancel_event.is_set():
+                footer = "Run cancelled. Press Enter to exit • O: open viewer"
+            else:
+                footer = "Run complete. Press Enter to exit • O: open viewer"
+        _safe_addstr(stdscr, max(0, height - 1), 0, footer[: max(0, width - 1)], curses.A_DIM)
+        stdscr.refresh()
+
+        if done_event.is_set():
+            stdscr.timeout(-1)
+            key = stdscr.getch()
+            if key in (ord("o"), ord("O")):
+                _maybe_open_viewer(run_dir)
+                continue
+            if key in (10, 13, curses.KEY_ENTER, ord("q"), ord("Q"), 27):
+                return int(exit_code_holder.get("code", 1))
+        else:
+            stdscr.timeout(200)
+            key = stdscr.getch()
+            if key in (ord("q"), ord("Q"), 27):
+                cancel_event.set()
+                continue
+
+
+def _prompt_int_curses(
+    stdscr,
+    *,
+    title: str,
+    default_value: int,
+    minimum: int,
+    maximum: int,
+    color_enabled: bool,
+) -> int | None:
+    while True:
+        text = _prompt_text_curses(
+            stdscr,
+            title=title,
+            default_value=str(default_value),
+            color_enabled=color_enabled,
+        )
+        if text is None:
+            return None
+        try:
+            value = int(text)
+        except Exception:
+            _show_notice_curses(stdscr, "Invalid number", f"Enter a number between {minimum} and {maximum}.", color_enabled=color_enabled)
+            continue
+        if minimum <= value <= maximum:
+            return value
+        _show_notice_curses(stdscr, "Invalid number", f"Enter a number between {minimum} and {maximum}.", color_enabled=color_enabled)
+
+
+def _prompt_float_curses(
+    stdscr,
+    *,
+    title: str,
+    default_value: str,
+    color_enabled: bool,
+) -> float | None | str:
+    while True:
+        text = _prompt_text_curses(
+            stdscr,
+            title=title,
+            default_value=default_value,
+            color_enabled=color_enabled,
+        )
+        if text is None:
+            return None
+        if text == "":
+            return ""
+        try:
+            value = float(text)
+        except Exception:
+            _show_notice_curses(stdscr, "Invalid number", "Enter a non-negative number or leave blank.", color_enabled=color_enabled)
+            continue
+        if value < 0:
+            _show_notice_curses(stdscr, "Invalid number", "Enter a non-negative number or leave blank.", color_enabled=color_enabled)
+            continue
+        return value
+
+
+def _interactive_experiment_args_curses(
+    stdscr,
+    *,
+    color_enabled: bool,
+) -> argparse.Namespace | None:
+    prompts_path: str | None = None
+    prompt_text: str | None = None
+    matrix_payload: dict | None = None
+    source = _prompt_choice_curses(
+        stdscr,
+        title="Prompt source",
+        choices=["single prompt", "prompts file"],
+        default_index=0,
+        color_enabled=color_enabled,
+    )
+    if source is None:
+        return None
+    if source == "prompts file":
+        while True:
+            prompts_path = _prompt_text_curses(
+                stdscr,
+                title="Prompts file (.txt/.csv)",
+                default_value="",
+                color_enabled=color_enabled,
+            )
+            if prompts_path is None:
+                return None
+            if not prompts_path.strip():
+                _show_notice_curses(stdscr, "Missing prompts", "Prompts file is required.", color_enabled=color_enabled)
+                continue
+            if not Path(prompts_path).expanduser().exists():
+                _show_notice_curses(
+                    stdscr,
+                    "Missing prompts",
+                    f"Prompts file not found: {prompts_path}",
+                    color_enabled=color_enabled,
+                )
+                continue
+            break
+    else:
+        prompt_text = _prompt_prompt_curses(
+            stdscr,
+            default_prompt=DEFAULT_PROMPTS[0],
+            color_enabled=color_enabled,
+        )
+    matrix_path: str | None = None
+    matrix_source = _prompt_choice_curses(
+        stdscr,
+        title="Matrix source",
+        choices=["auto (select providers/models)", "matrix file"],
+        default_index=0,
+        color_enabled=color_enabled,
+    )
+    if matrix_source is None:
+        return None
+    if matrix_source == "matrix file":
+        while True:
+            matrix_path = _prompt_text_curses(
+                stdscr,
+                title="Matrix file (.yaml/.json)",
+                default_value="matrix.yaml",
+                color_enabled=color_enabled,
+            )
+            if matrix_path is None:
+                return None
+            if not matrix_path.strip():
+                _show_notice_curses(stdscr, "Missing matrix", "Matrix file is required.", color_enabled=color_enabled)
+                continue
+            if not Path(matrix_path).expanduser().exists():
+                _show_notice_curses(
+                    stdscr,
+                    "Missing matrix",
+                    f"Matrix file not found: {matrix_path}",
+                    color_enabled=color_enabled,
+                )
+                continue
+            break
+    else:
+        provider_display = _prompt_multi_select_curses(
+            stdscr,
+            title="Providers",
+            choices=_provider_display_choices(),
+            default_indices=[0],
+            color_enabled=color_enabled,
+        )
+        if provider_display is None:
+            return None
+        provider_keys = [_provider_from_display(item) for item in provider_display]
+        matrix_blocks: list[dict[str, object]] = []
+        for provider_key in provider_keys:
+            models = _prompt_multi_select_curses(
+                stdscr,
+                title=f"Models for {provider_key}",
+                choices=_model_choices_for(provider_key),
+                default_indices=[0],
+                color_enabled=color_enabled,
+            )
+            if not models:
+                continue
+            matrix_blocks.append(
+                {
+                    "provider": provider_key,
+                    "model": models,
+                }
+            )
+        if not matrix_blocks:
+            matrix_blocks = [{"provider": "openai", "model": ["gpt-image-1.5"]}]
+        size_label = _prompt_choice_curses(
+            stdscr,
+            title="Size",
+            choices=_size_label_choices(),
+            default_index=0,
+            color_enabled=color_enabled,
+        )
+        if size_label is None:
+            return None
+        size_value = _size_value_from_label(size_label)
+        n_value = _prompt_int_curses(
+            stdscr,
+            title="Images per prompt",
+            default_value=1,
+            minimum=1,
+            maximum=4,
+            color_enabled=color_enabled,
+        )
+        if n_value is None:
+            return None
+        matrix_payload = {
+            "version": 1,
+            "defaults": {"n": n_value},
+            "matrix": [],
+        }
+        for block in matrix_blocks:
+            matrix_payload["matrix"].append(
+                {
+                    "provider": block["provider"],
+                    "model": block["model"],
+                    "size": [size_value],
+                }
+            )
+    out_dir = _prompt_text_curses(
+        stdscr,
+        title="Output run directory",
+        default_value=_default_experiment_out_dir(),
+        color_enabled=color_enabled,
+    )
+    if out_dir is None:
+        return None
+    resume = False
+    while True:
+        manifest_path = Path(out_dir).expanduser().resolve() / "run.json"
+        if manifest_path.exists():
+            choice = _prompt_choice_curses(
+                stdscr,
+                title="run.json exists. Resume?",
+                choices=["resume", "choose new"],
+                default_index=0,
+                color_enabled=color_enabled,
+            )
+            if choice is None:
+                return None
+            if choice == "resume":
+                resume = True
+                break
+            out_dir = _prompt_text_curses(
+                stdscr,
+                title="Output run directory",
+                default_value=_default_experiment_out_dir(),
+                color_enabled=color_enabled,
+            )
+            if out_dir is None:
+                return None
+            continue
+        break
+    concurrency = _prompt_int_curses(
+        stdscr,
+        title="Concurrency",
+        default_value=_EXPERIMENT_DEFAULT_CONCURRENCY,
+        minimum=1,
+        maximum=64,
+        color_enabled=color_enabled,
+    )
+    if concurrency is None:
+        return None
+    provider_concurrency = _prompt_text_curses(
+        stdscr,
+        title="Provider concurrency (optional, e.g. openai=1,gemini=2)",
+        default_value="",
+        color_enabled=color_enabled,
+    )
+    if provider_concurrency is None:
+        return None
+    budget_value = _prompt_float_curses(
+        stdscr,
+        title="Budget USD (blank for none)",
+        default_value="",
+        color_enabled=color_enabled,
+    )
+    if budget_value is None:
+        return None
+    budget = None if budget_value == "" else float(budget_value)
+    budget_mode = _prompt_choice_curses(
+        stdscr,
+        title="Budget mode",
+        choices=list(_EXPERIMENT_BUDGET_MODES),
+        default_index=0,
+        color_enabled=color_enabled,
+    )
+    if budget_mode is None:
+        return None
+    dry_run_choice = _prompt_choice_curses(
+        stdscr,
+        title="Dry run",
+        choices=["no", "yes"],
+        default_index=0,
+        color_enabled=color_enabled,
+    )
+    if dry_run_choice is None:
+        return None
+    dry_run = dry_run_choice.lower().startswith("y")
+    return _build_experiment_namespace(
+        prompts_path=prompts_path,
+        prompt_text=prompt_text,
+        matrix_payload=matrix_payload,
+        matrix_path=matrix_path,
+        out_dir=out_dir,
+        concurrency=concurrency,
+        provider_concurrency=provider_concurrency or None,
+        budget=budget,
+        budget_mode=budget_mode,
+        dry_run=dry_run,
+        resume=resume,
+    )
 
 
 def _prompt_freeform_curses(stdscr, prompt: str, *, color_enabled: bool) -> str:
@@ -8034,6 +9032,816 @@ def _run_view_cli(argv: list[str]) -> int:
     return 0
 
 
+def _utc_iso_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _experiment_relpath(path: Path, base: Path) -> str:
+    try:
+        rel = os.path.relpath(path, base)
+        return Path(rel).as_posix()
+    except Exception:
+        return str(path)
+
+
+def _write_manifest_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _normalize_to_list(value: object) -> list[object]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if value is None:
+        return [None]
+    return [value]
+
+
+def _parse_prompt_txt(path: Path) -> list[dict[str, object]]:
+    prompts: list[dict[str, object]] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        prompt_id = f"p-{len(prompts) + 1:04d}"
+        prompts.append({"id": prompt_id, "prompt": line, "metadata": {}})
+    return prompts
+
+
+def _parse_prompt_csv(path: Path) -> list[dict[str, object]]:
+    prompts: list[dict[str, object]] = []
+    seen_ids: set[str] = set()
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if not reader.fieldnames or "prompt" not in reader.fieldnames:
+            raise RuntimeError("CSV prompts must include a 'prompt' column.")
+        for row in reader:
+            if row is None:
+                continue
+            prompt_raw = (row.get("prompt") or "").strip()
+            if not prompt_raw:
+                continue
+            prompt_id = (row.get("id") or "").strip()
+            if not prompt_id or prompt_id in seen_ids:
+                prompt_id = f"p-{len(prompts) + 1:04d}"
+            seen_ids.add(prompt_id)
+            metadata: dict[str, object] = {}
+            metadata_raw = (row.get("metadata") or "").strip()
+            if metadata_raw:
+                try:
+                    parsed = json.loads(metadata_raw)
+                    if isinstance(parsed, dict):
+                        metadata.update(parsed)
+                except Exception:
+                    metadata["metadata_raw"] = metadata_raw
+            for key, value in row.items():
+                if key in {"prompt", "id", "metadata"}:
+                    continue
+                if value is None or str(value).strip() == "":
+                    continue
+                metadata[str(key)] = value
+            prompts.append({"id": prompt_id, "prompt": prompt_raw, "metadata": metadata})
+    return prompts
+
+
+def _load_prompts_file(path: Path) -> list[dict[str, object]]:
+    suffix = path.suffix.lower()
+    if suffix == ".txt":
+        return _parse_prompt_txt(path)
+    if suffix == ".csv":
+        return _parse_prompt_csv(path)
+    raise RuntimeError("Prompt file must be .txt or .csv.")
+
+
+def _load_matrix_file(path: Path) -> dict:
+    text = path.read_text(encoding="utf-8")
+    suffix = path.suffix.lower()
+    payload: object
+    if suffix in {".yaml", ".yml"}:
+        try:
+            import yaml  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("PyYAML is required for .yaml matrix files. Install with: pip install pyyaml") from exc
+        payload = yaml.safe_load(text)
+    else:
+        payload = json.loads(text)
+    if isinstance(payload, list):
+        return {"matrix": payload}
+    if not isinstance(payload, dict):
+        raise RuntimeError("Matrix file must be a JSON/YAML object or list.")
+    return payload
+
+
+def _normalize_matrix_payload(payload: dict) -> tuple[dict, list[dict], list[dict], list[dict], dict]:
+    defaults = payload.get("defaults") if isinstance(payload.get("defaults"), dict) else {}
+    matrix = payload.get("matrix")
+    if matrix is None:
+        matrix_list: list[dict] = []
+    elif isinstance(matrix, list):
+        matrix_list = [block for block in matrix if isinstance(block, dict)]
+    elif isinstance(matrix, dict):
+        matrix_list = [matrix]
+    else:
+        raise RuntimeError("Matrix 'matrix' must be a list of objects.")
+    include = payload.get("include")
+    if include is None:
+        include_list: list[dict] = []
+    elif isinstance(include, list):
+        include_list = [block for block in include if isinstance(block, dict)]
+    elif isinstance(include, dict):
+        include_list = [include]
+    else:
+        raise RuntimeError("Matrix 'include' must be a list of objects.")
+    exclude = payload.get("exclude")
+    if exclude is None:
+        exclude_list: list[dict] = []
+    elif isinstance(exclude, list):
+        exclude_list = [block for block in exclude if isinstance(block, dict)]
+    elif isinstance(exclude, dict):
+        exclude_list = [exclude]
+    else:
+        raise RuntimeError("Matrix 'exclude' must be a list of objects.")
+    limits = payload.get("limits") if isinstance(payload.get("limits"), dict) else {}
+    return defaults, matrix_list, include_list, exclude_list, limits
+
+
+def _normalize_provider_options(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    return {str(k): v for k, v in value.items()}
+
+
+def _normalize_job_params(raw: dict[str, object], defaults: dict[str, object] | None = None) -> dict[str, object]:
+    defaults = defaults or {}
+    params: dict[str, object] = {}
+    provider = raw.get("provider")
+    if provider is None or str(provider).strip() == "":
+        provider = defaults.get("provider", "openai")
+    model = raw.get("model")
+    if model is None or str(model).strip() == "":
+        model = defaults.get("model")
+    provider_key, model_key = _normalize_provider_and_model(str(provider), str(model) if model else None)
+    params["provider"] = provider_key
+    params["model"] = model_key
+    size = raw.get("size")
+    if size is None or str(size).strip() == "":
+        size = defaults.get("size", "1024x1024")
+    params["size"] = _normalize_size(str(size))
+    n_value = raw.get("n")
+    if n_value is None or (isinstance(n_value, str) and not n_value.strip()):
+        n_value = defaults.get("n", 1)
+    try:
+        params["n"] = max(1, int(n_value))
+    except Exception:
+        params["n"] = 1
+    seed = raw.get("seed")
+    if seed is None or (isinstance(seed, str) and not seed.strip()):
+        seed = defaults.get("seed")
+    if seed is None:
+        params["seed"] = None
+    else:
+        try:
+            params["seed"] = int(seed)
+        except Exception:
+            params["seed"] = seed
+    output_format = raw.get("output_format")
+    if output_format is None or (isinstance(output_format, str) and not output_format.strip()):
+        output_format = defaults.get("output_format")
+    params["output_format"] = output_format
+    background = raw.get("background")
+    if background is None or (isinstance(background, str) and not background.strip()):
+        background = defaults.get("background")
+    params["background"] = background
+    options = {}
+    options.update(_normalize_provider_options(defaults.get("provider_options")))
+    options.update(_normalize_provider_options(raw.get("provider_options")))
+    params["provider_options"] = options
+    return params
+
+
+def _expand_provider_options(options: dict[str, object]) -> list[dict[str, object]]:
+    if not options:
+        return [{}]
+    keys = sorted(options.keys())
+    values = [_normalize_to_list(options[key]) for key in keys]
+    combos: list[dict[str, object]] = []
+    for item in itertools.product(*values):
+        combo = {key: item[idx] for idx, key in enumerate(keys)}
+        combos.append(combo)
+    return combos
+
+
+def _expand_matrix_blocks(blocks: list[dict], defaults: dict[str, object]) -> list[dict[str, object]]:
+    expanded: list[dict[str, object]] = []
+    for block in blocks:
+        params_base: dict[str, object] = {}
+        for key in _EXPERIMENT_PARAM_KEYS:
+            if key in defaults:
+                params_base[key] = defaults[key]
+            if key in block:
+                params_base[key] = block[key]
+        options = {}
+        options.update(_normalize_provider_options(defaults.get("provider_options")))
+        options.update(_normalize_provider_options(block.get("provider_options")))
+        option_combos = _expand_provider_options(options)
+        keys = sorted(params_base.keys())
+        values = [_normalize_to_list(params_base[key]) for key in keys]
+        if not keys:
+            keys = []
+            values = []
+        for combo in itertools.product(*values):
+            params = {key: combo[idx] for idx, key in enumerate(keys)}
+            for opt in option_combos:
+                combined = dict(params)
+                combined["provider_options"] = opt
+                expanded.append(_normalize_job_params(combined, defaults))
+    return expanded
+
+
+def _match_filter_value(value: object, expected: object) -> bool:
+    if isinstance(expected, dict):
+        if not isinstance(value, dict):
+            return False
+        for key, exp in expected.items():
+            if key not in value:
+                return False
+            if not _match_filter_value(value.get(key), exp):
+                return False
+        return True
+    if isinstance(expected, (list, tuple, set)):
+        return value in expected
+    if isinstance(value, str) and isinstance(expected, str):
+        return value.strip().lower() == expected.strip().lower()
+    return value == expected
+
+
+def _apply_excludes(params_list: list[dict[str, object]], excludes: list[dict]) -> list[dict[str, object]]:
+    if not excludes:
+        return params_list
+    filtered: list[dict[str, object]] = []
+    for params in params_list:
+        matched = False
+        for rule in excludes:
+            if _match_filter_value(params, rule):
+                matched = True
+                break
+        if not matched:
+            filtered.append(params)
+    return filtered
+
+
+def _build_experiment_jobs(
+    *,
+    prompts: list[dict[str, object]],
+    params_list: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    jobs: list[dict[str, object]] = []
+    job_index = 0
+    for prompt in prompts:
+        prompt_text = str(prompt.get("prompt") or "")
+        prompt_id = str(prompt.get("id") or "")
+        prompt_metadata = prompt.get("metadata") if isinstance(prompt.get("metadata"), dict) else {}
+        for params in params_list:
+            job_index += 1
+            job_id = f"j-{job_index:06d}"
+            cost_value = _estimate_cost_value(
+                provider=str(params.get("provider") or ""),
+                model=str(params.get("model") or "") if params.get("model") else None,
+                size=str(params.get("size") or ""),
+            )
+            n_value = params.get("n", 1)
+            try:
+                n_count = int(n_value)
+            except Exception:
+                n_count = 1
+            estimated_cost = float(cost_value) * max(1, n_count) if cost_value is not None else None
+            job_entry: dict[str, object] = {
+                "job_id": job_id,
+                "prompt_id": prompt_id,
+                "prompt": prompt_text,
+                "params": params,
+                "status": "pending",
+                "attempts": 0,
+                "started_at": None,
+                "completed_at": None,
+                "estimated_cost_usd": estimated_cost,
+                "actual_cost_usd": None,
+                "artifacts": {"image_paths": [], "receipt_paths": []},
+                "warnings": [],
+                "error": None,
+            }
+            if prompt_metadata:
+                job_entry["prompt_metadata"] = prompt_metadata
+            jobs.append(job_entry)
+    return jobs
+
+
+def _recompute_experiment_summary(manifest: dict) -> dict[str, object]:
+    jobs = manifest.get("jobs")
+    summary: dict[str, object] = manifest.get("summary") if isinstance(manifest.get("summary"), dict) else {}
+    succeeded = failed = skipped = 0
+    estimated_total = 0.0
+    actual_total: float | None = None
+    if isinstance(jobs, list):
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            status = job.get("status")
+            if status == "success":
+                succeeded += 1
+            elif status == "failed":
+                failed += 1
+            elif status == "skipped":
+                skipped += 1
+            estimated_cost = job.get("estimated_cost_usd")
+            if status != "skipped" and isinstance(estimated_cost, (int, float)):
+                estimated_total += float(estimated_cost)
+            actual_cost = job.get("actual_cost_usd")
+            if status != "skipped" and isinstance(actual_cost, (int, float)):
+                if actual_total is None:
+                    actual_total = 0.0
+                actual_total += float(actual_cost)
+    summary["succeeded"] = succeeded
+    summary["failed"] = failed
+    summary["skipped"] = skipped
+    summary["estimated_cost_usd"] = round(estimated_total, 6)
+    summary["actual_cost_usd"] = actual_total
+    manifest["summary"] = summary
+    return summary
+
+
+def _parse_provider_concurrency(value: str | None) -> dict[str, int]:
+    if not value:
+        return {}
+    parsed: dict[str, int] = {}
+    for raw in value.split(","):
+        if not raw or "=" not in raw:
+            continue
+        key, count_raw = raw.split("=", 1)
+        key = key.strip()
+        try:
+            count = int(count_raw.strip())
+        except Exception:
+            continue
+        if count <= 0:
+            continue
+        provider_key, _ = _normalize_provider_and_model(key, None)
+        parsed[provider_key] = count
+    return parsed
+
+
+def _normalize_provider_concurrency(value: object) -> dict[str, int]:
+    if isinstance(value, dict):
+        parsed: dict[str, int] = {}
+        for key, count_raw in value.items():
+            try:
+                count = int(count_raw)
+            except Exception:
+                continue
+            if count <= 0:
+                continue
+            provider_key, _ = _normalize_provider_and_model(str(key), None)
+            parsed[provider_key] = count
+        return parsed
+    return {}
+
+
+def _apply_budget_limits(
+    *,
+    manifest: dict,
+    budget_usd: float | None,
+    budget_mode: str,
+    resume: bool,
+) -> None:
+    if budget_usd is None or budget_mode == "off":
+        return
+    jobs = manifest.get("jobs")
+    if not isinstance(jobs, list):
+        return
+    running_total = 0.0
+    budget_exhausted = False
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        status = job.get("status")
+        if resume and status == "success":
+            estimated_cost = job.get("estimated_cost_usd")
+            if isinstance(estimated_cost, (int, float)):
+                running_total += float(estimated_cost)
+            continue
+        if status == "skipped":
+            continue
+        if budget_exhausted:
+            job["status"] = "skipped"
+            job["error"] = "budget exceeded"
+            continue
+        estimated_cost = job.get("estimated_cost_usd")
+        if estimated_cost is None:
+            if budget_mode == "strict":
+                job["status"] = "skipped"
+                job["error"] = "unknown cost in strict budget mode"
+            continue
+        try:
+            estimated_cost_value = float(estimated_cost)
+        except Exception:
+            estimated_cost_value = None
+        if estimated_cost_value is None:
+            if budget_mode == "strict":
+                job["status"] = "skipped"
+                job["error"] = "unknown cost in strict budget mode"
+            continue
+        if running_total + estimated_cost_value > budget_usd:
+            job["status"] = "skipped"
+            job["error"] = "budget exceeded"
+            budget_exhausted = True
+            continue
+        running_total += estimated_cost_value
+
+
+def _run_experiment_jobs(
+    *,
+    manifest: dict,
+    run_dir: Path,
+    concurrency: int,
+    provider_concurrency: dict[str, int],
+    resume: bool,
+    cancel_event: threading.Event | None = None,
+) -> int:
+    manifest_path = run_dir / "run.json"
+    lock = threading.Lock()
+    provider_semaphores = {
+        provider: threading.Semaphore(limit)
+        for provider, limit in provider_concurrency.items()
+        if limit > 0
+    }
+    jobs = manifest.get("jobs")
+    if not isinstance(jobs, list):
+        return 1
+
+    def _write_manifest() -> None:
+        _recompute_experiment_summary(manifest)
+        _write_manifest_atomic(manifest_path, manifest)
+
+    def _update_job(index: int, updates: dict[str, object]) -> None:
+        with lock:
+            job = jobs[index]
+            if isinstance(job, dict):
+                job.update(updates)
+            _write_manifest()
+
+    def _should_run(job: dict) -> bool:
+        status = job.get("status")
+        if resume:
+            return status in {"pending", "failed", "running"}
+        return status == "pending"
+
+    run_indexes = [idx for idx, job in enumerate(jobs) if isinstance(job, dict) and _should_run(job)]
+    if not run_indexes:
+        print("No jobs to run.")
+        return 0
+
+    def _execute_job(index: int) -> tuple[int, bool]:
+        job = jobs[index]
+        if not isinstance(job, dict):
+            return index, False
+        if cancel_event and cancel_event.is_set():
+            _update_job(
+                index,
+                {
+                    "status": "skipped",
+                    "completed_at": _utc_iso_now(),
+                    "error": "cancelled",
+                },
+            )
+            return index, False
+        params = job.get("params") if isinstance(job.get("params"), dict) else {}
+        provider = str(params.get("provider") or "openai")
+        semaphore = provider_semaphores.get(provider)
+        if semaphore is not None:
+            semaphore.acquire()
+        try:
+            attempts = int(job.get("attempts") or 0)
+            success = False
+            last_error: str | None = None
+            for attempt in range(attempts, attempts + _EXPERIMENT_MAX_RETRIES + 1):
+                if cancel_event and cancel_event.is_set():
+                    _update_job(
+                        index,
+                        {
+                            "status": "skipped",
+                            "completed_at": _utc_iso_now(),
+                            "error": "cancelled",
+                        },
+                    )
+                    return index, False
+                updates = {
+                    "status": "running",
+                    "attempts": attempt + 1,
+                    "started_at": _utc_iso_now(),
+                }
+                _update_job(index, updates)
+                try:
+                    from forge_image_api import generate
+
+                    results = generate(
+                        prompt=str(job.get("prompt") or ""),
+                        provider=provider,
+                        size=str(params.get("size") or "1024x1024"),
+                        n=int(params.get("n") or 1),
+                        out_dir=run_dir,
+                        model=str(params.get("model") or "") or None,
+                        provider_options=params.get("provider_options") if isinstance(params.get("provider_options"), dict) else {},
+                        seed=params.get("seed"),
+                        output_format=params.get("output_format"),
+                        background=params.get("background"),
+                    )
+                    image_paths = [_experiment_relpath(Path(result.image_path), run_dir) for result in results]
+                    receipt_paths = [_experiment_relpath(Path(result.receipt_path), run_dir) for result in results]
+                    _update_job(
+                        index,
+                        {
+                            "status": "success",
+                            "completed_at": _utc_iso_now(),
+                            "artifacts": {"image_paths": image_paths, "receipt_paths": receipt_paths},
+                            "error": None,
+                        },
+                    )
+                    success = True
+                    break
+                except Exception as exc:
+                    last_error = str(exc)
+                    if attempt < attempts + _EXPERIMENT_MAX_RETRIES:
+                        continue
+            if not success:
+                job_id = job.get("job_id") if isinstance(job, dict) else None
+                model = params.get("model") if isinstance(params, dict) else None
+                _update_job(
+                    index,
+                    {
+                        "status": "failed",
+                        "completed_at": _utc_iso_now(),
+                        "error": last_error or "unknown error",
+                    },
+                )
+                label = f"{provider}/{model}" if model else provider
+                if job_id:
+                    print(f"Job {job_id} failed ({label}): {last_error or 'unknown error'}")
+                else:
+                    print(f"Job failed ({label}): {last_error or 'unknown error'}")
+            return index, success
+        finally:
+            if semaphore is not None:
+                semaphore.release()
+
+    print(f"Running {len(run_indexes)} jobs with concurrency={concurrency}...")
+    exit_code = 0
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = [executor.submit(_execute_job, idx) for idx in run_indexes]
+        for future in as_completed(futures):
+            try:
+                _, ok = future.result()
+                if not ok:
+                    exit_code = 1
+            except Exception:
+                exit_code = 1
+    if cancel_event and cancel_event.is_set():
+        with lock:
+            for job in jobs:
+                if not isinstance(job, dict):
+                    continue
+                if job.get("status") == "pending":
+                    job["status"] = "skipped"
+                    job["completed_at"] = _utc_iso_now()
+                    job["error"] = "cancelled"
+            _write_manifest()
+    return exit_code
+
+
+def _run_experiment_cli(argv: list[str], *, cancel_event: threading.Event | None = None) -> int:
+    parser = argparse.ArgumentParser(description="PARAM FORGE: run prompt experiments across a matrix.")
+    parser.add_argument("--prompts", help="Prompt file (.txt or .csv)")
+    parser.add_argument("--matrix", help="Matrix file (.yaml or .json)")
+    parser.add_argument("--out", required=True, help="Output run directory")
+    parser.add_argument("--concurrency", type=int, default=None, help="Global concurrency (default: 3)")
+    parser.add_argument(
+        "--provider-concurrency",
+        default=None,
+        help="Per-provider concurrency (e.g., openai=1,gemini=2)",
+    )
+    parser.add_argument("--budget", type=float, default=None, help="Budget cap in USD")
+    parser.add_argument(
+        "--budget-mode",
+        default=None,
+        choices=_EXPERIMENT_BUDGET_MODES,
+        help="Budget mode: estimate, strict, off",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Plan and exit without running")
+    parser.add_argument("--resume", action="store_true", help="Resume an existing run.json")
+    args = parser.parse_args(argv)
+
+    run_dir = Path(args.out).expanduser().resolve()
+    manifest_path = run_dir / "run.json"
+    _load_repo_dotenv()
+
+    if args.resume:
+        if not manifest_path.exists():
+            print(f"No run.json found at {manifest_path}.")
+            return 1
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"Failed to read manifest: {exc}")
+            return 1
+        if not isinstance(manifest, dict):
+            print("Run manifest is invalid.")
+            return 1
+        limits = manifest.get("limits") if isinstance(manifest.get("limits"), dict) else {}
+        concurrency = args.concurrency if args.concurrency is not None else limits.get("concurrency")
+        provider_concurrency = (
+            _parse_provider_concurrency(args.provider_concurrency)
+            if args.provider_concurrency
+            else _normalize_provider_concurrency(limits.get("provider_concurrency"))
+        )
+        budget_mode = args.budget_mode or limits.get("budget_mode") or "estimate"
+        budget = args.budget if args.budget is not None else limits.get("budget_usd")
+    else:
+        if not args.prompts or not args.matrix:
+            print("Experiment requires --prompts and --matrix (or use --resume).")
+            return 1
+        if manifest_path.exists():
+            print(f"run.json already exists in {run_dir}. Use --resume or choose a new --out.")
+            return 1
+        run_dir.mkdir(parents=True, exist_ok=True)
+        prompt_path = Path(args.prompts).expanduser().resolve()
+        matrix_path = Path(args.matrix).expanduser().resolve()
+        try:
+            prompts = _load_prompts_file(prompt_path)
+        except Exception as exc:
+            print(f"Failed to load prompts: {exc}")
+            return 1
+        if not prompts:
+            print("No prompts found.")
+            return 1
+        try:
+            matrix_payload = _load_matrix_file(matrix_path)
+        except Exception as exc:
+            print(f"Failed to load matrix: {exc}")
+            return 1
+        defaults, matrix_blocks, include_blocks, exclude_blocks, limits = _normalize_matrix_payload(matrix_payload)
+        params_list = _expand_matrix_blocks(matrix_blocks, defaults)
+        if include_blocks:
+            params_list.extend(_expand_matrix_blocks(include_blocks, defaults))
+        params_list = _apply_excludes(params_list, exclude_blocks)
+        if not params_list:
+            print("No matrix jobs found after applying include/exclude.")
+            return 1
+        jobs = _build_experiment_jobs(prompts=prompts, params_list=params_list)
+        planned_images = 0
+        for job in jobs:
+            params = job.get("params") if isinstance(job.get("params"), dict) else {}
+            try:
+                planned_images += int(params.get("n") or 1)
+            except Exception:
+                planned_images += 1
+        concurrency = args.concurrency if args.concurrency is not None else limits.get("concurrency")
+        provider_concurrency = (
+            _parse_provider_concurrency(args.provider_concurrency)
+            if args.provider_concurrency
+            else _normalize_provider_concurrency(limits.get("provider_concurrency"))
+        )
+        budget_mode = args.budget_mode or limits.get("budget_mode") or "estimate"
+        budget = args.budget if args.budget is not None else limits.get("budget_usd")
+        manifest = {
+            "schema_version": _EXPERIMENT_SCHEMA_VERSION,
+            "run_id": run_dir.name,
+            "created_at": _utc_iso_now(),
+            "started_at": None,
+            "completed_at": None,
+            "status": "planned",
+            "inputs": {
+                "prompts_path": _experiment_relpath(prompt_path, run_dir),
+                "matrix_path": _experiment_relpath(matrix_path, run_dir),
+                "prompt_count": len(prompts),
+                "matrix_blocks": len(matrix_blocks),
+                "expanded_jobs": len(jobs),
+                "planned_images": planned_images,
+            },
+            "limits": {
+                "concurrency": concurrency or _EXPERIMENT_DEFAULT_CONCURRENCY,
+                "provider_concurrency": provider_concurrency,
+                "budget_usd": budget,
+                "budget_mode": budget_mode,
+            },
+            "summary": {
+                "succeeded": 0,
+                "failed": 0,
+                "skipped": 0,
+                "estimated_cost_usd": 0.0,
+                "actual_cost_usd": None,
+            },
+            "jobs": jobs,
+        }
+
+    if concurrency is None:
+        concurrency = _EXPERIMENT_DEFAULT_CONCURRENCY
+    if concurrency <= 0:
+        concurrency = _EXPERIMENT_DEFAULT_CONCURRENCY
+    budget_mode = str(budget_mode or "estimate").lower()
+    if budget_mode not in _EXPERIMENT_BUDGET_MODES:
+        print(f"Unsupported budget mode '{budget_mode}'.")
+        return 1
+
+    if not isinstance(manifest.get("limits"), dict):
+        manifest["limits"] = {}
+
+    manifest["limits"]["concurrency"] = concurrency
+    manifest["limits"]["provider_concurrency"] = provider_concurrency
+    manifest["limits"]["budget_usd"] = budget
+    manifest["limits"]["budget_mode"] = budget_mode
+
+    _apply_budget_limits(manifest=manifest, budget_usd=budget, budget_mode=budget_mode, resume=args.resume)
+    _recompute_experiment_summary(manifest)
+    _write_manifest_atomic(manifest_path, manifest)
+
+    inputs = manifest.get("inputs") if isinstance(manifest.get("inputs"), dict) else {}
+    prompt_count = inputs.get("prompt_count")
+    expanded_jobs = inputs.get("expanded_jobs")
+    planned_images = inputs.get("planned_images")
+    summary = manifest.get("summary") if isinstance(manifest.get("summary"), dict) else {}
+    print("Experiment plan:")
+    print(f"  prompts={prompt_count} jobs={expanded_jobs} images={planned_images}")
+    print(f"  concurrency={concurrency} budget={budget} mode={budget_mode}")
+    print(f"  estimated_cost_usd={summary.get('estimated_cost_usd')}")
+
+    if args.dry_run:
+        print("Dry run complete. Manifest written.")
+        return 0
+
+    providers: set[str] = set()
+    jobs = manifest.get("jobs")
+    if isinstance(jobs, list):
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            if job.get("status") == "skipped":
+                continue
+            params = job.get("params") if isinstance(job.get("params"), dict) else {}
+            providers.add(str(params.get("provider") or "openai"))
+    for provider in sorted(providers):
+        try:
+            _ensure_api_keys(provider, _find_repo_dotenv(), allow_prompt=True)
+        except RuntimeError as exc:
+            print(f"Setup failed for {provider}: {exc}")
+            return 1
+
+    manifest["status"] = "running"
+    if not manifest.get("started_at"):
+        manifest["started_at"] = _utc_iso_now()
+    _write_manifest_atomic(manifest_path, manifest)
+
+    try:
+        exit_code = _run_experiment_jobs(
+            manifest=manifest,
+            run_dir=run_dir,
+            concurrency=concurrency,
+            provider_concurrency=provider_concurrency,
+            resume=args.resume,
+            cancel_event=cancel_event,
+        )
+    except KeyboardInterrupt:
+        manifest["completed_at"] = _utc_iso_now()
+        manifest["status"] = "cancelled"
+        _recompute_experiment_summary(manifest)
+        _write_manifest_atomic(manifest_path, manifest)
+        print("Cancelled.")
+        return 1
+
+    manifest["completed_at"] = _utc_iso_now()
+    if cancel_event and cancel_event.is_set():
+        manifest["status"] = "cancelled"
+    else:
+        manifest["status"] = "completed"
+    _recompute_experiment_summary(manifest)
+    _write_manifest_atomic(manifest_path, manifest)
+    summary = manifest.get("summary") if isinstance(manifest.get("summary"), dict) else {}
+    if cancel_event and cancel_event.is_set():
+        print(
+            "Run cancelled: "
+            f"{summary.get('succeeded')} succeeded, {summary.get('failed')} failed, {summary.get('skipped')} skipped."
+        )
+    else:
+        print(
+            "Run complete: "
+            f"{summary.get('succeeded')} succeeded, {summary.get('failed')} failed, {summary.get('skipped')} skipped."
+        )
+    print(f"Manifest: {manifest_path}")
+    return exit_code
+
+
 def _run_generation(args: argparse.Namespace) -> int:
     _load_repo_dotenv()
     args.analyzer = _resolve_receipt_analyzer(getattr(args, "analyzer", None))
@@ -8171,6 +9979,8 @@ def _run_generation(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] in {"experiment", "runner"}:
+        return _run_experiment_cli(sys.argv[2:])
     if len(sys.argv) > 1 and sys.argv[1] == "view":
         return _run_view_cli(sys.argv[2:])
     parser = argparse.ArgumentParser(

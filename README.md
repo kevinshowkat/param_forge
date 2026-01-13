@@ -76,6 +76,14 @@ Non-interactive defaults:
 python scripts/param_forge.py --defaults
 ```
 
+Experiment runner:
+```bash
+python scripts/param_forge.py experiment \
+  --prompts prompts.txt \
+  --matrix matrix.yaml \
+  --out runs/food_glam_v1
+```
+
 Prompt selection (interactive):
 - The Explore flow includes a **Prompt** step.
 - Press Enter with no input to use the default prompt.
@@ -109,7 +117,7 @@ OpenAI image call options:
 - If curses can’t initialize (TERM issues or small terminal), the script falls back to a raw prompt flow.
 - Receipts are stored next to generated images in the output directory.
 - Pricing reference (per 1K images): docs/pricing_reference.md, docs/pricing_reference.json
-- Experiment flow is not wired up yet (planned; not runnable in this release).
+- Experiment runner is available via `python scripts/param_forge.py experiment ...`.
 - External LLM review context: docs/llm_review_context.md
 - Prompt catalog (all analysis prompts in one place): docs/prompts.md
 - Default prompt: a nod to Simon Willison's baseline SVG prompt for testing text-to-text models.
