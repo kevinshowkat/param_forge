@@ -240,5 +240,38 @@ class TestMatrixExpansion(unittest.TestCase):
         self.assertEqual(job["prompt_metadata"]["tag"], "a")
 
 
+class TestExploreHelpers(unittest.TestCase):
+    def test_normalize_provider_and_model_google(self) -> None:
+        provider, model = param_forge._normalize_provider_and_model("google", "imagen-4")
+        self.assertEqual(provider, "imagen")
+        self.assertEqual(model, "imagen-4")
+        provider, model = param_forge._normalize_provider_and_model("google", "gemini-2.5-flash-image")
+        self.assertEqual(provider, "gemini")
+        self.assertEqual(model, "gemini-2.5-flash-image")
+
+    def test_model_choices_for_aliases(self) -> None:
+        google_models = param_forge._model_choices_for("google")
+        self.assertTrue(any("gemini" in item for item in google_models))
+        self.assertTrue(any("imagen" in item for item in google_models))
+        flux_models = param_forge._model_choices_for("black forest labs")
+        self.assertTrue(any("flux" in item for item in flux_models))
+
+    def test_build_interactive_namespace_defaults(self) -> None:
+        args = param_forge._build_interactive_namespace(
+            "openai",
+            "gpt-image-1.5",
+            "Hello world",
+            "1024x1024",
+            1,
+            "outputs/param_forge",
+        )
+        self.assertEqual(args.provider, "openai")
+        self.assertEqual(args.model, "gpt-image-1.5")
+        self.assertEqual(args.prompt, ["Hello world"])
+        self.assertEqual(args.size, "1024x1024")
+        self.assertEqual(args.n, 1)
+        self.assertEqual(args.out, "outputs/param_forge")
+
+
 if __name__ == "__main__":
     unittest.main()
