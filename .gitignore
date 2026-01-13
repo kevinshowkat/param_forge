@@ -4,6 +4,8 @@ __pycache__/
 .venv/
 .env
 
+param_forge_review.tar.gz
+
 outputs/
 scripts/outputs/
 feedback.png

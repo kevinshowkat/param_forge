@@ -111,6 +111,7 @@ OpenAI image call options:
 - Pricing reference (per 1K images): docs/pricing_reference.md, docs/pricing_reference.json
 - Experiment flow is not wired up yet (planned; not runnable in this release).
 - External LLM review context: docs/llm_review_context.md
+- Prompt catalog (all analysis prompts in one place): docs/prompts.md
 - Default prompt: a nod to Simon Willison's baseline SVG prompt for testing text-to-text models.
   - https://x.com/simonw/status/1990859659595731046
   - https://simonwillison.net/2024/Oct/25/pelicans-on-a-bicycle/
