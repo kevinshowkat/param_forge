@@ -76,9 +76,9 @@ Non-interactive defaults:
 python scripts/param_forge.py --defaults
 ```
 
-Batch run (CLI subcommand is `experiment`):
+Batch run (CLI subcommand is `batch-run`):
 ```bash
-python scripts/param_forge.py experiment \
+python scripts/param_forge.py batch-run \
   --prompts prompts.txt \
   --matrix matrix.yaml \
   --out runs/food_glam_v1
@@ -117,7 +117,7 @@ OpenAI image call options:
 - If curses can’t initialize (TERM issues or small terminal), the script falls back to a raw prompt flow.
 - Receipts are stored next to generated images in the output directory.
 - Pricing reference (per 1K images): docs/pricing_reference.md, docs/pricing_reference.json
-- Batch run is available in the UI (label: "Batch run") and via `python scripts/param_forge.py experiment ...`.
+- Batch run is available in the UI (label: "Batch run") and via `python scripts/param_forge.py batch-run ...`.
 - External LLM review context: docs/llm_review_context.md
 - Prompt catalog (all analysis prompts in one place): docs/prompts.md
 - Default prompt: a nod to Simon Willison's baseline SVG prompt for testing text-to-text models.

@@ -66,7 +66,7 @@ Used for cost estimates:
 - `scripts/forge_image_api/core/receipts.py` — receipt serialization
 - `scripts/forge_image_api/core/contracts.py` — typed request/result contracts
 - `docs/pricing_reference.json` — local cost reference
-- `docs/experiment_mode_spec.md` — experiment run spec (implemented via CLI runner)
+- `docs/experiment_mode_spec.md` — batch run spec (CLI subcommand: `batch-run`)
 
 ## What’s in scope for feedback
 - UX and information architecture of the viewer (grid, compare, snippets, winners).

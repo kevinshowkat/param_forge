@@ -4,7 +4,7 @@
 Usage:
   python scripts/param_forge.py \
     --provider openai --size portrait --n 1 --out outputs/param_forge
-  python scripts/param_forge.py experiment \
+  python scripts/param_forge.py batch-run \
     --prompts prompts.txt --matrix matrix.yaml --out runs/food_glam_v1
   python scripts/param_forge.py --interactive
   python scripts/param_forge.py --defaults
@@ -1415,8 +1415,8 @@ def _interactive_args_raw(color_override: bool | None = None) -> argparse.Namesp
     with _RawMode(fd, original):
         experiment_selected = False
         while True:
-            mode = _select_from_list("Mode", ["Explore", "Experiment"], 0)
-            if mode.lower() == "experiment":
+            mode = _select_from_list("Mode", ["Explore", "Batch run"], 0)
+            if mode.lower() == "batch run":
                 experiment_selected = True
                 break
             break
@@ -1440,8 +1440,8 @@ def _interactive_args_simple() -> argparse.Namespace:
     print("Type a number and press Enter. Press Enter to accept defaults.")
 
     while True:
-        mode = _prompt_choice("Mode", ["Explore", "Experiment"], 0)
-        if mode.lower() == "experiment":
+        mode = _prompt_choice("Mode", ["Explore", "Batch run"], 0)
+        if mode.lower() == "batch run":
             return _interactive_experiment_args_simple()
         break
     provider = _prompt_choice("Provider", _provider_display_choices(), 0)
@@ -1631,7 +1631,7 @@ def _run_experiment_from_namespace(args: argparse.Namespace) -> int:
 
 
 def _interactive_experiment_args_simple() -> argparse.Namespace:
-    print("PARAM FORGE (experiment)")
+    print("PARAM FORGE (batch run)")
     for line in _version_text_lines():
         print(line)
     prompts_path: str | None = None
@@ -1893,7 +1893,7 @@ def _interactive_args_curses(stdscr, color_override: bool | None = None) -> argp
             stdscr,
             y,
             "Mode",
-            ["Explore", "Experiment"],
+            ["Explore", "Batch run"],
             mode_idx,
             field_idx == 0,
             field_idx,
@@ -5347,7 +5347,7 @@ def _run_experiment_curses(
         stdscr.erase()
         height, width = stdscr.getmaxyx()
         y = _draw_banner(stdscr, color_enabled, 1)
-        title = "Experiment run"
+        title = "Batch run"
         _safe_addstr(stdscr, min(height - 2, y), 0, title[: max(0, width - 1)], curses.A_BOLD)
         y = min(height - 2, y + 2)
 
@@ -9622,7 +9622,7 @@ def _run_experiment_jobs(
 
 
 def _run_experiment_cli(argv: list[str], *, cancel_event: threading.Event | None = None) -> int:
-    parser = argparse.ArgumentParser(description="PARAM FORGE: run prompt experiments across a matrix.")
+    parser = argparse.ArgumentParser(description="PARAM FORGE: run batch prompts across a matrix.")
     parser.add_argument("--prompts", help="Prompt file (.txt or .csv)")
     parser.add_argument("--matrix", help="Matrix file (.yaml or .json)")
     parser.add_argument("--out", required=True, help="Output run directory")
@@ -9670,7 +9670,7 @@ def _run_experiment_cli(argv: list[str], *, cancel_event: threading.Event | None
         budget = args.budget if args.budget is not None else limits.get("budget_usd")
     else:
         if not args.prompts or not args.matrix:
-            print("Experiment requires --prompts and --matrix (or use --resume).")
+            print("Batch run requires --prompts and --matrix (or use --resume).")
             return 1
         if manifest_path.exists():
             print(f"run.json already exists in {run_dir}. Use --resume or choose a new --out.")
@@ -9772,7 +9772,7 @@ def _run_experiment_cli(argv: list[str], *, cancel_event: threading.Event | None
     expanded_jobs = inputs.get("expanded_jobs")
     planned_images = inputs.get("planned_images")
     summary = manifest.get("summary") if isinstance(manifest.get("summary"), dict) else {}
-    print("Experiment plan:")
+    print("Batch run plan:")
     print(f"  prompts={prompt_count} jobs={expanded_jobs} images={planned_images}")
     print(f"  concurrency={concurrency} budget={budget} mode={budget_mode}")
     print(f"  estimated_cost_usd={summary.get('estimated_cost_usd')}")
@@ -9979,7 +9979,9 @@ def _run_generation(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    if len(sys.argv) > 1 and sys.argv[1] in {"experiment", "runner"}:
+    if len(sys.argv) > 1 and sys.argv[1] in {"batch-run", "experiment", "runner"}:
+        if sys.argv[1] in {"experiment", "runner"}:
+            print("Note: 'experiment' is now 'batch-run'.")
         return _run_experiment_cli(sys.argv[2:])
     if len(sys.argv) > 1 and sys.argv[1] == "view":
         return _run_view_cli(sys.argv[2:])
