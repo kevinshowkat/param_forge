@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 import time
+import uuid
 from typing import Iterable, Iterator, List, Optional
 
 from forge_image_api.core.contracts import ImageEvent, ImageInputs, ImageRequest, ImageResult
@@ -43,6 +44,10 @@ def _write_image(out_dir: Path, provider: str, index: int, image: ProviderImage,
 
 def _utc_iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _unique_stamp() -> str:
+    return f"{utc_timestamp()}-{uuid.uuid4().hex[:6]}"
 
 
 def _finalize_results(
@@ -137,7 +142,7 @@ def generate(
     response = adapter.generate(request, resolved)
     elapsed = time.monotonic() - started_monotonic
     completed_at = datetime.now(timezone.utc)
-    stamp = utc_timestamp()
+    stamp = _unique_stamp()
     return _finalize_results(
         request=request,
         resolved_provider=resolved_provider,
@@ -193,7 +198,7 @@ def edit(
     response = adapter.generate(request, resolved)
     elapsed = time.monotonic() - started_monotonic
     completed_at = datetime.now(timezone.utc)
-    stamp = utc_timestamp()
+    stamp = _unique_stamp()
     return _finalize_results(
         request=request,
         resolved_provider=resolved_provider,
@@ -243,7 +248,7 @@ def stream(
     request.out_dir = out_path
     resolved = resolve_request(request, resolved_provider)
     adapter = get_adapter(resolved_provider)
-    stamp = utc_timestamp()
+    stamp = _unique_stamp()
 
     if resolved.stream:
         started_at = datetime.now(timezone.utc)
