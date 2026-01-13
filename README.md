@@ -17,6 +17,8 @@ PARAM FORGE is a terminal UI for running text-to-image jobs across providers and
 ## Outputs
 - images and receipt files written to the output directory
 - receipts capture the prompts and provider parameters used
+- receipt metadata includes render timing and LLM scoring (adherence/quality) when available
+- local receipt viewer can render a grid view for quick comparison
 
 ## Requirements
 - Python 3.10+
@@ -56,7 +58,7 @@ Set the key for the provider you plan to use. You can export env vars or create 
 - Imagen: `GOOGLE_API_KEY` or Vertex credentials (for example `GOOGLE_APPLICATION_CREDENTIALS`)
 
 Tip: If you run with the OpenAI provider and no key is found, the script will prompt you to set one and can save it to `.env`.
-Note: OpenAI image generation models (gpt-image-1.5 / gpt-image-1) may require API organization verification to access image generation.
+Note: OpenAI image generation models (gpt-image-1.5 / gpt-image-1-mini / gpt-image-1) may require API organization verification to access image generation.
 
 ## Usage
 Interactive (default when no args are provided):
@@ -73,6 +75,16 @@ Non-interactive defaults:
 ```bash
 python scripts/param_forge.py --defaults
 ```
+
+Prompt selection (interactive):
+- The Explore flow includes a **Prompt** step.
+- Press Enter with no input to use the default prompt.
+
+Receipt viewer:
+```bash
+python scripts/param_forge.py view outputs/param_forge
+```
+This opens a local web page for side-by-side comparison, winner picking, and copyable reproduction snippets.
 
 Receipt analyzer provider:
 - Default: Anthropic (`anthropic`), with automatic fallback to OpenAI if Anthropic rate-limits.
@@ -98,6 +110,7 @@ OpenAI image call options:
 - Receipts are stored next to generated images in the output directory.
 - Pricing reference (per 1K images): docs/pricing_reference.md, docs/pricing_reference.json
 - Experiment flow is not wired up yet (planned; not runnable in this release).
+- External LLM review context: docs/llm_review_context.md
 - Default prompt: a nod to Simon Willison's baseline SVG prompt for testing text-to-text models.
   - https://x.com/simonw/status/1990859659595731046
   - https://simonwillison.net/2024/Oct/25/pelicans-on-a-bicycle/

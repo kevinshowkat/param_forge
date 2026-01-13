@@ -50,7 +50,7 @@ FIXED_PROMPT = (
 DEFAULT_PROMPTS = [FIXED_PROMPT]
 PROVIDER_CHOICES = ["openai", "google", "black forest labs"]
 MODEL_CHOICES_BY_PROVIDER = {
-    "openai": ["gpt-image-1.5", "gpt-image-1"],
+    "openai": ["gpt-image-1.5", "gpt-image-1-mini", "gpt-image-1"],
     "gemini": ["gemini-2.5-flash-image", "gemini-3-pro-image-preview"],
     "imagen": ["imagen-4.0-ultra", "imagen-4"],
     "flux": ["flux-2-flex", "flux-2-pro", "flux-2"],
@@ -385,6 +385,26 @@ def _select_int(label: str, default: int, minimum: int = 1, maximum: int = 6) ->
         elif key in {"q", "Q"}:
             sys.stdout.write("\r\n")
     return default
+
+
+def _select_text(label: str, default: str) -> str:
+    print(f"{label} (enter to confirm; empty = default):")
+    buffer = ""
+    while True:
+        sys.stdout.write("\r\033[2K  " + buffer)
+        sys.stdout.flush()
+        key = _read_key()
+        if key in {"\r", "\n"}:
+            sys.stdout.write("\r\n")
+            text = buffer.strip()
+            return text if text else default
+        if key in {"\x7f", "\b"}:
+            buffer = buffer[:-1]
+            continue
+        if key in {"LEFT", "RIGHT", "UP", "DOWN", "ESC"}:
+            continue
+        if len(key) == 1 and key.isprintable():
+            buffer += key
 
 
 def _model_choices_for(provider: str) -> list[str]:
@@ -1386,11 +1406,12 @@ def _interactive_args_raw(color_override: bool | None = None) -> argparse.Namesp
         provider = _select_from_list("Provider", _provider_display_choices(), 0)
         provider = _provider_from_display(provider)
         model = _select_from_list("Model", _model_choices_for(provider), 0)
+        prompt_text = _select_text("Prompt (press Enter to use default prompt)", DEFAULT_PROMPTS[0])
         size_label = _select_from_list("Size", _size_label_choices(), 0)
         size = _size_value_from_label(size_label)
         n = _select_int("Images per prompt", 1, minimum=1, maximum=4)
         out_choice = _select_from_list("Output dir", OUT_DIR_CHOICES, 0)
-    return _build_interactive_namespace(provider, model, size, n, out_choice)
+    return _build_interactive_namespace(provider, model, prompt_text, size, n, out_choice)
 
 
 def _interactive_args_simple() -> argparse.Namespace:
@@ -1408,11 +1429,12 @@ def _interactive_args_simple() -> argparse.Namespace:
     provider = _prompt_choice("Provider", _provider_display_choices(), 0)
     provider = _provider_from_display(provider)
     model = _prompt_choice("Model", _model_choices_for(provider), 0)
+    prompt_text = _prompt_text("Prompt (press Enter to use default prompt)", DEFAULT_PROMPTS[0])
     size_label = _prompt_choice("Size", _size_label_choices(), 0)
     size = _size_value_from_label(size_label)
     n = _prompt_int("Images per prompt", 1, minimum=1, maximum=4)
     out_choice = _prompt_choice("Output dir", OUT_DIR_CHOICES, 0)
-    return _build_interactive_namespace(provider, model, size, n, out_choice)
+    return _build_interactive_namespace(provider, model, prompt_text, size, n, out_choice)
 
 
 def _prompt_choice(label: str, choices: list[str], default_index: int = 0) -> str:
@@ -1452,14 +1474,27 @@ def _prompt_int(label: str, default: int, minimum: int = 1, maximum: int = 6) ->
         print(f"Enter a number between {minimum} and {maximum}.")
 
 
+def _prompt_text(label: str, default: str) -> str:
+    while True:
+        try:
+            response = input(f"{label}: ").strip()
+        except EOFError:
+            raise KeyboardInterrupt from None
+        if response == "":
+            return default
+        return response
+
+
 def _build_interactive_namespace(
     provider: str,
     model: str | None,
+    prompt_text: str,
     size: str,
     n: int,
     out_choice: str,
 ) -> argparse.Namespace:
-    prompts = list(DEFAULT_PROMPTS)
+    prompt_text = (prompt_text or "").strip()
+    prompts = [prompt_text] if prompt_text else list(DEFAULT_PROMPTS)
     out_dir = "outputs/param_forge"
     if out_choice == "outputs/param_forge_dated":
         stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -1536,6 +1571,7 @@ def _interactive_args_curses(stdscr, color_override: bool | None = None) -> argp
     mode_idx = 0
     provider_idx = 0
     model_idx = 0
+    prompt_text = DEFAULT_PROMPTS[0]
     size_idx = 0
     count_value = 1
     out_idx = 0
@@ -1635,15 +1671,29 @@ def _interactive_args_curses(stdscr, color_override: bool | None = None) -> argp
                 done_pair,
                 color_enabled,
             )
+            y = _draw_prompt_line(
+                stdscr,
+                y,
+                "Prompt",
+                prompt_text,
+                DEFAULT_PROMPTS[0],
+                field_idx == 3,
+                field_idx,
+                3,
+                highlight_pair,
+                done_pair,
+                color_enabled,
+                hint_text="Press (n) to input custom prompt • Enter: use default prompt",
+            )
             y = _draw_choice_column(
                 stdscr,
                 y,
                 "Size",
                 size_choices,
                 size_idx,
-                field_idx == 3,
+                field_idx == 4,
                 field_idx,
-                3,
+                4,
                 highlight_pair,
                 done_pair,
                 color_enabled,
@@ -1654,9 +1704,9 @@ def _interactive_args_curses(stdscr, color_override: bool | None = None) -> argp
                 y,
                 "Images per prompt",
                 count_value,
-                field_idx == 4,
+                field_idx == 5,
                 field_idx,
-                4,
+                5,
                 highlight_pair,
                 done_pair,
                 color_enabled,
@@ -1667,9 +1717,9 @@ def _interactive_args_curses(stdscr, color_override: bool | None = None) -> argp
                 "Output dir",
                 OUT_DIR_CHOICES,
                 out_idx,
-                field_idx == 5,
+                field_idx == 6,
                 field_idx,
-                5,
+                6,
                 highlight_pair,
                 done_pair,
                 color_enabled,
@@ -1684,7 +1734,7 @@ def _interactive_args_curses(stdscr, color_override: bool | None = None) -> argp
                 _, _, _, _, bstate = curses.getmouse()
             except curses.error:
                 continue
-            if field_idx == 3:
+            if field_idx == 4:
                 if bstate & curses.BUTTON5_PRESSED:
                     size_idx = (size_idx + 1) % len(size_choices)
                 elif bstate & curses.BUTTON4_PRESSED:
@@ -1696,7 +1746,7 @@ def _interactive_args_curses(stdscr, color_override: bool | None = None) -> argp
             field_idx = max(0, field_idx - 1)
             continue
         if key in (curses.KEY_DOWN, ord("j"), ord("J")):
-            if field_idx == 3:
+            if field_idx == 4:
                 size_idx = (size_idx + 1) % len(size_choices)
             continue
         if key in (curses.KEY_LEFT, ord("h"), ord("H"), ord("a"), ord("A")):
@@ -1707,11 +1757,11 @@ def _interactive_args_curses(stdscr, color_override: bool | None = None) -> argp
                 model_idx = 0
             elif field_idx == 2:
                 model_idx = (model_idx - 1) % len(model_choices)
-            elif field_idx == 3:
-                size_idx = (size_idx - 1) % len(size_choices)
             elif field_idx == 4:
-                count_value = max(1, count_value - 1)
+                size_idx = (size_idx - 1) % len(size_choices)
             elif field_idx == 5:
+                count_value = max(1, count_value - 1)
+            elif field_idx == 6:
                 out_idx = (out_idx - 1) % len(OUT_DIR_CHOICES)
             continue
         if key in (curses.KEY_RIGHT, ord("l"), ord("L"), ord("d"), ord("D")):
@@ -1722,12 +1772,25 @@ def _interactive_args_curses(stdscr, color_override: bool | None = None) -> argp
                 model_idx = 0
             elif field_idx == 2:
                 model_idx = (model_idx + 1) % len(model_choices)
-            elif field_idx == 3:
-                size_idx = (size_idx + 1) % len(size_choices)
             elif field_idx == 4:
-                count_value = min(4, count_value + 1)
+                size_idx = (size_idx + 1) % len(size_choices)
             elif field_idx == 5:
+                count_value = min(4, count_value + 1)
+            elif field_idx == 6:
                 out_idx = (out_idx + 1) % len(OUT_DIR_CHOICES)
+            continue
+        if field_idx == 3 and key in (ord("n"), ord("N")):
+            default_prompt = DEFAULT_PROMPTS[0]
+            initial_text = ""
+            if prompt_text and prompt_text.strip() != default_prompt.strip():
+                initial_text = prompt_text
+            prompt_text = _prompt_prompt_curses(
+                stdscr,
+                default_prompt=default_prompt,
+                color_enabled=color_enabled,
+                initial_text=initial_text,
+            )
+            field_idx = 4
             continue
         if key in (10, 13, curses.KEY_ENTER, ord("\t")):
             if field_idx == 0:
@@ -1747,12 +1810,18 @@ def _interactive_args_curses(stdscr, color_override: bool | None = None) -> argp
                     continue
                 field_idx = 1
                 continue
-            if field_idx < 5:
+            if field_idx == 3:
+                if not prompt_text:
+                    prompt_text = DEFAULT_PROMPTS[0]
+                field_idx = 4
+                continue
+            if field_idx < 6:
                 field_idx += 1
                 continue
             return _build_interactive_namespace(
                 PROVIDER_CHOICES[provider_idx],
                 _model_choices_for(PROVIDER_CHOICES[provider_idx])[model_idx],
+                prompt_text,
                 _size_value_from_label(size_choices[size_idx]),
                 count_value,
                 OUT_DIR_CHOICES[out_idx],
@@ -4584,6 +4653,64 @@ def _show_final_recommendation_curses(
 
 
 
+def _prompt_prompt_curses(
+    stdscr,
+    *,
+    default_prompt: str,
+    color_enabled: bool,
+    initial_text: str | None = None,
+) -> str:
+    import curses
+    stdscr.erase()
+    height, width = stdscr.getmaxyx()
+    y = _draw_banner(stdscr, color_enabled, 1)
+    title = "Enter a prompt (press Enter to use the default prompt)."
+    _safe_addstr(stdscr, min(height - 2, y), 0, title[: max(0, width - 1)], curses.A_BOLD)
+    y = min(height - 2, y + 2)
+    default_line = _truncate_text(default_prompt, max(0, width - 1))
+    if default_line:
+        _safe_addstr(
+            stdscr,
+            min(height - 2, y),
+            0,
+            f"Default: {default_line}"[: max(0, width - 1)],
+            curses.A_DIM,
+        )
+        y = min(height - 2, y + 2)
+    input_y = min(height - 1, y + 1)
+    buffer = initial_text or ""
+    try:
+        curses.curs_set(1)
+    except curses.error:
+        pass
+    stdscr.timeout(-1)
+    while True:
+        stdscr.move(input_y, 0)
+        stdscr.clrtoeol()
+        display = buffer
+        max_len = max(1, width - 1)
+        if len(display) > max_len:
+            display = display[-max_len:]
+        _safe_addstr(stdscr, input_y, 0, display[: max(0, width - 1)])
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (10, 13, curses.KEY_ENTER):
+            break
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            buffer = buffer[:-1]
+            continue
+        if 32 <= key <= 126:
+            buffer += chr(key)
+            continue
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    stdscr.timeout(80)
+    text = buffer.strip()
+    return text or default_prompt
+
+
 def _prompt_freeform_curses(stdscr, prompt: str, *, color_enabled: bool) -> str:
     import curses
     stdscr.erase()
@@ -5365,6 +5492,64 @@ def _draw_count_line(
         except curses.error:
             pass
     return y + 2
+
+
+def _draw_prompt_line(
+    stdscr,
+    y: int,
+    label: str,
+    prompt_text: str,
+    default_prompt: str,
+    active: bool,
+    current_step: int,
+    step_index: int,
+    highlight_pair: int,
+    done_pair: int,
+    color_enabled: bool,
+    hint_text: str | None = None,
+) -> int:
+    import curses
+    height, width = stdscr.getmaxyx()
+    if y >= height - 1:
+        return y
+    is_done = step_index < current_step
+    label_attr = curses.A_BOLD if active else (curses.A_NORMAL if is_done else curses.A_DIM)
+    prefix = "-> " if active else ("✓  " if is_done else "   ")
+    try:
+        stdscr.addstr(y, 0, f"{prefix}{label}:"[: width - 1], label_attr)
+    except curses.error:
+        return y + 1
+    y += 1
+    display = prompt_text.strip() if prompt_text else ""
+    if display and default_prompt and display == default_prompt.strip():
+        display = "(default prompt)"
+    if not display:
+        display = "(default prompt)"
+    token = _truncate_text(display, max(1, width - 5))
+    if active:
+        if color_enabled and highlight_pair:
+            attr = curses.color_pair(highlight_pair) | curses.A_BOLD
+        else:
+            attr = curses.A_REVERSE
+    elif is_done:
+        if color_enabled and done_pair:
+            attr = curses.color_pair(done_pair) | curses.A_BOLD
+        else:
+            attr = curses.A_BOLD
+    else:
+        attr = curses.A_DIM
+    _safe_addstr(stdscr, y, 4, token, attr)
+    y += 1
+    if hint_text and active:
+        _safe_addstr(
+            stdscr,
+            y,
+            4,
+            _truncate_text(hint_text, max(1, width - 5)),
+            curses.A_DIM,
+        )
+        y += 1
+    return y + 1
 
 
 def _visible_indices(
@@ -6172,6 +6357,22 @@ def _is_anthropic_rate_limit_error(exc: Exception) -> bool:
     )
 
 
+def _is_anthropic_image_size_error(exc: Exception) -> bool:
+    lowered = str(exc).lower()
+    if "image" not in lowered:
+        return False
+    size_hits = (
+        "size" in lowered
+        or "too large" in lowered
+        or "exceed" in lowered
+        or "maximum" in lowered
+        or "max_image" in lowered
+    )
+    if not size_hits:
+        return False
+    return "5mb" in lowered or "5 mb" in lowered or "image" in lowered
+
+
 def _call_analyzer(
     prompt: str,
     *,
@@ -6204,7 +6405,7 @@ def _call_analyzer(
             image_mime=image_mime,
         )
     except Exception as exc:
-        if _is_anthropic_rate_limit_error(exc):
+        if _is_anthropic_rate_limit_error(exc) or _is_anthropic_image_size_error(exc):
             openai_prompt = fallback_prompt or prompt
             return _call_openai(
                 openai_prompt,
