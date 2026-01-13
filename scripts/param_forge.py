@@ -24,6 +24,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 import getpass
@@ -1774,6 +1775,8 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
         "exit_code": 0,
         "ran": False,
         "error": None,
+        "view_ready": False,
+        "view_out_dir": None,
     }
 
     def _curses_flow(stdscr) -> None:
@@ -1796,6 +1799,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
         if args is None:
             result["exit_code"] = 1
             return
+        result["view_out_dir"] = Path(args.out)
         args.analyzer = _resolve_receipt_analyzer(getattr(args, "analyzer", None))
         try:
             _load_repo_dotenv()
@@ -2203,6 +2207,8 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                 history_lines,
                 pending_rationale,
             )
+            if receipts:
+                result["view_ready"] = True
             pending_rationale = None
             if history_block:
                 if history_lines:
@@ -2504,6 +2510,8 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
         print(f"Setup failed: {result['error']}")
     if result.get("open_path"):
         _open_path(Path(result["open_path"]))  # type: ignore[arg-type]
+    if result.get("view_ready") and result.get("view_out_dir"):
+        _maybe_open_viewer(Path(result["view_out_dir"]))  # type: ignore[arg-type]
     return int(result.get("exit_code", 0))
 
 
@@ -2520,7 +2528,10 @@ def _run_raw_fallback(reason: str | None, color_override: bool | None) -> int:
     except Exception as exc:
         print(f"Raw prompt failed ({exc}). Falling back to simple prompts.")
         args = _interactive_args_simple()
-    return _run_generation(args)
+    exit_code = _run_generation(args)
+    if exit_code == 0:
+        _maybe_open_viewer(Path(args.out))
+    return exit_code
 
 
 def _safe_addstr(stdscr, y: int, x: int, text: str, attr: int = 0) -> None:
@@ -3183,8 +3194,8 @@ def _score_image_with_council(
     ):
         return None, None
     score_prompt = (
-        "You are a strict image evaluator. Given the prompt and the generated image, "
-        "rate prompt adherence and overall image quality. "
+        "Given the prompt and the generated image, evaluate how a group of appropriate judges would rate "
+        "the adherence of the generated image to the given prompt and the quality of the image. "
         "Return ONLY JSON like: {\"adherence\": 0-100, \"quality\": 0-100}. "
         "Use integers. No extra text.\n\n"
         f"Prompt:\n{prompt}"
@@ -3537,6 +3548,62 @@ def _write_image_quality_metadata(
         return
 
 
+def _write_render_metadata(receipt_path: Path, elapsed: float | None) -> None:
+    if elapsed is None:
+        return
+    try:
+        payload = _load_receipt_payload(receipt_path)
+    except Exception:
+        return
+    if not isinstance(payload, dict):
+        return
+    meta = payload.get("result_metadata")
+    if not isinstance(meta, dict):
+        meta = {}
+        payload["result_metadata"] = meta
+    if "render_seconds" not in meta:
+        try:
+            meta["render_seconds"] = float(elapsed)
+        except Exception:
+            return
+    try:
+        receipt_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        return
+
+
+def _write_llm_scores_metadata(
+    receipt_path: Path,
+    adherence: int | None,
+    quality: int | None,
+    *,
+    model: str = "council",
+    version: str = "v1",
+) -> None:
+    if adherence is None and quality is None:
+        return
+    try:
+        payload = _load_receipt_payload(receipt_path)
+    except Exception:
+        return
+    if not isinstance(payload, dict):
+        return
+    meta = payload.get("result_metadata")
+    if not isinstance(meta, dict):
+        meta = {}
+        payload["result_metadata"] = meta
+    scores: dict[str, object] = {"model": model, "version": version}
+    if adherence is not None:
+        scores["adherence"] = int(adherence)
+    if quality is not None:
+        scores["quality"] = int(quality)
+    meta["llm_scores"] = scores
+    try:
+        receipt_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        return
+
+
 def _load_retrieval_score(receipt_path: Path) -> int | None:
     try:
         payload = _load_receipt_payload(receipt_path)
@@ -3580,6 +3647,7 @@ def _apply_snapshot_for_result(
         model=str(model) if model else None,
         size=str(size) if size else None,
     )
+    _write_render_metadata(receipt_path, elapsed)
     quality_metrics: dict[str, object] = {}
     quality_gates: list[str] = []
     try:
@@ -3601,6 +3669,7 @@ def _apply_snapshot_for_result(
         image_base64=image_base64,
         image_mime=image_mime,
     )
+    _write_llm_scores_metadata(receipt_path, adherence, quality)
     retrieval_payload = None
     retrieval_score = None
     retrieval_note = None
@@ -4491,7 +4560,7 @@ def _show_final_recommendation_curses(
                 prefix = "Change: " if not diff.startswith("Change:") else ""
                 for line in _wrap_text(f"{prefix}{diff}", max_width):
                     lines.append((line, "change"))
-    footer_line = "Open receipt (o) • Press Q or Enter to exit"
+    footer_line = "Open receipt viewer (o) • Press Q or Enter to exit"
     open_keys = {ord("o"), ord("O")} if receipt_path else None
     hotkeys = None
     if receipt_path:
@@ -4508,7 +4577,7 @@ def _show_final_recommendation_curses(
             open_keys=open_keys,
         )
         if action == "open" and receipt_path:
-            _open_path(receipt_path)
+            _maybe_open_viewer(receipt_path.parent)
             continue
         break
 
@@ -6056,7 +6125,9 @@ def _call_council(
         chair_instructions = [
             "You are the council chair. Synthesize the best final response.",
             "Follow the original instructions EXACTLY: output ONLY the final response in the required 4-line format plus <setting_json>.",
-            "Prefer step-change recommendations over incremental tweaks and honor the user goals.",
+            "Prefer changes likely to result in a 10x improvement to the metrics attached to the user's stated goals.",
+            "Avoid tiny deltas (e.g., steps 20→30) unless they unlock a major improvement.",
+            "Honor the user goals.",
     ]
     council_sections: list[str] = [
         *chair_instructions,
@@ -6194,6 +6265,9 @@ def _build_receipt_analysis_prompt(
     current_round: int = 1,
     max_rounds: int = MAX_ROUNDS,
 ) -> str:
+    top_level_candidates = ("size", "n", "seed", "output_format", "background", "model")
+    top_level_allowed = [key for key in top_level_candidates if key in allowed_settings]
+    top_level_hint = ", ".join(top_level_allowed) if top_level_allowed else "size, n, seed, output_format, model"
     explicit_lines = "\n".join(f"- {key}: {value}" for key, value in explicit_fields.items())
     allowed_line = ", ".join(allowed_settings) if allowed_settings else "(none)"
     goals_line = ", ".join(user_goals) if user_goals else "(not specified)"
@@ -6228,18 +6302,17 @@ def _build_receipt_analysis_prompt(
         )
     remaining_rounds = max(0, max_rounds - current_round)
     return (
-        "You are an expert image-generation assistant. An image output is attached. "
+        "Simulate many runs of this prompt given the image attached with bleeding-edge vision analysis. "
         "Respond with EXACTLY four lines labeled ADH, UNSET, COST, REC, then a <setting_json> block. "
         "No tables, no markdown, no bullet points. "
-        "Total response INCLUDING <setting_json> must be <=500 characters.\n\n"
-        "ADH: brief prompt adherence summary (1 sentence).\n"
-        "UNSET: list 2–4 most important unset params (short list).\n"
+        "ADH: brief prompt adherence summary (1 sentence), comparing the image to the prompt as written.\n"
+        "UNSET: list 2–4 most important unset params, given the user's selected goals.\n"
         "COST: estimated USD cost per 1K images for this provider/model (short).\n"
-        "REC: 1–3 short recommendations aligned to user goals. "
+        "REC: 1–3 unconventional recommendations aligned to user goals. "
         "If speed is a priority, you may suggest unconventional levers (e.g., output format/filetype, "
         "compression, or size tradeoffs) in addition to standard settings. "
-        "Prefer step-change recommendations over incremental tweaks (avoid tiny deltas like steps 20→30); "
-        "think big and unconventional when it helps meet the goals.\n"
+        "Prefer changes likely to result in a 10x improvement to the metrics attached to the user's stated goals "
+        "(avoid tiny deltas like steps 20→30); think big and unconventional when it helps meet the goals.\n"
         f"You have at most {max_rounds} total rounds. This is round {current_round}; "
         f"{remaining_rounds} round(s) remain after this. "
         "Plan a coherent testing path and avoid flip-flopping settings (e.g., jpeg→png→jpeg) unless there's a strong reason.\n\n"
@@ -6258,10 +6331,10 @@ def _build_receipt_analysis_prompt(
         f"{history_block}"
         f"{model_block}"
         f"Allowed settings for recommendations (API settings for this model): {allowed_line}\n"
+        "Do NOT recommend or list settings outside the allowed list.\n"
         "Model changes must stay within the same provider and use the listed model options.\n"
         "Use setting_target='provider_options' for provider-specific options, "
-        "and setting_target='request' for top-level settings like size, n, seed, "
-        "output_format, background, or model.\n\n"
+        f"and setting_target='request' for top-level settings like {top_level_hint}.\n\n"
         "At the end, output a JSON array (max 3 items) wrapped in <setting_json>...</setting_json> "
         "with objects that include keys: setting_name, setting_value, setting_target, rationale. "
         "If no safe recommendation, output an empty array.\n\n"
@@ -6284,6 +6357,9 @@ def _build_recommendation_only_prompt(
     current_round: int = 1,
     max_rounds: int = MAX_ROUNDS,
 ) -> str:
+    top_level_candidates = ("size", "n", "seed", "output_format", "background", "model")
+    top_level_allowed = [key for key in top_level_candidates if key in allowed_settings]
+    top_level_hint = ", ".join(top_level_allowed) if top_level_allowed else "size, n, seed, output_format, model"
     allowed_line = ", ".join(allowed_settings) if allowed_settings else "(none)"
     model_label = model or "(default)"
     goals_line = ", ".join(user_goals) if user_goals else "(not specified)"
@@ -6309,7 +6385,7 @@ def _build_recommendation_only_prompt(
         )
     remaining_rounds = max(0, max_rounds - current_round)
     return (
-        "You are an expert image-generation assistant. "
+        "Simulate many runs of this prompt given the image attached with bleeding-edge vision analysis. "
         "Based on the receipt summary, recommend 1–3 API setting changes to improve prompt adherence. "
         "Only choose from the allowed settings list. "
         "Output ONLY a JSON array wrapped in <setting_json>...</setting_json> with objects that include keys: "
@@ -6329,8 +6405,8 @@ def _build_recommendation_only_prompt(
         f"{model_block}"
         "If speed is a priority, consider unconventional levers (e.g., output format/filetype, "
         "compression, or size tradeoffs) but still choose from the allowed list. "
-        "Prefer step-change recommendations over incremental tweaks (avoid tiny deltas like steps 20→30); "
-        "think big and unconventional when it helps meet the goals.\n"
+        "Prefer changes likely to result in a 10x improvement to the metrics attached to the user's stated goals "
+        "(avoid tiny deltas like steps 20→30); think big and unconventional when it helps meet the goals.\n"
         "If cost/time goals are selected, treat them as primary and only pursue quality improvements "
         "that do not materially worsen cost/time.\n"
         f"You have at most {max_rounds} total rounds. This is round {current_round}; "
@@ -6338,9 +6414,9 @@ def _build_recommendation_only_prompt(
         "Plan a coherent testing path and avoid flip-flopping settings unless there's a strong reason.\n"
         "Model changes must stay within the same provider and use the listed model options.\n"
         "Use setting_target='provider_options' for provider-specific options, "
-        "and setting_target='request' for top-level settings like size, n, seed, "
-        "output_format, background, or model.\n"
-        f"Allowed settings: {allowed_line}\n\n"
+        f"and setting_target='request' for top-level settings like {top_level_hint}.\n"
+        f"Allowed settings: {allowed_line}\n"
+        "Do NOT recommend or list settings outside the allowed list.\n\n"
         f"Receipt summary JSON:\n{summary_json}"
     )
 
@@ -6639,6 +6715,1069 @@ def _open_path(path: Path) -> None:
         pass
 
 
+_VIEWER_TEMPLATE = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Param Forge Viewer</title>
+    <style>
+      :root {
+        --ink: #121212;
+        --muted: #6b645f;
+        --paper: #f6f1e8;
+        --paper-2: #fbfaf7;
+        --card: #ffffff;
+        --accent: #ff6b3d;
+        --accent-2: #2aa7a1;
+        --accent-3: #f2c14e;
+        --shadow: rgba(16, 16, 16, 0.12);
+        --border: rgba(18, 18, 18, 0.08);
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: "Space Grotesk", "Avenir Next", "Futura", sans-serif;
+        color: var(--ink);
+        background: radial-gradient(circle at top, #f9ede2 0%, var(--paper) 45%, #f1f7f4 100%);
+      }
+      .page {
+        max-width: 1400px;
+        margin: 0 auto;
+        padding: 32px 24px 64px;
+      }
+      header.hero {
+        padding: 24px 28px;
+        border-radius: 20px;
+        background: linear-gradient(120deg, #fff2e8 0%, #f7fff7 50%, #f1f5ff 100%);
+        box-shadow: 0 16px 40px -28px rgba(0, 0, 0, 0.3);
+        border: 1px solid rgba(255, 107, 61, 0.12);
+      }
+      header.hero h1 {
+        margin: 0 0 8px;
+        font-size: 28px;
+        letter-spacing: -0.02em;
+      }
+      header.hero .meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 16px;
+        font-size: 14px;
+        color: var(--muted);
+      }
+      .pill {
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: rgba(18, 18, 18, 0.06);
+        border: 1px solid var(--border);
+      }
+      .toolbar {
+        display: grid;
+        grid-template-columns: minmax(220px, 1fr) minmax(240px, 1fr) minmax(220px, 1fr);
+        gap: 16px;
+        margin: 20px 0 12px;
+      }
+      .panel {
+        background: var(--paper-2);
+        border-radius: 16px;
+        border: 1px solid var(--border);
+        padding: 12px 14px;
+        box-shadow: 0 10px 24px -18px var(--shadow);
+      }
+      .panel h3 {
+        margin: 0 0 8px;
+        font-size: 13px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+      }
+      .panel input[type="text"] {
+        width: 100%;
+        padding: 10px 12px;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        background: #fff;
+        font-size: 14px;
+      }
+      .toggle-row {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+        font-size: 13px;
+      }
+      .toggle-row label {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        cursor: pointer;
+      }
+      .filter-list {
+        max-height: 160px;
+        overflow: auto;
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 6px;
+      }
+      .filter-list label {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        font-size: 13px;
+      }
+      .compare {
+        margin: 18px 0 24px;
+        padding: 16px;
+        background: #fff;
+        border-radius: 18px;
+        border: 1px solid var(--border);
+        box-shadow: 0 18px 30px -26px rgba(0, 0, 0, 0.3);
+      }
+      .compare h2 {
+        margin: 0 0 12px;
+        font-size: 16px;
+      }
+      .compare-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 14px;
+      }
+      .compare-card {
+        background: var(--paper-2);
+        border-radius: 14px;
+        border: 1px solid var(--border);
+        padding: 10px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .compare-card img {
+        width: 100%;
+        border-radius: 10px;
+        object-fit: cover;
+      }
+      .grid-wrap {
+        overflow: auto;
+        border-radius: 18px;
+        border: 1px solid var(--border);
+        background: #fff;
+        box-shadow: 0 18px 32px -26px rgba(0, 0, 0, 0.35);
+      }
+      table.grid {
+        width: 100%;
+        border-collapse: separate;
+        border-spacing: 0;
+        min-width: 920px;
+      }
+      table.grid th,
+      table.grid td {
+        border-bottom: 1px solid var(--border);
+        vertical-align: top;
+        padding: 12px;
+      }
+      table.grid thead th {
+        position: sticky;
+        top: 0;
+        background: #fff;
+        z-index: 5;
+        text-align: left;
+        font-size: 13px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+      }
+      table.grid tbody th {
+        position: sticky;
+        left: 0;
+        background: #fff;
+        z-index: 4;
+        width: 280px;
+        max-width: 280px;
+      }
+      .prompt-text {
+        font-size: 13px;
+        line-height: 1.4;
+      }
+      .prompt-meta {
+        margin-top: 8px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+      .card {
+        background: var(--paper-2);
+        border-radius: 14px;
+        border: 1px solid var(--border);
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        min-height: 240px;
+        animation: rise 0.4s ease;
+      }
+      .card.selected {
+        border-color: var(--accent);
+        box-shadow: 0 12px 28px -18px rgba(255, 107, 61, 0.7);
+      }
+      .card.winner {
+        border-color: var(--accent-2);
+        box-shadow: 0 12px 28px -18px rgba(42, 167, 161, 0.7);
+      }
+      .card img {
+        width: 100%;
+        height: 180px;
+        object-fit: cover;
+        display: block;
+      }
+      .card-body {
+        padding: 10px 12px 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .badges {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+      .badge {
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: rgba(18, 18, 18, 0.08);
+        font-size: 11px;
+      }
+      .badge.accent { background: rgba(255, 107, 61, 0.18); }
+      .badge.teal { background: rgba(42, 167, 161, 0.18); }
+      .badge.yellow { background: rgba(242, 193, 78, 0.25); }
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      .btn {
+        border: none;
+        padding: 6px 10px;
+        border-radius: 8px;
+        background: var(--accent);
+        color: #fff;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      .btn.ghost {
+        background: rgba(18, 18, 18, 0.08);
+        color: var(--ink);
+      }
+      .cell-empty {
+        font-size: 12px;
+        color: var(--muted);
+        padding: 16px;
+      }
+      .nav-row {
+        display: flex;
+        justify-content: space-between;
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .nav-row button {
+        background: transparent;
+        border: none;
+        cursor: pointer;
+        font-size: 12px;
+      }
+      .toast {
+        position: fixed;
+        right: 20px;
+        top: 20px;
+        padding: 10px 14px;
+        border-radius: 10px;
+        background: rgba(18, 18, 18, 0.92);
+        color: #fff;
+        font-size: 13px;
+        opacity: 0;
+        transform: translateY(-10px);
+        transition: all 0.2s ease;
+        pointer-events: none;
+        z-index: 99;
+      }
+      .toast.show {
+        opacity: 1;
+        transform: translateY(0);
+      }
+      @keyframes rise {
+        from { opacity: 0; transform: translateY(6px); }
+        to { opacity: 1; transform: translateY(0); }
+      }
+      @media (max-width: 960px) {
+        .toolbar { grid-template-columns: 1fr; }
+        table.grid tbody th { width: 220px; max-width: 220px; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <header class="hero">
+        <h1 id="run-title">Param Forge Viewer</h1>
+        <div class="meta" id="run-meta"></div>
+      </header>
+      <div class="toolbar">
+        <div class="panel">
+          <h3>Search</h3>
+          <input id="prompt-search" type="text" placeholder="Filter prompts..." />
+        </div>
+        <div class="panel">
+          <h3>Focus</h3>
+          <div class="toggle-row">
+            <label><input id="toggle-winners" type="checkbox" /> Winners only</label>
+            <label><input id="toggle-flags" type="checkbox" /> Flags only</label>
+          </div>
+        </div>
+        <div class="panel">
+          <h3>Models</h3>
+          <div class="filter-list" id="column-filters"></div>
+        </div>
+      </div>
+      <section class="compare">
+        <h2>Side-by-side compare</h2>
+        <div class="compare-grid" id="compare-grid">
+          <div class="cell-empty">Pick up to 4 cards to compare.</div>
+        </div>
+      </section>
+      <section class="grid-wrap">
+        <table class="grid">
+          <thead id="grid-head"></thead>
+          <tbody id="grid-body"></tbody>
+        </table>
+      </section>
+    </div>
+    <div class="toast" id="toast"></div>
+    <script>
+      const PF_DATA = __DATA__;
+      const state = {
+        search: "",
+        winnersOnly: false,
+        flagsOnly: false,
+        visibleColumns: new Set(),
+        compare: [],
+        winners: {},
+        cellCursor: {}
+      };
+      const variantsById = new Map();
+      const cellIndex = {};
+      const storageKey = `pf_winners_${PF_DATA.run.id || "default"}`;
+
+      function loadWinners() {
+        try {
+          const raw = localStorage.getItem(storageKey);
+          if (raw) {
+            state.winners = JSON.parse(raw);
+          }
+        } catch (err) {
+          state.winners = {};
+        }
+      }
+
+      function saveWinners() {
+        try {
+          localStorage.setItem(storageKey, JSON.stringify(state.winners));
+        } catch (err) {
+          /* ignore */
+        }
+      }
+
+      function toast(message) {
+        const node = document.getElementById("toast");
+        node.textContent = message;
+        node.classList.add("show");
+        setTimeout(() => node.classList.remove("show"), 1400);
+      }
+
+      function copyText(text) {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(() => toast("Copied."));
+          return;
+        }
+        const textarea = document.createElement("textarea");
+        textarea.value = text;
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand("copy");
+        document.body.removeChild(textarea);
+        toast("Copied.");
+      }
+
+      function buildIndex() {
+        PF_DATA.variants.forEach((variant) => {
+          variantsById.set(variant.id, variant);
+          if (!cellIndex[variant.prompt_id]) {
+            cellIndex[variant.prompt_id] = {};
+          }
+          if (!cellIndex[variant.prompt_id][variant.column_key]) {
+            cellIndex[variant.prompt_id][variant.column_key] = [];
+          }
+          cellIndex[variant.prompt_id][variant.column_key].push(variant);
+        });
+      }
+
+      function formatSeconds(value) {
+        if (value === null || value === undefined) return "N/A";
+        return `${value.toFixed(1)}s`;
+      }
+
+      function formatCost(cost) {
+        if (!cost) return "N/A";
+        return cost;
+      }
+
+      function renderMeta() {
+        const meta = document.getElementById("run-meta");
+        meta.innerHTML = "";
+        const totalImages = PF_DATA.variants.length;
+        const totalCost = PF_DATA.variants.reduce((sum, v) => sum + (v.cost_usd || 0), 0);
+        const totalLatency = PF_DATA.variants.reduce((sum, v) => sum + (v.render_seconds_per_image || 0), 0);
+        const avgLatency = totalImages ? totalLatency / totalImages : null;
+        const items = [
+          `Run: ${PF_DATA.run.id || "local"}`,
+          `Prompts: ${PF_DATA.prompts.length}`,
+          `Models: ${PF_DATA.columns.length}`,
+          `Images: ${totalImages}`,
+          `Est. cost: $${totalCost.toFixed(2)}`,
+          `Avg latency: ${avgLatency ? avgLatency.toFixed(1) + "s" : "N/A"}`
+        ];
+        items.forEach((item) => {
+          const pill = document.createElement("div");
+          pill.className = "pill";
+          pill.textContent = item;
+          meta.appendChild(pill);
+        });
+        const title = document.getElementById("run-title");
+        title.textContent = PF_DATA.run.title || "Param Forge Viewer";
+      }
+
+      function renderColumnFilters() {
+        const container = document.getElementById("column-filters");
+        container.innerHTML = "";
+        PF_DATA.columns.forEach((column) => {
+          const label = document.createElement("label");
+          const checkbox = document.createElement("input");
+          checkbox.type = "checkbox";
+          checkbox.checked = state.visibleColumns.has(column.key);
+          checkbox.addEventListener("change", () => {
+            if (checkbox.checked) {
+              state.visibleColumns.add(column.key);
+            } else {
+              state.visibleColumns.delete(column.key);
+            }
+            renderGrid();
+          });
+          label.appendChild(checkbox);
+          const text = document.createElement("span");
+          text.textContent = column.label;
+          label.appendChild(text);
+          container.appendChild(label);
+        });
+      }
+
+      function buildBadge(label, className) {
+        const badge = document.createElement("span");
+        badge.className = `badge ${className || ""}`.trim();
+        badge.textContent = label;
+        return badge;
+      }
+
+      function buildCard(variant, prompt) {
+        const card = document.createElement("div");
+        card.className = "card";
+        if (state.compare.includes(variant.id)) {
+          card.classList.add("selected");
+        }
+        if (state.winners[prompt.id] === variant.id) {
+          card.classList.add("winner");
+        }
+        const image = document.createElement("img");
+        image.src = variant.image_src;
+        image.alt = variant.prompt || "generated image";
+        image.loading = "lazy";
+        image.addEventListener("click", () => window.open(variant.image_src, "_blank"));
+        card.appendChild(image);
+
+        const body = document.createElement("div");
+        body.className = "card-body";
+
+        const navRow = document.createElement("div");
+        navRow.className = "nav-row";
+        if (variant.variant_total && variant.variant_total > 1) {
+          const prev = document.createElement("button");
+          prev.textContent = "prev";
+          prev.addEventListener("click", () => shiftVariant(prompt.id, variant.column_key, -1));
+          const next = document.createElement("button");
+          next.textContent = "next";
+          next.addEventListener("click", () => shiftVariant(prompt.id, variant.column_key, 1));
+          const index = document.createElement("span");
+          index.textContent = `${variant.variant_index + 1}/${variant.variant_total}`;
+          navRow.appendChild(prev);
+          navRow.appendChild(index);
+          navRow.appendChild(next);
+          body.appendChild(navRow);
+        }
+
+        const badges = document.createElement("div");
+        badges.className = "badges";
+        badges.appendChild(buildBadge(`cost ${formatCost(variant.cost_per_1k)}`, "accent"));
+        badges.appendChild(buildBadge(`render ${formatSeconds(variant.render_seconds_per_image)}`, "teal"));
+        if (variant.adherence !== null && variant.adherence !== undefined) {
+          badges.appendChild(buildBadge(`adh ${variant.adherence}`, "yellow"));
+        }
+        if (variant.quality !== null && variant.quality !== undefined) {
+          badges.appendChild(buildBadge(`qual ${variant.quality}`, "yellow"));
+        }
+        if (variant.retrieval_score !== null && variant.retrieval_score !== undefined) {
+          badges.appendChild(buildBadge(`retr ${variant.retrieval_score}`, "yellow"));
+        }
+        if (variant.flags && variant.flags.length) {
+          badges.appendChild(buildBadge("flag", "accent"));
+        }
+        body.appendChild(badges);
+
+        const actions = document.createElement("div");
+        actions.className = "actions";
+        const copyBtn = document.createElement("button");
+        copyBtn.className = "btn";
+        copyBtn.textContent = "Copy snippet";
+        copyBtn.addEventListener("click", () => copyText(variant.snippet));
+        const compareBtn = document.createElement("button");
+        compareBtn.className = "btn ghost";
+        compareBtn.textContent = state.compare.includes(variant.id) ? "Remove" : "Compare";
+        compareBtn.addEventListener("click", () => toggleCompare(variant.id));
+        const winnerBtn = document.createElement("button");
+        winnerBtn.className = "btn ghost";
+        winnerBtn.textContent = state.winners[prompt.id] === variant.id ? "Winner" : "Pick winner";
+        winnerBtn.addEventListener("click", () => pickWinner(prompt.id, variant.id));
+        const receiptBtn = document.createElement("button");
+        receiptBtn.className = "btn ghost";
+        receiptBtn.textContent = "Receipt";
+        receiptBtn.addEventListener("click", () => window.open(variant.receipt_src, "_blank"));
+        actions.appendChild(copyBtn);
+        actions.appendChild(compareBtn);
+        actions.appendChild(winnerBtn);
+        actions.appendChild(receiptBtn);
+        body.appendChild(actions);
+
+        card.appendChild(body);
+        return card;
+      }
+
+      function renderGrid() {
+        const head = document.getElementById("grid-head");
+        const body = document.getElementById("grid-body");
+        head.innerHTML = "";
+        body.innerHTML = "";
+        const visibleColumns = PF_DATA.columns.filter((col) => state.visibleColumns.has(col.key));
+
+        const headRow = document.createElement("tr");
+        const corner = document.createElement("th");
+        corner.textContent = "Prompt";
+        headRow.appendChild(corner);
+        visibleColumns.forEach((col) => {
+          const th = document.createElement("th");
+          th.textContent = col.label;
+          headRow.appendChild(th);
+        });
+        head.appendChild(headRow);
+
+        PF_DATA.prompts.forEach((prompt) => {
+          if (state.search && !prompt.text.toLowerCase().includes(state.search)) {
+            return;
+          }
+          const row = document.createElement("tr");
+          const promptCell = document.createElement("th");
+          const promptText = document.createElement("div");
+          promptText.className = "prompt-text";
+          promptText.textContent = prompt.text;
+          promptCell.appendChild(promptText);
+          const promptMeta = document.createElement("div");
+          promptMeta.className = "prompt-meta";
+          if (state.winners[prompt.id]) {
+            promptMeta.appendChild(buildBadge("winner picked", "teal"));
+          }
+          promptCell.appendChild(promptMeta);
+          row.appendChild(promptCell);
+
+          visibleColumns.forEach((column) => {
+            const cell = document.createElement("td");
+            const variants = (cellIndex[prompt.id] || {})[column.key] || [];
+            if (!variants.length) {
+              const empty = document.createElement("div");
+              empty.className = "cell-empty";
+              empty.textContent = "—";
+              cell.appendChild(empty);
+              row.appendChild(cell);
+              return;
+            }
+            let filtered = variants;
+            if (state.flagsOnly) {
+              filtered = variants.filter((variant) => variant.flags && variant.flags.length);
+            }
+            if (state.winnersOnly) {
+              filtered = variants.filter((variant) => state.winners[prompt.id] === variant.id);
+            }
+            if (!filtered.length) {
+              const empty = document.createElement("div");
+              empty.className = "cell-empty";
+              empty.textContent = "filtered";
+              cell.appendChild(empty);
+              row.appendChild(cell);
+              return;
+            }
+            const key = `${prompt.id}::${column.key}`;
+            let idx = state.cellCursor[key] || 0;
+            if (idx >= filtered.length) idx = 0;
+            state.cellCursor[key] = idx;
+            const variant = filtered[idx];
+            variant.variant_index = idx;
+            variant.variant_total = filtered.length;
+            cell.appendChild(buildCard(variant, prompt));
+            row.appendChild(cell);
+          });
+          body.appendChild(row);
+        });
+      }
+
+      function renderCompare() {
+        const grid = document.getElementById("compare-grid");
+        grid.innerHTML = "";
+        if (!state.compare.length) {
+          const empty = document.createElement("div");
+          empty.className = "cell-empty";
+          empty.textContent = "Pick up to 4 cards to compare.";
+          grid.appendChild(empty);
+          return;
+        }
+        state.compare.forEach((id) => {
+          const variant = variantsById.get(id);
+          if (!variant) return;
+          const card = document.createElement("div");
+          card.className = "compare-card";
+          const img = document.createElement("img");
+          img.src = variant.image_src;
+          img.alt = variant.prompt || "comparison image";
+          card.appendChild(img);
+          const badges = document.createElement("div");
+          badges.className = "badges";
+          badges.appendChild(buildBadge(variant.column_label, "accent"));
+          badges.appendChild(buildBadge(`cost ${formatCost(variant.cost_per_1k)}`, "accent"));
+          badges.appendChild(buildBadge(`render ${formatSeconds(variant.render_seconds_per_image)}`, "teal"));
+          card.appendChild(badges);
+          const actions = document.createElement("div");
+          actions.className = "actions";
+          const copyBtn = document.createElement("button");
+          copyBtn.className = "btn";
+          copyBtn.textContent = "Copy snippet";
+          copyBtn.addEventListener("click", () => copyText(variant.snippet));
+          const removeBtn = document.createElement("button");
+          removeBtn.className = "btn ghost";
+          removeBtn.textContent = "Remove";
+          removeBtn.addEventListener("click", () => toggleCompare(id));
+          actions.appendChild(copyBtn);
+          actions.appendChild(removeBtn);
+          card.appendChild(actions);
+          grid.appendChild(card);
+        });
+      }
+
+      function toggleCompare(id) {
+        const idx = state.compare.indexOf(id);
+        if (idx >= 0) {
+          state.compare.splice(idx, 1);
+        } else {
+          if (state.compare.length >= 4) {
+            toast("Compare tray is full.");
+            return;
+          }
+          state.compare.push(id);
+        }
+        renderCompare();
+        renderGrid();
+      }
+
+      function pickWinner(promptId, variantId) {
+        if (state.winners[promptId] === variantId) {
+          delete state.winners[promptId];
+          toast("Winner cleared.");
+        } else {
+          state.winners[promptId] = variantId;
+          toast("Winner saved.");
+        }
+        saveWinners();
+        renderGrid();
+      }
+
+      function shiftVariant(promptId, columnKey, direction) {
+        const key = `${promptId}::${columnKey}`;
+        const list = (cellIndex[promptId] || {})[columnKey] || [];
+        if (!list.length) return;
+        const current = state.cellCursor[key] || 0;
+        const next = (current + direction + list.length) % list.length;
+        state.cellCursor[key] = next;
+        renderGrid();
+      }
+
+      function attachHandlers() {
+        const search = document.getElementById("prompt-search");
+        search.addEventListener("input", (event) => {
+          state.search = event.target.value.toLowerCase();
+          renderGrid();
+        });
+        document.getElementById("toggle-winners").addEventListener("change", (event) => {
+          state.winnersOnly = event.target.checked;
+          renderGrid();
+        });
+        document.getElementById("toggle-flags").addEventListener("change", (event) => {
+          state.flagsOnly = event.target.checked;
+          renderGrid();
+        });
+      }
+
+      function init() {
+        PF_DATA.columns.forEach((column) => state.visibleColumns.add(column.key));
+        loadWinners();
+        buildIndex();
+        renderMeta();
+        renderColumnFilters();
+        renderGrid();
+        renderCompare();
+        attachHandlers();
+      }
+
+      init();
+    </script>
+  </body>
+</html>
+"""
+
+
+def _view_parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except Exception:
+        return None
+
+
+def _view_seconds_between(start: str | None, end: str | None) -> float | None:
+    start_dt = _view_parse_iso(start)
+    end_dt = _view_parse_iso(end)
+    if not start_dt or not end_dt:
+        return None
+    try:
+        return max(0.0, (end_dt - start_dt).total_seconds())
+    except Exception:
+        return None
+
+
+def _view_rel_path(path: Path, base: Path) -> str:
+    try:
+        rel = os.path.relpath(path, base)
+        return Path(rel).as_posix()
+    except Exception:
+        return Path(path).as_posix()
+
+
+def _view_build_snippet(receipt: dict) -> str:
+    request = receipt.get("request") if isinstance(receipt.get("request"), dict) else {}
+    resolved = receipt.get("resolved") if isinstance(receipt.get("resolved"), dict) else {}
+    prompt = str(request.get("prompt") or resolved.get("prompt") or "")
+    provider = resolved.get("provider") or request.get("provider") or "openai"
+    model = resolved.get("model") or request.get("model")
+    size = resolved.get("size") or request.get("size") or "1024x1024"
+    n = resolved.get("n") or request.get("n") or 1
+    seed = resolved.get("seed") or request.get("seed")
+    output_format = resolved.get("output_format") or request.get("output_format")
+    background = resolved.get("background") or request.get("background")
+    mode = request.get("mode") or "generate"
+    inputs = request.get("inputs") if isinstance(request.get("inputs"), dict) else {}
+    provider_options = {}
+    if isinstance(request.get("provider_options"), dict) and request.get("provider_options"):
+        provider_options = dict(request.get("provider_options") or {})
+    elif isinstance(resolved.get("provider_params"), dict):
+        provider_options = dict(resolved.get("provider_params") or {})
+    for key in ("size", "output_format", "background", "n", "seed", "model", "prompt"):
+        provider_options.pop(key, None)
+    provider_options = {k: provider_options[k] for k in sorted(provider_options) if provider_options[k] is not None}
+
+    args: list[str] = [f"prompt={prompt!r}", f"provider={str(provider)!r}"]
+    if model:
+        args.append(f"model={str(model)!r}")
+    if size and str(size) != "1024x1024":
+        args.append(f"size={str(size)!r}")
+    if n and int(n) != 1:
+        args.append(f"n={int(n)}")
+    if seed is not None:
+        args.append(f"seed={int(seed)}")
+    if output_format:
+        args.append(f"output_format={str(output_format)!r}")
+    if background:
+        args.append(f"background={str(background)!r}")
+    if provider_options:
+        args.append(f"provider_options={provider_options!r}")
+    call_name = "generate"
+    if mode == "edit":
+        call_name = "edit"
+        init_image = inputs.get("init_image")
+        if init_image:
+            args.append(f"init_image={str(init_image)!r}")
+        mask = inputs.get("mask")
+        if mask:
+            args.append(f"mask={str(mask)!r}")
+
+    lines = [
+        f"from forge_image_api import {call_name}",
+        "",
+        f"result = {call_name}(",
+    ]
+    lines.extend([f"    {item}," for item in args])
+    lines.append(")")
+    return "\n".join(lines)
+
+
+def _view_load_manifest(run_dir: Path) -> dict | None:
+    manifest_path = run_dir / "run.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _view_collect_receipts(run_dir: Path, manifest: dict | None) -> tuple[list[Path], dict[Path, dict]]:
+    receipts: list[Path] = []
+    job_lookup: dict[Path, dict] = {}
+    if manifest and isinstance(manifest.get("jobs"), list):
+        for job in manifest.get("jobs", []):
+            artifacts = job.get("artifacts") if isinstance(job, dict) else None
+            if not isinstance(artifacts, dict):
+                continue
+            receipt_paths = artifacts.get("receipt_paths")
+            if not isinstance(receipt_paths, list):
+                continue
+            for item in receipt_paths:
+                if not isinstance(item, str):
+                    continue
+                path = (run_dir / item).resolve()
+                receipts.append(path)
+                job_lookup[path] = job
+    if not receipts:
+        receipts = sorted(run_dir.glob("receipt-*.json"))
+    return receipts, job_lookup
+
+
+def _view_build_index(run_path: Path, view_dir: Path) -> dict:
+    run_dir = run_path if run_path.is_dir() else run_path.parent
+    manifest = _view_load_manifest(run_dir)
+    receipts, job_lookup = _view_collect_receipts(run_dir, manifest)
+
+    prompts: list[dict[str, str]] = []
+    prompt_by_id: dict[str, str] = {}
+    prompt_id_by_text: dict[str, str] = {}
+
+    if manifest and isinstance(manifest.get("jobs"), list):
+        for job in manifest.get("jobs", []):
+            if not isinstance(job, dict):
+                continue
+            prompt_id = str(job.get("prompt_id") or "")
+            prompt_text = str(job.get("prompt") or "")
+            if not prompt_id:
+                continue
+            if prompt_id in prompt_by_id:
+                continue
+            prompt_by_id[prompt_id] = prompt_text
+            if prompt_text:
+                prompt_id_by_text.setdefault(prompt_text, prompt_id)
+            prompts.append({"id": prompt_id, "text": prompt_text})
+
+    def _fallback_prompt_id(text: str) -> str:
+        existing = prompt_id_by_text.get(text)
+        if existing:
+            return existing
+        next_id = f"p-{len(prompts) + 1:04d}"
+        prompt_id_by_text[text] = next_id
+        prompt_by_id[next_id] = text
+        prompts.append({"id": next_id, "text": text})
+        return next_id
+
+    columns: list[dict[str, str]] = []
+    column_keys: dict[str, dict[str, str]] = {}
+
+    variants: list[dict[str, object]] = []
+    for receipt_path in receipts:
+        try:
+            receipt = _load_receipt_payload(receipt_path)
+        except Exception:
+            continue
+        if not isinstance(receipt, dict):
+            continue
+        request = receipt.get("request") if isinstance(receipt.get("request"), dict) else {}
+        resolved = receipt.get("resolved") if isinstance(receipt.get("resolved"), dict) else {}
+        prompt_text = str(request.get("prompt") or resolved.get("prompt") or "")
+        prompt_id = None
+        job = job_lookup.get(receipt_path)
+        if job and isinstance(job, dict):
+            job_prompt = job.get("prompt_id")
+            if job_prompt:
+                prompt_id = str(job_prompt)
+        if not prompt_id:
+            prompt_id = _fallback_prompt_id(prompt_text)
+        provider = resolved.get("provider") or request.get("provider") or "unknown"
+        model = resolved.get("model") or request.get("model") or "default"
+        column_key = f"{provider}::{model}"
+        if column_key not in column_keys:
+            column = {"key": column_key, "provider": str(provider), "model": str(model)}
+            column["label"] = f"{provider} / {model}"
+            column_keys[column_key] = column
+            columns.append(column)
+        column_label = column_keys[column_key]["label"]
+        artifacts = receipt.get("artifacts") if isinstance(receipt.get("artifacts"), dict) else {}
+        image_path = artifacts.get("image_path")
+        receipt_path_value = artifacts.get("receipt_path")
+        image_path_obj = Path(str(image_path)) if image_path else receipt_path.with_suffix(".png")
+        if not image_path_obj.is_absolute():
+            image_path_obj = (run_dir / image_path_obj).resolve()
+        receipt_path_obj = Path(str(receipt_path_value)) if receipt_path_value else receipt_path
+        if not receipt_path_obj.is_absolute():
+            receipt_path_obj = (run_dir / receipt_path_obj).resolve()
+        image_src = _view_rel_path(image_path_obj, view_dir)
+        receipt_src = _view_rel_path(receipt_path_obj, view_dir)
+        result_meta = receipt.get("result_metadata") if isinstance(receipt.get("result_metadata"), dict) else {}
+        render_seconds = result_meta.get("render_seconds")
+        if not isinstance(render_seconds, (int, float)):
+            render_seconds = None
+        if render_seconds is None and job and isinstance(job, dict):
+            render_seconds = _view_seconds_between(job.get("started_at"), job.get("completed_at"))
+        size = resolved.get("size") or request.get("size") or "1024x1024"
+        n_value = resolved.get("n") or request.get("n") or 1
+        try:
+            n_value = int(n_value)
+        except Exception:
+            n_value = 1
+        render_seconds_per_image = None
+        if isinstance(render_seconds, (int, float)):
+            render_seconds_per_image = float(render_seconds) / max(1, n_value)
+        cost_value = _estimate_cost_value(
+            provider=str(provider) if provider else None,
+            model=str(model) if model else None,
+            size=str(size) if size else None,
+        )
+        cost_per_1k = _format_cost_value(cost_value)
+        llm_scores = result_meta.get("llm_scores") if isinstance(result_meta.get("llm_scores"), dict) else {}
+        adherence = llm_scores.get("adherence")
+        quality = llm_scores.get("quality")
+        retrieval_payload = result_meta.get("llm_retrieval") if isinstance(result_meta.get("llm_retrieval"), dict) else {}
+        retrieval_score = retrieval_payload.get("score")
+        quality_metrics = result_meta.get("image_quality_metrics") if isinstance(result_meta.get("image_quality_metrics"), dict) else {}
+        quality_gates = quality_metrics.get("gates") if isinstance(quality_metrics.get("gates"), list) else []
+        warnings: list[str] = []
+        if isinstance(receipt.get("warnings"), list):
+            warnings.extend([str(item) for item in receipt.get("warnings") if item])
+        if isinstance(resolved.get("warnings"), list):
+            warnings.extend([str(item) for item in resolved.get("warnings") if item])
+        snippet = _view_build_snippet(receipt)
+        variant_id = receipt_path.name
+        flags = []
+        if isinstance(quality_gates, list):
+            flags.extend([str(item) for item in quality_gates if item])
+        if warnings:
+            flags.extend(warnings)
+        variants.append(
+            {
+                "id": variant_id,
+                "prompt_id": prompt_id,
+                "prompt": prompt_text,
+                "column_key": column_key,
+                "column_label": column_label,
+                "provider": provider,
+                "model": model,
+                "size": size,
+                "n": n_value,
+                "image_src": image_src,
+                "receipt_src": receipt_src,
+                "render_seconds": render_seconds,
+                "render_seconds_per_image": render_seconds_per_image,
+                "cost_usd": cost_value,
+                "cost_per_1k": cost_per_1k,
+                "adherence": adherence,
+                "quality": quality,
+                "retrieval_score": retrieval_score,
+                "flags": flags,
+                "snippet": snippet,
+            }
+        )
+
+    run_title = "Param Forge • Model Showdown"
+    return {
+        "run": {
+            "id": manifest.get("run_id") if isinstance(manifest, dict) else run_dir.name,
+            "title": run_title,
+            "path": str(run_dir),
+        },
+        "prompts": prompts,
+        "columns": columns,
+        "variants": variants,
+    }
+
+
+def _view_write_html(data: dict, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(data, ensure_ascii=True).replace("<", "\\u003c")
+    html_text = _VIEWER_TEMPLATE.replace("__DATA__", payload)
+    out_path.write_text(html_text, encoding="utf-8")
+
+
+def _maybe_open_viewer(run_dir: Path) -> None:
+    run_dir = Path(run_dir).expanduser().resolve()
+    if not run_dir.exists():
+        return
+    has_manifest = (run_dir / "run.json").exists()
+    has_receipts = any(run_dir.glob("receipt-*.json"))
+    if not has_manifest and not has_receipts:
+        return
+    out_dir = run_dir / ".param_forge_view"
+    data = _view_build_index(run_dir, out_dir)
+    if not data.get("variants"):
+        return
+    out_path = out_dir / "index.html"
+    _view_write_html(data, out_path)
+    _open_path(out_path)
+
+
+def _run_view_cli(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="PARAM FORGE: view a receipt run locally.")
+    parser.add_argument("path", help="Run folder, run.json, or receipt path")
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="Output directory for viewer (default: <run>/.param_forge_view)",
+    )
+    parser.add_argument("--no-open", action="store_true", help="Do not open the viewer in a browser.")
+    args = parser.parse_args(argv)
+
+    target = Path(args.path).expanduser().resolve()
+    run_dir = target if target.is_dir() else target.parent
+    out_dir = Path(args.out).expanduser().resolve() if args.out else (run_dir / ".param_forge_view")
+    out_path = out_dir / "index.html"
+    data = _view_build_index(run_dir, out_dir)
+    _view_write_html(data, out_path)
+    if not args.no_open:
+        _open_path(out_path)
+    print(f"Viewer written to {out_path}")
+    return 0
+
+
 def _run_generation(args: argparse.Namespace) -> int:
     _load_repo_dotenv()
     args.analyzer = _resolve_receipt_analyzer(getattr(args, "analyzer", None))
@@ -6776,6 +7915,8 @@ def _run_generation(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "view":
+        return _run_view_cli(sys.argv[2:])
     parser = argparse.ArgumentParser(
         description="PARAM FORGE: interactive terminal UI for multi-provider image generation + receipts."
     )

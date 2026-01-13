@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
+import time
 from typing import Iterable, Iterator, List, Optional
 
 from forge_image_api.core.contracts import ImageEvent, ImageInputs, ImageRequest, ImageResult
@@ -39,6 +41,10 @@ def _write_image(out_dir: Path, provider: str, index: int, image: ProviderImage,
     return path
 
 
+def _utc_iso(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _finalize_results(
     *,
     request: ImageRequest,
@@ -47,11 +53,24 @@ def _finalize_results(
     provider_response,
     out_dir: Path,
     stamp: str,
+    render_seconds: Optional[float] = None,
+    render_started_at: Optional[str] = None,
+    render_completed_at: Optional[str] = None,
 ) -> List[ImageResult]:
     results: List[ImageResult] = []
     for idx, image in enumerate(provider_response.images):
         image_path = _write_image(out_dir, resolved_provider, idx, image, resolved.output_format, stamp)
         receipt_path = out_dir / f"receipt-{resolved_provider}-{stamp}-{idx:02d}.json"
+        result_metadata = {
+            "provider_metadata": image.metadata,
+            "provider_request_id": image.provider_request_id,
+        }
+        if render_seconds is not None:
+            result_metadata["render_seconds"] = float(render_seconds)
+        if render_started_at is not None:
+            result_metadata["render_started_at"] = render_started_at
+        if render_completed_at is not None:
+            result_metadata["render_completed_at"] = render_completed_at
         receipt_payload = build_receipt(
             request=request,
             resolved=resolved,
@@ -60,10 +79,7 @@ def _finalize_results(
             warnings=list(resolved.warnings),
             image_path=image_path,
             receipt_path=receipt_path,
-            result_metadata={
-                "provider_metadata": image.metadata,
-                "provider_request_id": image.provider_request_id,
-            },
+            result_metadata=result_metadata,
         )
         write_receipt(receipt_path, receipt_payload)
         results.append(
@@ -116,7 +132,11 @@ def generate(
     request.out_dir = out_path
     resolved = resolve_request(request, resolved_provider)
     adapter = get_adapter(resolved_provider)
+    started_at = datetime.now(timezone.utc)
+    started_monotonic = time.monotonic()
     response = adapter.generate(request, resolved)
+    elapsed = time.monotonic() - started_monotonic
+    completed_at = datetime.now(timezone.utc)
     stamp = utc_timestamp()
     return _finalize_results(
         request=request,
@@ -125,6 +145,9 @@ def generate(
         provider_response=response,
         out_dir=out_path,
         stamp=stamp,
+        render_seconds=elapsed,
+        render_started_at=_utc_iso(started_at),
+        render_completed_at=_utc_iso(completed_at),
     )
 
 
@@ -165,7 +188,11 @@ def edit(
     request.out_dir = out_path
     resolved = resolve_request(request, resolved_provider)
     adapter = get_adapter(resolved_provider)
+    started_at = datetime.now(timezone.utc)
+    started_monotonic = time.monotonic()
     response = adapter.generate(request, resolved)
+    elapsed = time.monotonic() - started_monotonic
+    completed_at = datetime.now(timezone.utc)
     stamp = utc_timestamp()
     return _finalize_results(
         request=request,
@@ -174,6 +201,9 @@ def edit(
         provider_response=response,
         out_dir=out_path,
         stamp=stamp,
+        render_seconds=elapsed,
+        render_started_at=_utc_iso(started_at),
+        render_completed_at=_utc_iso(completed_at),
     )
 
 
@@ -216,6 +246,8 @@ def stream(
     stamp = utc_timestamp()
 
     if resolved.stream:
+        started_at = datetime.now(timezone.utc)
+        started_monotonic = time.monotonic()
         for event in adapter.stream(request, resolved):
             if event.type == "partial" and event.image_bytes is not None:
                 yield ImageEvent(type="partial", index=event.index, image_bytes=event.image_bytes)
@@ -225,6 +257,8 @@ def stream(
                 yield ImageEvent(type="error", index=event.index, message=event.message)
                 return
             elif event.type == "final" and event.image is not None:
+                elapsed = time.monotonic() - started_monotonic
+                completed_at = datetime.now(timezone.utc)
                 provider_response = ProviderResponse(
                     images=[event.image],
                     model=resolved.model,
@@ -240,6 +274,9 @@ def stream(
                     provider_response=provider_response,
                     out_dir=out_path,
                     stamp=stamp,
+                    render_seconds=elapsed,
+                    render_started_at=_utc_iso(started_at),
+                    render_completed_at=_utc_iso(completed_at),
                 )
                 if results:
                     yield ImageEvent(type="final", index=event.index, result=results[0])
