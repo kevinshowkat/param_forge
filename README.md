@@ -1,24 +1,28 @@
 # PARAM FORGE
 
-Interactive terminal UI for multi-provider image generation and receipts.
+Interactive terminal UI for independent image-model tinkerers experimenting across providers.
 
 <img src="assets/param_forge_demo_v2.gif" width="800" alt="PARAM FORGE terminal demo" />
 
 ## TL;DR
-PARAM FORGE is a terminal UI for running text-to-image jobs across providers and saving reproducible receipts next to outputs.
+PARAM FORGE is a local terminal workbench for running image prompts across models/providers and saving receipts so you can reproduce, compare, and iterate fast.
 
 <img src="docs/explore_flow.svg" width="800" alt="Explore Mode — Feedback Loop" />
 
+## Who it's for
+Independent image-model experimenters who want quick comparisons, reproducible runs, and a paper trail they can trust.
+
 ## Use cases
-- compare providers or models for a prompt set
-- iterate on prompt, size, and seed quickly
-- keep a local paper trail of inputs and parameters
+- sweep multiple providers/models for the same prompt
+- tweak prompt/size/seed/quality without writing a harness
+- keep receipts + manifests so you can re-run or share exact settings later
 
 ## Outputs
 - images and receipt files written to the output directory
-- receipts capture the prompts and provider parameters used
+- receipts capture prompt + model/provider parameters
 - receipt metadata includes render timing and LLM scoring (adherence/quality) when available
-- local receipt viewer can render a grid view for quick comparison
+- batch runs write a `run.json` manifest that indexes every job/output
+- local receipt viewer renders a grid for fast side-by-side comparison
 
 ## Requirements
 - Python 3.10+
@@ -83,6 +87,7 @@ python scripts/param_forge.py batch-run \
   --matrix matrix.yaml \
   --out runs/food_glam_v1
 ```
+Tip: in the UI, Batch run lets you pick providers/models directly without a matrix file.
 
 Prompt selection (interactive):
 - The Explore flow includes a **Prompt** step.

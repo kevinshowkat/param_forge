@@ -2,7 +2,7 @@
 
 Last verified: 2026-01-04
 
-This file summarizes current per-image pricing for providers/models used by PARAM FORGE.
+This file summarizes current per-image pricing for providers/models used by PARAM FORGE, so experimenters can budget sweeps without guesswork.
 Pricing can change; re-verify before production billing.
 
 ## OpenAI (GPT Image)

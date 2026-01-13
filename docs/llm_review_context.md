@@ -3,10 +3,10 @@
 This document is meant to accompany a tarball of the repo so an outside LLM can review the product and codebase without prior context. The goal is to identify improvements that can make the product 10x more valuable.
 
 ## What is PARAM FORGE?
-Param Forge is a local, terminal-first workbench for running text-to-image prompts across multiple providers, saving reproducible receipts next to outputs, and helping users select a winner quickly.
+Param Forge is a local, terminal-first workbench for independent image-model experimenters who run prompts across providers, save reproducible receipts, and pick winners fast.
 
 ## Primary user need
-Compare providers/models/params for a prompt and pick the best output quickly, with a reproducible API call.
+Rapidly compare models/providers/params for a prompt, keep a reproducible paper trail, and iterate without writing a custom harness.
 
 ## Desired outcome of this review
 Provide targeted feedback that leads to 10x improvements in:
@@ -21,6 +21,11 @@ Provide targeted feedback that leads to 10x improvements in:
 - Steps: Mode → Provider → Model → Prompt → Size → Images per prompt → Output dir
 - Generates images + receipts, then (optionally) analyzes and applies recommendations.
 - Auto-opens a local receipt viewer at the end of interactive runs.
+
+### Batch run (interactive + CLI)
+- UI label: “Batch run” (select providers/models, size, concurrency, budgets).
+- CLI subcommand: `python scripts/param_forge.py batch-run --prompts ... --matrix ... --out ...`
+- Writes a `run.json` manifest that indexes every job/output.
 
 ### Receipt analysis & recommendations
 - Analyzer choices: `anthropic`, `openai`, `council`.
@@ -77,7 +82,7 @@ Used for cost estimates:
 
 ## Known constraints / non-goals
 - No cloud dashboard; everything is local.
-- Experiment mode CLI runner is implemented; interactive builder remains limited.
+- Batch run is local-only (no hosted scheduler).
 - Providers are accessed via their official SDKs; user supplies API keys.
 
 ## Suggested focus for a “10x” review

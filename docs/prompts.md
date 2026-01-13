@@ -1,6 +1,6 @@
 # Param Forge Prompt Catalog
 
-This file centralizes the core prompt templates used by Param Forge. It is intended to make it easy to audit and tune prompt behavior.
+This file centralizes the core prompt templates used by Param Forge. It is intended to make it easy for independent model tinkerers to audit and tune prompt behavior.
 
 All prompt templates live in `scripts/param_forge.py` unless otherwise noted.
 
@@ -150,4 +150,3 @@ Second pass (if still too long):
 ```
 Tighten to <= {limit} chars total. Preserve ADH/UNSET/COST/REC labels and <setting_json> block.
 ```
-
