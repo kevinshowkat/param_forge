@@ -81,6 +81,34 @@ def _generate_one(
 ) -> _FluxResult:
     if requests is None:
         raise RuntimeError("requests package not installed. Run: pip install requests")
+
+    def _summarize_error(response) -> str:
+        detail = ""
+        try:
+            detail = json.dumps(response.json(), ensure_ascii=True)
+        except Exception:
+            try:
+                detail = response.text or ""
+            except Exception:
+                detail = ""
+        detail = detail.strip().replace("\n", " ")
+        if len(detail) > 500:
+            detail = detail[:500].rstrip() + "..."
+        return detail
+
+    def _raise_for_status(response, label: str) -> None:
+        try:
+            response.raise_for_status()
+        except Exception as exc:
+            detail = _summarize_error(response)
+            url = getattr(response, "url", "")
+            parts = [f"Flux {label} failed ({response.status_code})"]
+            if url:
+                parts.append(f"url={url}")
+            if detail:
+                parts.append(detail)
+            raise RuntimeError(": ".join(parts)) from exc
+
     session = requests.Session()
     request_response = session.post(
         endpoint_url,
@@ -88,7 +116,7 @@ def _generate_one(
         json=payload,
         timeout=request_timeout,
     )
-    request_response.raise_for_status()
+    _raise_for_status(request_response, "request")
     request_json = request_response.json()
     request_id = request_json.get("id")
     polling_url = request_json.get("polling_url")
@@ -99,7 +127,7 @@ def _generate_one(
     last_payload: Mapping[str, Any] = {}
     while time.time() - started < poll_timeout:
         poll_response = session.get(polling_url, headers=headers, timeout=request_timeout)
-        poll_response.raise_for_status()
+        _raise_for_status(poll_response, "poll")
         payload_json = poll_response.json()
         last_payload = payload_json
         status = str(payload_json.get("status") or "").lower()
@@ -109,7 +137,7 @@ def _generate_one(
             if not sample:
                 raise RuntimeError("Flux result missing sample URL.")
             image_response = session.get(sample, timeout=download_timeout)
-            image_response.raise_for_status()
+            _raise_for_status(image_response, "download")
             mime_type = image_response.headers.get("content-type")
             return _FluxResult(
                 image_bytes=image_response.content,
