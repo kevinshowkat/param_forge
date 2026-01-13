@@ -539,13 +539,24 @@ def _allowed_models_for_provider(provider: str | None, current_model: str | None
     return models
 
 
-def _model_options_line(provider: str, size: str, current_model: str | None) -> str:
+def _model_options_line(
+    provider: str,
+    size: str,
+    current_model: str | None,
+    provider_options: dict[str, object] | None = None,
+) -> str:
     models = _allowed_models_for_provider(provider, current_model)
     if not models:
         return ""
+    options = provider_options if isinstance(provider_options, dict) else None
     items: list[str] = []
     for model in models:
-        cost = _estimate_cost_value(provider=provider, model=model, size=size)
+        cost = _estimate_cost_value(
+            provider=provider,
+            model=model,
+            size=size,
+            provider_options=options,
+        )
         if cost is not None:
             items.append(f"{model} (~${_format_price(cost)})")
         else:
@@ -835,10 +846,12 @@ def _sanitize_recommendation_rationales(
     provider: str | None = None,
     size: str | None = None,
     n: int | None = None,
+    provider_options: dict[str, object] | None = None,
 ) -> list[dict]:
     if not recs:
         return recs
     base_cost_token = _extract_price_token(cost_line)
+    options = provider_options if isinstance(provider_options, dict) else None
     updated: list[dict] = []
     for rec in recs:
         rec_copy = dict(rec)
@@ -854,6 +867,7 @@ def _sanitize_recommendation_rationales(
                         model=rec_model or None,
                         size=size,
                         n=n or 1,
+                        provider_options=options,
                     )
                     rec_cost_token = _extract_price_token(rec_cost_line)
                     if rec_cost_token:
@@ -1237,19 +1251,69 @@ def _format_price(value: float, digits: int = 3) -> str:
     return f"{value:.{digits}f}".rstrip("0").rstrip(".")
 
 
+def _normalize_quality_tier(value: object | None) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in {"low", "medium", "high"}:
+        return normalized
+    if normalized in {"standard", "std"}:
+        return "medium"
+    return None
+
+
+def _normalize_imagen_quality(value: object | None) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in {"fast", "standard", "ultra"}:
+        return normalized
+    return None
+
+
+def _is_batch_pricing(provider_options: dict[str, object] | None) -> bool:
+    if not provider_options:
+        return False
+    for key in ("batch", "use_batch", "batch_mode"):
+        if provider_options.get(key) is True:
+            return True
+    for key in ("pricing_tier", "usage_tier", "pricing", "mode"):
+        value = provider_options.get(key)
+        if isinstance(value, str) and value.strip().lower() == "batch":
+            return True
+    return False
+
+
+def _pricing_option_key(
+    provider_key: str,
+    size: str,
+    provider_options: dict[str, object] | None,
+) -> tuple | None:
+    if not provider_options:
+        return None
+    if provider_key == "openai":
+        return ("quality", _normalize_quality_tier(provider_options.get("quality")))
+    if provider_key == "gemini":
+        return ("batch", _is_batch_pricing(provider_options), "tier", _gemini_size_tier(size))
+    if provider_key == "imagen":
+        return ("quality", _normalize_imagen_quality(provider_options.get("quality")))
+    return None
+
+
 def _estimate_cost_only(
     *,
     provider: str,
     model: str | None,
     size: str,
     n: int,
+    provider_options: dict[str, object] | None = None,
 ) -> str | None:
-    cache_key = (provider, model, size)
+    provider_key = provider.strip().lower()
+    cache_key = (provider_key, model, size, _pricing_option_key(provider_key, size, provider_options))
     cached = _COST_ESTIMATE_CACHE.get(cache_key)
     if cached:
         return cached
     pricing = _load_pricing_reference()
-    provider_key = provider.strip().lower()
     model_key = (model or "").strip().lower()
     cost_line: str | None = None
 
@@ -1262,33 +1326,49 @@ def _estimate_cost_only(
         model_prices = pricing.get("openai", {}).get(model_key, {})
         size_prices = model_prices.get(size_key) if isinstance(model_prices, dict) else None
         if isinstance(size_prices, dict):
-            price = size_prices.get("medium") or size_prices.get("standard") or size_prices.get("low")
+            quality = _normalize_quality_tier(provider_options.get("quality") if provider_options else None)
+            price = None
+            if quality:
+                price = size_prices.get(quality)
+            if price is None:
+                price = size_prices.get("medium") or size_prices.get("standard") or size_prices.get("low")
             if isinstance(price, (int, float)):
+                quality_label = quality or "medium"
                 cost_line = (
                     f"COST: ~{_per_1k(float(price))} images "
-                    f"({model_key}, {size_key}, medium)"
+                    f"({model_key}, {size_key}, {quality_label})"
                 )
 
     elif provider_key == "gemini":
         model_key = model_key or "gemini-2.5-flash-image"
         model_prices = pricing.get("gemini", {}).get(model_key, {})
         if model_key == "gemini-2.5-flash-image":
-            price = model_prices.get("standard") if isinstance(model_prices, dict) else None
+            use_batch = _is_batch_pricing(provider_options)
+            tier_key = "batch" if use_batch else "standard"
+            price = model_prices.get(tier_key) if isinstance(model_prices, dict) else None
             if isinstance(price, (int, float)):
-                cost_line = f"COST: ~{_per_1k(float(price))} images ({model_key}, standard)"
+                label = "batch" if use_batch else "standard"
+                cost_line = f"COST: ~{_per_1k(float(price))} images ({model_key}, {label})"
         elif model_key == "gemini-3-pro-image-preview":
             tier = _gemini_size_tier(size)
-            key = f"standard_{tier}"
+            use_batch = _is_batch_pricing(provider_options)
+            key = f"{'batch' if use_batch else 'standard'}_{tier}"
             price = model_prices.get(key) if isinstance(model_prices, dict) else None
             if isinstance(price, (int, float)):
                 label = "1K/2K" if tier == "1k_2k" else "4K"
-                cost_line = f"COST: ~{_per_1k(float(price))} images ({model_key}, {label})"
+                mode_label = "batch" if use_batch else "standard"
+                cost_line = f"COST: ~{_per_1k(float(price))} images ({model_key}, {mode_label} {label})"
 
     elif provider_key == "imagen":
         model_key = model_key or "imagen-4"
         model_prices = pricing.get("imagen", {}).get(model_key, {})
         if isinstance(model_prices, dict):
-            price = model_prices.get("standard") or model_prices.get("ultra") or model_prices.get("fast")
+            quality = _normalize_imagen_quality(provider_options.get("quality") if provider_options else None)
+            price = None
+            if quality:
+                price = model_prices.get(quality)
+            if price is None:
+                price = model_prices.get("standard") or model_prices.get("ultra") or model_prices.get("fast")
             if isinstance(price, (int, float)):
                 label = (
                     "ultra"
@@ -1297,6 +1377,8 @@ def _estimate_cost_only(
                     if model_key.endswith("fast")
                     else "standard"
                 )
+                if quality:
+                    label = quality
                 cost_line = f"COST: ~{_per_1k(float(price))} images ({model_key}, {label})"
 
     elif provider_key == "flux":
@@ -3164,6 +3246,7 @@ def _estimate_cost_value(
     provider: str | None,
     model: str | None,
     size: str | None,
+    provider_options: dict[str, object] | None = None,
 ) -> float | None:
     if not provider or not size:
         return None
@@ -3176,19 +3259,27 @@ def _estimate_cost_value(
         model_prices = pricing.get("openai", {}).get(model_key, {})
         size_prices = model_prices.get(size_key) if isinstance(model_prices, dict) else None
         if isinstance(size_prices, dict):
-            price = size_prices.get("medium") or size_prices.get("standard") or size_prices.get("low")
+            quality = _normalize_quality_tier(provider_options.get("quality") if provider_options else None)
+            price = None
+            if quality:
+                price = size_prices.get(quality)
+            if price is None:
+                price = size_prices.get("medium") or size_prices.get("standard") or size_prices.get("low")
             if isinstance(price, (int, float)):
                 return float(price)
     if provider_key == "gemini":
         model_key = model_key or "gemini-2.5-flash-image"
         model_prices = pricing.get("gemini", {}).get(model_key, {})
         if model_key == "gemini-2.5-flash-image":
-            price = model_prices.get("standard") if isinstance(model_prices, dict) else None
+            use_batch = _is_batch_pricing(provider_options)
+            tier_key = "batch" if use_batch else "standard"
+            price = model_prices.get(tier_key) if isinstance(model_prices, dict) else None
             if isinstance(price, (int, float)):
                 return float(price)
         if model_key == "gemini-3-pro-image-preview":
             tier = _gemini_size_tier(size)
-            key = f"standard_{tier}"
+            use_batch = _is_batch_pricing(provider_options)
+            key = f"{'batch' if use_batch else 'standard'}_{tier}"
             price = model_prices.get(key) if isinstance(model_prices, dict) else None
             if isinstance(price, (int, float)):
                 return float(price)
@@ -3196,7 +3287,12 @@ def _estimate_cost_value(
         model_key = model_key or "imagen-4"
         model_prices = pricing.get("imagen", {}).get(model_key, {})
         if isinstance(model_prices, dict):
-            price = model_prices.get("standard") or model_prices.get("ultra") or model_prices.get("fast")
+            quality = _normalize_imagen_quality(provider_options.get("quality") if provider_options else None)
+            price = None
+            if quality:
+                price = model_prices.get(quality)
+            if price is None:
+                price = model_prices.get("standard") or model_prices.get("ultra") or model_prices.get("fast")
             if isinstance(price, (int, float)):
                 return float(price)
     if provider_key == "flux":
@@ -3966,20 +4062,31 @@ def _apply_snapshot_for_result(
     provider = fallback_settings.get("provider")
     model = fallback_settings.get("model")
     size = fallback_settings.get("size")
+    provider_options = fallback_settings.get("provider_options")
+    if not isinstance(provider_options, dict):
+        provider_options = None
     try:
         receipt = _load_receipt_payload(receipt_path)
         if isinstance(receipt, dict):
-            resolved = receipt.get("resolved")
+            resolved = receipt.get("resolved") if isinstance(receipt.get("resolved"), dict) else None
+            request = receipt.get("request") if isinstance(receipt.get("request"), dict) else None
             if isinstance(resolved, dict):
                 provider = resolved.get("provider") or provider
                 model = resolved.get("model") or model
                 size = resolved.get("size") or size
+            if isinstance(request, dict) and isinstance(request.get("provider_options"), dict):
+                if request.get("provider_options"):
+                    provider_options = request.get("provider_options")
+            elif isinstance(resolved, dict) and isinstance(resolved.get("provider_params"), dict):
+                if resolved.get("provider_params"):
+                    provider_options = resolved.get("provider_params")
     except Exception:
         pass
     cost_value = _estimate_cost_value(
         provider=str(provider) if provider else None,
         model=str(model) if model else None,
         size=str(size) if size else None,
+        provider_options=provider_options if isinstance(provider_options, dict) else None,
     )
     _write_render_metadata(receipt_path, elapsed)
     quality_metrics: dict[str, object] = {}
@@ -4638,24 +4745,30 @@ def _build_final_recommendation_lines(
         )
     ):
         reference_settings = baseline_settings or settings
+        ref_provider_options = reference_settings.get("provider_options")
         cost_ref = _estimate_cost_value(
             provider=str(reference_settings.get("provider"))
             if reference_settings.get("provider")
             else None,
             model=str(reference_settings.get("model")) if reference_settings.get("model") else None,
             size=str(reference_settings.get("size")) if reference_settings.get("size") else None,
+            provider_options=ref_provider_options if isinstance(ref_provider_options, dict) else None,
         )
         if cost_ref is None:
             if baseline_settings and baseline_cost_line:
                 cost_ref = _parse_cost_amount(baseline_cost_line)
             else:
                 cost_ref = _parse_cost_amount(cost_line)
+        target_provider_options = (
+            metric_settings.get("provider_options") if isinstance(metric_settings, dict) else None
+        )
         cost_target = _estimate_cost_value(
             provider=str(metric_settings.get("provider"))
             if metric_settings.get("provider")
             else None,
             model=str(metric_settings.get("model")) if metric_settings.get("model") else None,
             size=str(metric_settings.get("size")) if metric_settings.get("size") else None,
+            provider_options=target_provider_options if isinstance(target_provider_options, dict) else None,
         )
         if cost_target is None:
             if not _diff_call_settings(metric_settings, settings):
@@ -5981,11 +6094,26 @@ def _show_receipt_analysis_curses(
         baseline_cost_text = _strip_cost_prefix(first_entry.get("cost"))
 
     if user_goals and "minimize cost of render" in user_goals and not last_cost:
+        provider_options = None
+        try:
+            receipt = _load_receipt_payload(receipt_path)
+            if isinstance(receipt, dict):
+                request = receipt.get("request") if isinstance(receipt.get("request"), dict) else None
+                resolved = receipt.get("resolved") if isinstance(receipt.get("resolved"), dict) else None
+                if isinstance(request, dict) and isinstance(request.get("provider_options"), dict):
+                    if request.get("provider_options"):
+                        provider_options = request.get("provider_options")
+                elif isinstance(resolved, dict) and isinstance(resolved.get("provider_params"), dict):
+                    if resolved.get("provider_params"):
+                        provider_options = resolved.get("provider_params")
+        except Exception:
+            provider_options = None
         pre_cost_line = _estimate_cost_only(
             provider=provider,
             model=model,
             size=size,
             n=n,
+            provider_options=provider_options if isinstance(provider_options, dict) else None,
         )
         if pre_cost_line:
             last_cost = str(pre_cost_line).replace("COST:", "").strip()
@@ -7652,11 +7780,19 @@ def _analyze_receipt_payload(
         "prompt": str(receipt.get("request", {}).get("prompt", "")),
         "out_dir": str(out_dir),
     }
+    resolved = receipt.get("resolved") if isinstance(receipt.get("resolved"), dict) else None
+    request = receipt.get("request") if isinstance(receipt.get("request"), dict) else None
+    provider_options = None
+    if isinstance(request, dict):
+        provider_options = request.get("provider_options")
+    if not (isinstance(provider_options, dict) and provider_options):
+        if isinstance(resolved, dict):
+            provider_options = resolved.get("provider_params")
+    if not isinstance(provider_options, dict):
+        provider_options = None
     provider_key, _ = _normalize_provider_and_model(provider, model)
     if provider_key == "openai":
         use_responses = None
-        resolved = receipt.get("resolved") if isinstance(receipt.get("resolved"), dict) else None
-        request = receipt.get("request") if isinstance(receipt.get("request"), dict) else None
         for source in (
             resolved.get("provider_params") if isinstance(resolved, dict) else None,
             request.get("provider_options") if isinstance(request, dict) else None,
@@ -7670,7 +7806,7 @@ def _analyze_receipt_payload(
     target_prompt = FIXED_PROMPT
     allowed_settings = _allowed_settings_for_receipt(receipt, provider)
     allowed_models = _allowed_models_for_provider(provider, model)
-    model_options_line = _model_options_line(provider, size, model)
+    model_options_line = _model_options_line(provider, size, model, provider_options)
     summary = {
         "request": receipt.get("request"),
         "resolved": receipt.get("resolved"),
@@ -7738,8 +7874,6 @@ def _analyze_receipt_payload(
     cleaned_text = _normalize_rec_line(cleaned_text)
     rec_text = _rec_line_text(cleaned_text)
     recommendations = _normalize_recommendations(recs_payload)
-    resolved = receipt.get("resolved") if isinstance(receipt, dict) else None
-    request = receipt.get("request") if isinstance(receipt, dict) else None
     recommendations = _filter_noop_recommendations(
         recommendations,
         resolved,
@@ -7753,7 +7887,13 @@ def _analyze_receipt_payload(
     if rec_text and "no change" in rec_text:
         recommendations = []
     cleaned_text, cost_line = _extract_cost_line(cleaned_text)
-    local_cost_line = _estimate_cost_only(provider=provider, model=model, size=size, n=n)
+    local_cost_line = _estimate_cost_only(
+        provider=provider,
+        model=model,
+        size=size,
+        n=n,
+        provider_options=provider_options,
+    )
     cost_line = local_cost_line
     recommendations = _sanitize_recommendation_rationales(
         recommendations,
@@ -7761,6 +7901,7 @@ def _analyze_receipt_payload(
         provider=provider,
         size=size,
         n=n,
+        provider_options=provider_options,
     )
     cleaned_text = _rewrite_rec_line(cleaned_text, recommendations)
     if not recommendations:
@@ -7818,6 +7959,7 @@ def _analyze_receipt_payload(
             provider=provider,
             size=size,
             n=n,
+            provider_options=provider_options,
         )
         cleaned_text = _rewrite_rec_line(cleaned_text, recommendations)
     return cleaned_text, citations, recommendations or None, cost_line, stop_reason
@@ -8919,6 +9061,11 @@ def _view_build_index(run_path: Path, view_dir: Path) -> dict:
             n_value = int(n_value)
         except Exception:
             n_value = 1
+        provider_options = None
+        if isinstance(request.get("provider_options"), dict) and request.get("provider_options"):
+            provider_options = request.get("provider_options")
+        elif isinstance(resolved.get("provider_params"), dict) and resolved.get("provider_params"):
+            provider_options = resolved.get("provider_params")
         render_seconds_per_image = None
         if isinstance(render_seconds, (int, float)):
             render_seconds_per_image = float(render_seconds) / max(1, n_value)
@@ -8926,6 +9073,7 @@ def _view_build_index(run_path: Path, view_dir: Path) -> dict:
             provider=str(provider) if provider else None,
             model=str(model) if model else None,
             size=str(size) if size else None,
+            provider_options=provider_options if isinstance(provider_options, dict) else None,
         )
         cost_per_1k = _format_cost_value(cost_value)
         llm_scores = result_meta.get("llm_scores") if isinstance(result_meta.get("llm_scores"), dict) else {}
@@ -9308,10 +9456,12 @@ def _build_experiment_jobs(
         for params in params_list:
             job_index += 1
             job_id = f"j-{job_index:06d}"
+            provider_options = params.get("provider_options")
             cost_value = _estimate_cost_value(
                 provider=str(params.get("provider") or ""),
                 model=str(params.get("model") or "") if params.get("model") else None,
                 size=str(params.get("size") or ""),
+                provider_options=provider_options if isinstance(provider_options, dict) else None,
             )
             n_value = params.get("n", 1)
             try:
