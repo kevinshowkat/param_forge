@@ -11,6 +11,7 @@ from .contracts import ImageRequest, ResolvedRequest
 
 
 _MAX_INLINE_BYTES = 2000
+_RECEIPT_SCHEMA_VERSION = 1
 
 
 def _serialize(value: Any) -> Any:
@@ -62,6 +63,7 @@ def build_receipt(
     result_metadata: Mapping[str, Any],
 ) -> dict[str, Any]:
     return {
+        "schema_version": _RECEIPT_SCHEMA_VERSION,
         "request": _serialize(request),
         "resolved": _serialize(resolved),
         "provider_request": _sanitize_payload(provider_request),

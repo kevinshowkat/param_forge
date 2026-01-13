@@ -7123,6 +7123,10 @@ _VIEWER_TEMPLATE = """<!doctype html>
         border-color: var(--accent-2);
         box-shadow: 0 12px 28px -18px rgba(42, 167, 161, 0.7);
       }
+      .card.auto {
+        border-color: var(--accent-3);
+        box-shadow: 0 12px 28px -18px rgba(242, 193, 78, 0.7);
+      }
       .card img {
         width: 100%;
         height: 180px;
@@ -7259,7 +7263,8 @@ _VIEWER_TEMPLATE = """<!doctype html>
         visibleColumns: new Set(),
         compare: [],
         winners: {},
-        cellCursor: {}
+        cellCursor: {},
+        autoWinners: {}
       };
       const variantsById = new Map();
       const cellIndex = {};
@@ -7315,6 +7320,48 @@ _VIEWER_TEMPLATE = """<!doctype html>
             cellIndex[variant.prompt_id][variant.column_key] = [];
           }
           cellIndex[variant.prompt_id][variant.column_key].push(variant);
+        });
+      }
+
+      function scoreVariant(variant) {
+        const values = [];
+        if (Number.isFinite(variant.adherence)) values.push(variant.adherence);
+        if (Number.isFinite(variant.quality)) values.push(variant.quality);
+        if (Number.isFinite(variant.retrieval_score)) values.push(variant.retrieval_score);
+        if (!values.length) return null;
+        return values.reduce((sum, value) => sum + value, 0) / values.length;
+      }
+
+      function computeAutoWinners() {
+        state.autoWinners = {};
+        PF_DATA.prompts.forEach((prompt) => {
+          const variants = PF_DATA.variants.filter((variant) => variant.prompt_id === prompt.id);
+          let best = null;
+          variants.forEach((variant) => {
+            const score = scoreVariant(variant);
+            if (score === null) return;
+            const cost = Number.isFinite(variant.cost_usd) ? variant.cost_usd : Infinity;
+            const latency = Number.isFinite(variant.render_seconds_per_image)
+              ? variant.render_seconds_per_image
+              : Infinity;
+            if (
+              !best ||
+              score > best.score ||
+              (score === best.score && cost < best.cost) ||
+              (score === best.score && cost === best.cost && latency < best.latency)
+            ) {
+              best = { id: variant.id, score, cost, latency, column_key: variant.column_key };
+            }
+          });
+          if (best) {
+            state.autoWinners[prompt.id] = best.id;
+            const cellKey = `${prompt.id}::${best.column_key}`;
+            const list = (cellIndex[prompt.id] || {})[best.column_key] || [];
+            const idx = list.findIndex((item) => item.id === best.id);
+            if (idx >= 0) {
+              state.cellCursor[cellKey] = idx;
+            }
+          }
         });
       }
 
@@ -7393,6 +7440,10 @@ _VIEWER_TEMPLATE = """<!doctype html>
         if (state.winners[prompt.id] === variant.id) {
           card.classList.add("winner");
         }
+        const isAutoWinner = state.autoWinners[prompt.id] === variant.id;
+        if (isAutoWinner) {
+          card.classList.add("auto");
+        }
         const image = document.createElement("img");
         image.src = variant.image_src;
         image.alt = variant.prompt || "generated image";
@@ -7435,6 +7486,9 @@ _VIEWER_TEMPLATE = """<!doctype html>
         }
         if (variant.flags && variant.flags.length) {
           badges.appendChild(buildBadge("flag", "accent"));
+        }
+        if (isAutoWinner) {
+          badges.appendChild(buildBadge("auto pick", "yellow"));
         }
         body.appendChild(badges);
 
@@ -7641,6 +7695,7 @@ _VIEWER_TEMPLATE = """<!doctype html>
         PF_DATA.columns.forEach((column) => state.visibleColumns.add(column.key));
         loadWinners();
         buildIndex();
+        computeAutoWinners();
         renderMeta();
         renderColumnFilters();
         renderGrid();
