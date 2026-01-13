@@ -66,7 +66,7 @@ Used for cost estimates:
 - `scripts/forge_image_api/core/receipts.py` — receipt serialization
 - `scripts/forge_image_api/core/contracts.py` — typed request/result contracts
 - `docs/pricing_reference.json` — local cost reference
-- `docs/experiment_mode_spec.md` — experiment run spec (planned, not wired)
+- `docs/experiment_mode_spec.md` — experiment run spec (implemented via CLI runner)
 
 ## What’s in scope for feedback
 - UX and information architecture of the viewer (grid, compare, snippets, winners).
@@ -77,7 +77,7 @@ Used for cost estimates:
 
 ## Known constraints / non-goals
 - No cloud dashboard; everything is local.
-- Experiment mode spec exists but is not implemented.
+- Experiment mode CLI runner is implemented; interactive builder remains limited.
 - Providers are accessed via their official SDKs; user supplies API keys.
 
 ## Suggested focus for a “10x” review
@@ -85,4 +85,3 @@ Used for cost estimates:
 - Make comparisons obvious in <10 seconds for ~50 images.
 - Enable demos that are “run → view → pick → copy snippet”.
 - Identify missing metadata that would unlock huge gains.
-
