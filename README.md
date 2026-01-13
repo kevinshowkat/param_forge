@@ -59,7 +59,9 @@ Set the key for the provider you plan to use. You can export env vars or create 
 - Anthropic (receipt analyzer default): `ANTHROPIC_API_KEY`
 - Gemini: `GEMINI_API_KEY` (or `GOOGLE_API_KEY`)
 - Flux: `BFL_API_KEY` (or `FLUX_API_KEY`)
-- Imagen: `GOOGLE_API_KEY` or Vertex credentials (for example `GOOGLE_APPLICATION_CREDENTIALS`)
+- Imagen: `GOOGLE_API_KEY` or Vertex credentials (for example `GOOGLE_APPLICATION_CREDENTIALS`).
+  - Note: Google GenAI rejects Vertex project/location + API key together. Use either API-key mode
+    (set `GOOGLE_API_KEY`) or Vertex mode (set project/location + service account), but not both.
 
 Tip: If you run with the OpenAI provider and no key is found, the script will prompt you to set one and can save it to `.env`.
 Note: OpenAI image generation models (gpt-image-1.5 / gpt-image-1-mini / gpt-image-1) may require API organization verification to access image generation.
@@ -125,6 +127,7 @@ OpenAI image call options:
 - Batch run is available in the UI (label: "Batch run") and via `python scripts/param_forge.py batch-run ...`.
 - External LLM review context: docs/llm_review_context.md
 - Prompt catalog (all analysis prompts in one place): docs/prompts.md
+- Flux: `flux-2` is deprecated and treated as `flux-2-flex`.
 - Default prompt: a nod to Simon Willison's baseline SVG prompt for testing text-to-text models.
   - https://x.com/simonw/status/1990859659595731046
   - https://simonwillison.net/2024/Oct/25/pelicans-on-a-bicycle/

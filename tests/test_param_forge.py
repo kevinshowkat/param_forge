@@ -19,6 +19,8 @@ if SPEC is None or SPEC.loader is None:
 param_forge = importlib.util.module_from_spec(SPEC)
 sys.modules["param_forge"] = param_forge
 SPEC.loader.exec_module(param_forge)
+from forge_image_api.core.contracts import ImageRequest
+from forge_image_api.core.solver import resolve_request
 
 
 class TestWrapText(unittest.TestCase):
@@ -271,6 +273,22 @@ class TestExploreHelpers(unittest.TestCase):
         self.assertEqual(args.size, "1024x1024")
         self.assertEqual(args.n, 1)
         self.assertEqual(args.out, "outputs/param_forge")
+
+
+class TestProviderResolution(unittest.TestCase):
+    def test_imagen_ratio_remap(self) -> None:
+        request = ImageRequest(prompt="Hello", provider="imagen", size="4:5")
+        resolved = resolve_request(request, "imagen")
+        self.assertEqual(resolved.provider_params.get("aspect_ratio"), "3:4")
+        self.assertTrue(
+            any("Imagen does not support 4:5" in str(warn) for warn in resolved.warnings)
+        )
+
+    def test_flux_model_alias(self) -> None:
+        request = ImageRequest(prompt="Hello", provider="flux", model="flux-2")
+        resolved = resolve_request(request, "flux")
+        self.assertEqual(resolved.model, "flux-2-flex")
+        self.assertTrue(any("flux-2 is deprecated" in str(warn) for warn in resolved.warnings))
 
 
 if __name__ == "__main__":
