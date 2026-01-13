@@ -326,6 +326,9 @@ def resolve_request(request: ImageRequest, provider: str) -> ResolvedRequest:
             flux_model = request.provider_options.get("model")
         if not flux_model:
             flux_model = "flux-2-flex"
+        if str(flux_model).strip().lower() == "flux-2":
+            warnings.append("Flux model flux-2 is deprecated; using flux-2-flex.")
+            flux_model = "flux-2-flex"
         return ResolvedRequest(
             provider=provider,
             model=flux_model,
