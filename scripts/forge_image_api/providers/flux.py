@@ -130,6 +130,8 @@ class FluxAdapter:
     def generate(self, request: ImageRequest, resolved: ResolvedRequest) -> ProviderResponse:
         api_key = _resolve_api_key()
         options = dict(request.provider_options or {})
+        if resolved.model and not any(key in options for key in ("endpoint", "url", "model")):
+            options["model"] = resolved.model
         endpoint_url, endpoint_label = _resolve_endpoint(options)
 
         poll_interval = float(options.get("poll_interval", DEFAULT_POLL_INTERVAL))
