@@ -20,6 +20,7 @@ import argparse
 import base64
 import contextlib
 import csv
+import html
 import io
 import itertools
 import json
@@ -8118,6 +8119,99 @@ _VIEWER_TEMPLATE = """<!doctype html>
         gap: 16px;
         margin: 20px 0 12px;
       }
+      .leaderboard {
+        margin: 18px 0 24px;
+        background: #fff;
+        border-radius: 18px;
+        border: 1px solid var(--border);
+        box-shadow: 0 18px 32px -26px rgba(0, 0, 0, 0.35);
+        padding: 16px 18px;
+      }
+      .leaderboard-header {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .leaderboard-header h2 {
+        margin: 0 0 4px;
+        font-size: 16px;
+      }
+      .leaderboard-note {
+        margin: 0;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .leaderboard-filters {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      .leaderboard-filters label {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        background: var(--paper-2);
+      }
+      .leaderboard-filters input[type="number"] {
+        width: 88px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 4px 6px;
+        font-size: 12px;
+        background: #fff;
+      }
+      .leaderboard-active {
+        margin-top: 10px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .leaderboard-table-wrap {
+        margin-top: 12px;
+        overflow: auto;
+      }
+      table.leaderboard-table {
+        width: 100%;
+        border-collapse: separate;
+        border-spacing: 0;
+        min-width: 840px;
+      }
+      table.leaderboard-table th,
+      table.leaderboard-table td {
+        border-bottom: 1px solid var(--border);
+        padding: 10px 12px;
+        text-align: left;
+        font-size: 13px;
+        vertical-align: top;
+      }
+      table.leaderboard-table th {
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-size: 11px;
+        color: var(--muted);
+        background: var(--paper-2);
+        position: sticky;
+        top: 0;
+        z-index: 2;
+      }
+      .leaderboard-cell {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      .leaderboard-sub {
+        font-size: 11px;
+        color: var(--muted);
+      }
       .panel {
         background: var(--paper-2);
         border-radius: 16px;
@@ -8293,6 +8387,7 @@ _VIEWER_TEMPLATE = """<!doctype html>
       .badge.accent { background: rgba(255, 107, 61, 0.18); }
       .badge.teal { background: rgba(42, 167, 161, 0.18); }
       .badge.yellow { background: rgba(242, 193, 78, 0.25); }
+      .badge.pareto { background: rgba(42, 167, 161, 0.2); }
       .actions {
         display: flex;
         flex-wrap: wrap;
@@ -8380,6 +8475,38 @@ _VIEWER_TEMPLATE = """<!doctype html>
           <div class="filter-list" id="column-filters"></div>
         </div>
       </div>
+      <section class="leaderboard">
+        <div class="leaderboard-header">
+          <div>
+            <h2>Run leaderboard</h2>
+            <p class="leaderboard-note" id="leaderboard-note">Auto picks are used until you select winners.</p>
+          </div>
+          <div class="leaderboard-filters">
+            <label><input id="filter-pareto-cost" type="checkbox" /> Pareto frontier (cost)</label>
+            <label><input id="filter-pareto-latency" type="checkbox" /> Pareto frontier (latency)</label>
+            <label><input id="filter-hide-dominated" type="checkbox" /> Hide dominated (cost)</label>
+            <label>Max $/image <input id="filter-max-cost" type="number" step="0.001" min="0" placeholder="0.03" /></label>
+            <label>Max sec/image (p95) <input id="filter-max-latency" type="number" step="0.1" min="0" placeholder="4.0" /></label>
+          </div>
+        </div>
+        <div class="leaderboard-active" id="leaderboard-active"></div>
+        <div class="leaderboard-table-wrap">
+          <table class="leaderboard-table">
+            <thead>
+              <tr>
+                <th>Model</th>
+                <th>Images (n)</th>
+                <th>Avg cost / 1K images</th>
+                <th>Latency</th>
+                <th>Failure rate</th>
+                <th>Flag rate</th>
+                <th>Pareto</th>
+              </tr>
+            </thead>
+            <tbody id="leaderboard-body"></tbody>
+          </table>
+        </div>
+      </section>
       <section class="compare">
         <h2>Side-by-side compare</h2>
         <div class="compare-grid" id="compare-grid">
@@ -8404,11 +8531,18 @@ _VIEWER_TEMPLATE = """<!doctype html>
         compare: [],
         winners: {},
         cellCursor: {},
-        autoWinners: {}
+        autoWinners: {},
+        paretoCostOnly: false,
+        paretoLatencyOnly: false,
+        hideDominated: false,
+        maxCost: null,
+        maxLatency: null,
+        filteredColumns: null
       };
       const variantsById = new Map();
       const cellIndex = {};
       const storageKey = `pf_winners_${PF_DATA.run.id || "default"}`;
+      const jobStats = PF_DATA.job_stats || {};
 
       function loadWinners() {
         try {
@@ -8515,6 +8649,375 @@ _VIEWER_TEMPLATE = """<!doctype html>
         return cost;
       }
 
+      function formatPercent(value) {
+        if (value === null || value === undefined) return "N/A";
+        return `${(value * 100).toFixed(1)}%`;
+      }
+
+      function formatCurrency(value) {
+        if (value === null || value === undefined) return "N/A";
+        return `$${value.toFixed(4)}`;
+      }
+
+      function formatCurrencyPer1k(value) {
+        if (value === null || value === undefined) return "N/A";
+        const rounded = Math.round(value);
+        return `$${rounded}/1K`;
+      }
+
+      function renderActiveFilters() {
+        const container = document.getElementById("leaderboard-active");
+        if (!container) return;
+        container.innerHTML = "";
+        const pills = [];
+        if (state.paretoCostOnly) pills.push("Pareto frontier (cost)");
+        if (state.paretoLatencyOnly) pills.push("Pareto frontier (latency)");
+        if (state.hideDominated) pills.push("Hide dominated (cost)");
+        if (state.maxCost !== null) pills.push(`Max $/image <= ${state.maxCost}`);
+        if (state.maxLatency !== null) pills.push(`Max sec/image (p95) <= ${state.maxLatency}`);
+        const label = document.createElement("span");
+        label.textContent = "Active filters:";
+        container.appendChild(label);
+        if (!pills.length) {
+          const none = document.createElement("span");
+          none.textContent = "None";
+          container.appendChild(none);
+          return;
+        }
+        pills.forEach((text) => {
+          const pill = document.createElement("div");
+          pill.className = "pill";
+          pill.textContent = text;
+          container.appendChild(pill);
+        });
+      }
+
+      function average(values) {
+        if (!values.length) return null;
+        const total = values.reduce((sum, item) => sum + item, 0);
+        return total / values.length;
+      }
+
+      function quantile(values, q) {
+        if (!values.length) return null;
+        const sorted = [...values].sort((a, b) => a - b);
+        const pos = (sorted.length - 1) * q;
+        const base = Math.floor(pos);
+        const rest = pos - base;
+        if (sorted[base + 1] !== undefined) {
+          return sorted[base] + rest * (sorted[base + 1] - sorted[base]);
+        }
+        return sorted[base];
+      }
+
+      function colorScale(value, min, max) {
+        if (!Number.isFinite(value) || !Number.isFinite(min) || !Number.isFinite(max)) return "";
+        if (max <= min) return "hsl(120, 45%, 92%)";
+        const t = Math.min(1, Math.max(0, (value - min) / (max - min)));
+        const hue = 120 - 120 * t;
+        return `hsl(${hue}, 55%, 90%)`;
+      }
+
+      function computeWinStats() {
+        const manualTotal = Object.keys(state.winners).length;
+        const useManual = manualTotal > 0;
+        const source = useManual ? "manual" : "auto";
+        const winners = useManual ? state.winners : state.autoWinners;
+        const winCounts = {};
+        let total = 0;
+        Object.entries(winners).forEach(([promptId, variantId]) => {
+          const variant = variantsById.get(variantId);
+          if (!variant) return;
+          total += 1;
+          const key = variant.column_key;
+          winCounts[key] = (winCounts[key] || 0) + 1;
+        });
+        return { winCounts, total, source };
+      }
+
+      function computeModelStats() {
+        const stats = {};
+        PF_DATA.variants.forEach((variant) => {
+          const key = variant.column_key;
+          if (!stats[key]) {
+            stats[key] = {
+              key,
+              label: variant.column_label,
+              total: 0,
+              costs: [],
+              latencies: [],
+              scores: [],
+              flagged: 0,
+              flagCounts: {},
+              normalizationCounts: {}
+            };
+          }
+          const entry = stats[key];
+          entry.total += 1;
+          if (Number.isFinite(variant.cost_usd)) {
+            entry.costs.push(variant.cost_usd);
+          }
+          if (Number.isFinite(variant.render_seconds_per_image)) {
+            entry.latencies.push(variant.render_seconds_per_image);
+          }
+          const score = scoreVariant(variant);
+          if (Number.isFinite(score)) {
+            entry.scores.push(score);
+          }
+          if (variant.flags && variant.flags.length) {
+            entry.flagged += 1;
+            variant.flags.forEach((flag) => {
+              entry.flagCounts[flag] = (entry.flagCounts[flag] || 0) + 1;
+            });
+          }
+          if (variant.normalizations && variant.normalizations.length) {
+            variant.normalizations.forEach((note) => {
+              entry.normalizationCounts[note] = (entry.normalizationCounts[note] || 0) + 1;
+            });
+          }
+        });
+
+        const { winCounts, total: winTotal, source: winSource } = computeWinStats();
+        const rows = PF_DATA.columns.map((column) => {
+          const entry = stats[column.key] || {
+            key: column.key,
+            label: column.label,
+            total: 0,
+            costs: [],
+            latencies: [],
+            scores: [],
+            flagged: 0,
+            flagCounts: {}
+          };
+          const avgCost = average(entry.costs);
+          const avgLatency = average(entry.latencies);
+          const scoreAvg = average(entry.scores);
+          const p50 = quantile(entry.latencies, 0.5);
+          const p95 = quantile(entry.latencies, 0.95);
+          const winCount = winCounts[entry.key] || 0;
+          const winRate = winTotal ? winCount / winTotal : null;
+          const flagsRate = entry.total ? entry.flagged / entry.total : null;
+          const flagPairs = Object.entries(entry.flagCounts).sort((a, b) => b[1] - a[1]);
+          const topFlags = flagPairs.slice(0, 2).map(([name]) => name);
+          const normPairs = Object.entries(entry.normalizationCounts).sort((a, b) => b[1] - a[1]);
+          const topNormalizations = normPairs.slice(0, 2).map(([name]) => name);
+          const job = jobStats[entry.key] || {};
+          const jobTotal = Number.isFinite(job.total) ? job.total : null;
+          const failed = Number.isFinite(job.failed) ? job.failed : null;
+          const failureRate = jobTotal && failed !== null ? failed / jobTotal : null;
+          return {
+            key: entry.key,
+            label: entry.label,
+            total: entry.total,
+            avgCost,
+            avgLatency,
+            p50,
+            p95,
+            quality: scoreAvg,
+            winRate,
+            winCount,
+            winTotal,
+            winSource,
+            flagsRate,
+            topFlags,
+            topNormalizations,
+            failureRate,
+            jobTotal,
+            failed
+          };
+        });
+        return { rows, winSource };
+      }
+
+      function paretoFront(stats, costKey, qualityKey) {
+        return stats.filter((current) => {
+          if (!Number.isFinite(current[costKey]) || !Number.isFinite(current[qualityKey])) {
+            return false;
+          }
+          return !stats.some((other) => {
+            if (other.key === current.key) return false;
+            if (!Number.isFinite(other[costKey]) || !Number.isFinite(other[qualityKey])) {
+              return false;
+            }
+            const betterOrEqualQuality = other[qualityKey] >= current[qualityKey];
+            const betterOrEqualCost = other[costKey] <= current[costKey];
+            const strictlyBetter = other[qualityKey] > current[qualityKey] || other[costKey] < current[costKey];
+            return betterOrEqualQuality && betterOrEqualCost && strictlyBetter;
+          });
+        });
+      }
+
+      function computeLeaderboardData() {
+        const { rows, winSource } = computeModelStats();
+        const baseRows = rows.filter((row) => state.visibleColumns.has(row.key));
+        const paretoCostRows = paretoFront(baseRows, "avgCost", "quality");
+        const paretoLatencyRows = paretoFront(baseRows, "avgLatency", "quality");
+        const paretoCost = new Set(paretoCostRows.map((row) => row.key));
+        const paretoLatency = new Set(paretoLatencyRows.map((row) => row.key));
+        const dominatedCost = new Set(baseRows.filter((row) => !paretoCost.has(row.key)).map((row) => row.key));
+
+        const allowed = new Set(baseRows.map((row) => row.key));
+        if (state.maxCost !== null) {
+          baseRows.forEach((row) => {
+            if (!Number.isFinite(row.avgCost) || row.avgCost > state.maxCost) {
+              allowed.delete(row.key);
+            }
+          });
+        }
+        if (state.maxLatency !== null) {
+          baseRows.forEach((row) => {
+            if (!Number.isFinite(row.p95) || row.p95 > state.maxLatency) {
+              allowed.delete(row.key);
+            }
+          });
+        }
+        if (state.hideDominated) {
+          dominatedCost.forEach((key) => allowed.delete(key));
+        }
+        if (state.paretoCostOnly || state.paretoLatencyOnly) {
+          const paretoKeys = new Set();
+          if (state.paretoCostOnly) {
+            paretoCost.forEach((key) => paretoKeys.add(key));
+          }
+          if (state.paretoLatencyOnly) {
+            paretoLatency.forEach((key) => paretoKeys.add(key));
+          }
+          baseRows.forEach((row) => {
+            if (!paretoKeys.has(row.key)) {
+              allowed.delete(row.key);
+            }
+          });
+        }
+
+        const withPareto = baseRows.map((row) => ({
+          ...row,
+          paretoCost: paretoCost.has(row.key),
+          paretoLatency: paretoLatency.has(row.key)
+        }));
+
+        return { rows: withPareto, allowed, winSource };
+      }
+
+      function renderLeaderboard() {
+        const body = document.getElementById("leaderboard-body");
+        const note = document.getElementById("leaderboard-note");
+        body.innerHTML = "";
+        const { rows, allowed, winSource } = computeLeaderboardData();
+        state.filteredColumns = allowed;
+        renderActiveFilters();
+        const filtered = rows.filter((row) => allowed.has(row.key));
+        const costValues = filtered.map((row) => row.avgCost).filter((value) => Number.isFinite(value));
+        const latencyValues = filtered.map((row) => row.p95).filter((value) => Number.isFinite(value));
+        const minCost = costValues.length ? Math.min(...costValues) : null;
+        const maxCost = costValues.length ? Math.max(...costValues) : null;
+        const minLatency = latencyValues.length ? Math.min(...latencyValues) : null;
+        const maxLatency = latencyValues.length ? Math.max(...latencyValues) : null;
+        note.textContent =
+          winSource === "manual"
+            ? "Win rate is based on your picked winners."
+            : "Auto picks are used until you select winners.";
+        if (!filtered.length) {
+          const row = document.createElement("tr");
+          const cell = document.createElement("td");
+          cell.colSpan = 8;
+          cell.className = "cell-empty";
+          cell.textContent = "No models match the current filters.";
+          row.appendChild(cell);
+          body.appendChild(row);
+          return;
+        }
+        const sorted = [...filtered].sort((a, b) => {
+          if (a.winRate !== null && b.winRate !== null && a.winRate !== b.winRate) {
+            return b.winRate - a.winRate;
+          }
+          if (a.quality !== null && b.quality !== null && a.quality !== b.quality) {
+            return b.quality - a.quality;
+          }
+          if (a.avgCost !== null && b.avgCost !== null && a.avgCost !== b.avgCost) {
+            return a.avgCost - b.avgCost;
+          }
+          return a.label.localeCompare(b.label);
+        });
+        sorted.forEach((rowData) => {
+          const row = document.createElement("tr");
+          const modelCell = document.createElement("td");
+          const modelWrap = document.createElement("div");
+          modelWrap.className = "leaderboard-cell";
+          modelWrap.textContent = rowData.label;
+          const modelSub = document.createElement("div");
+          modelSub.className = "leaderboard-sub";
+          modelSub.textContent = `${rowData.total} images`;
+          modelCell.appendChild(modelWrap);
+          modelCell.appendChild(modelSub);
+          row.appendChild(modelCell);
+
+          const totalCell = document.createElement("td");
+          totalCell.textContent = rowData.total !== null && rowData.total !== undefined ? rowData.total : "0";
+          row.appendChild(totalCell);
+
+          const costCell = document.createElement("td");
+          const avgPer1k = rowData.avgCost !== null ? rowData.avgCost * 1000 : null;
+          costCell.textContent = avgPer1k !== null ? formatCurrencyPer1k(avgPer1k) : "N/A";
+          if (rowData.avgCost !== null && minCost !== null && maxCost !== null) {
+            costCell.style.background = colorScale(rowData.avgCost, minCost, maxCost);
+          }
+          row.appendChild(costCell);
+
+          const latencyCell = document.createElement("td");
+          const latencyWrap = document.createElement("div");
+          latencyWrap.className = "leaderboard-cell";
+          latencyWrap.textContent = rowData.p50 !== null ? `p50 ${rowData.p50.toFixed(1)}s` : "N/A";
+          const latencySub = document.createElement("div");
+          latencySub.className = "leaderboard-sub";
+          latencySub.textContent =
+            rowData.p95 !== null ? `p95 ${rowData.p95.toFixed(1)}s` : "p95 N/A";
+          latencyCell.appendChild(latencyWrap);
+          latencyCell.appendChild(latencySub);
+          if (rowData.p95 !== null && minLatency !== null && maxLatency !== null) {
+            latencyCell.style.background = colorScale(rowData.p95, minLatency, maxLatency);
+          }
+          row.appendChild(latencyCell);
+
+          const failureCell = document.createElement("td");
+          failureCell.textContent =
+            rowData.failureRate !== null ? formatPercent(rowData.failureRate) : "N/A";
+          row.appendChild(failureCell);
+
+          const flagCell = document.createElement("td");
+          const flagWrap = document.createElement("div");
+          flagWrap.className = "leaderboard-cell";
+          flagWrap.textContent = rowData.flagsRate !== null ? formatPercent(rowData.flagsRate) : "N/A";
+          const flagSub = document.createElement("div");
+          flagSub.className = "leaderboard-sub";
+          flagSub.textContent = rowData.topFlags.length ? `top flags: ${rowData.topFlags.join(", ")}` : "";
+          const normSub = document.createElement("div");
+          normSub.className = "leaderboard-sub";
+          normSub.textContent = rowData.topNormalizations.length
+            ? `top normalization: ${rowData.topNormalizations.join(", ")}`
+            : "";
+          flagCell.appendChild(flagWrap);
+          if (flagSub.textContent) flagCell.appendChild(flagSub);
+          if (normSub.textContent) flagCell.appendChild(normSub);
+          row.appendChild(flagCell);
+
+          const paretoCell = document.createElement("td");
+          const paretoWrap = document.createElement("div");
+          paretoWrap.className = "badges";
+          if (rowData.paretoCost) {
+            paretoWrap.appendChild(buildBadge("cost", "pareto"));
+          }
+          if (rowData.paretoLatency) {
+            paretoWrap.appendChild(buildBadge("latency", "pareto"));
+          }
+          if (!rowData.paretoCost && !rowData.paretoLatency) {
+            paretoWrap.textContent = "—";
+          }
+          paretoCell.appendChild(paretoWrap);
+          row.appendChild(paretoCell);
+          body.appendChild(row);
+        });
+      }
+
       function renderMeta() {
         const meta = document.getElementById("run-meta");
         meta.innerHTML = "";
@@ -8554,6 +9057,7 @@ _VIEWER_TEMPLATE = """<!doctype html>
             } else {
               state.visibleColumns.delete(column.key);
             }
+            renderLeaderboard();
             renderGrid();
           });
           label.appendChild(checkbox);
@@ -8665,7 +9169,10 @@ _VIEWER_TEMPLATE = """<!doctype html>
         const body = document.getElementById("grid-body");
         head.innerHTML = "";
         body.innerHTML = "";
-        const visibleColumns = PF_DATA.columns.filter((col) => state.visibleColumns.has(col.key));
+        const allowedKeys = state.filteredColumns || new Set(state.visibleColumns);
+        const visibleColumns = PF_DATA.columns.filter(
+          (col) => state.visibleColumns.has(col.key) && allowedKeys.has(col.key)
+        );
 
         const headRow = document.createElement("tr");
         const corner = document.createElement("th");
@@ -8802,6 +9309,7 @@ _VIEWER_TEMPLATE = """<!doctype html>
           toast("Winner saved.");
         }
         saveWinners();
+        renderLeaderboard();
         renderGrid();
       }
 
@@ -8829,6 +9337,35 @@ _VIEWER_TEMPLATE = """<!doctype html>
           state.flagsOnly = event.target.checked;
           renderGrid();
         });
+        document.getElementById("filter-pareto-cost").addEventListener("change", (event) => {
+          state.paretoCostOnly = event.target.checked;
+          renderLeaderboard();
+          renderGrid();
+        });
+        document.getElementById("filter-pareto-latency").addEventListener("change", (event) => {
+          state.paretoLatencyOnly = event.target.checked;
+          renderLeaderboard();
+          renderGrid();
+        });
+        document.getElementById("filter-hide-dominated").addEventListener("change", (event) => {
+          state.hideDominated = event.target.checked;
+          renderLeaderboard();
+          renderGrid();
+        });
+        document.getElementById("filter-max-cost").addEventListener("input", (event) => {
+          const raw = event.target.value;
+          state.maxCost = raw ? parseFloat(raw) : null;
+          if (Number.isNaN(state.maxCost)) state.maxCost = null;
+          renderLeaderboard();
+          renderGrid();
+        });
+        document.getElementById("filter-max-latency").addEventListener("input", (event) => {
+          const raw = event.target.value;
+          state.maxLatency = raw ? parseFloat(raw) : null;
+          if (Number.isNaN(state.maxLatency)) state.maxLatency = null;
+          renderLeaderboard();
+          renderGrid();
+        });
       }
 
       function init() {
@@ -8838,6 +9375,7 @@ _VIEWER_TEMPLATE = """<!doctype html>
         computeAutoWinners();
         renderMeta();
         renderColumnFilters();
+        renderLeaderboard();
         renderGrid();
         renderCompare();
         attachHandlers();
@@ -8845,6 +9383,171 @@ _VIEWER_TEMPLATE = """<!doctype html>
 
       init();
     </script>
+  </body>
+</html>
+"""
+
+_RUNS_DASHBOARD_TEMPLATE = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Param Forge Run Leaderboards</title>
+    <style>
+      :root {
+        --ink: #121212;
+        --muted: #6b645f;
+        --paper: #f6f1e8;
+        --paper-2: #fbfaf7;
+        --card: #ffffff;
+        --accent: #ff6b3d;
+        --accent-2: #2aa7a1;
+        --shadow: rgba(16, 16, 16, 0.12);
+        --border: rgba(18, 18, 18, 0.08);
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: "Space Grotesk", "Avenir Next", "Futura", sans-serif;
+        color: var(--ink);
+        background: radial-gradient(circle at top, #f9ede2 0%, var(--paper) 45%, #f1f7f4 100%);
+      }
+      .page {
+        max-width: 1400px;
+        margin: 0 auto;
+        padding: 32px 24px 64px;
+      }
+      header.hero {
+        padding: 24px 28px;
+        border-radius: 20px;
+        background: linear-gradient(120deg, #fff2e8 0%, #f7fff7 50%, #f1f5ff 100%);
+        box-shadow: 0 16px 40px -28px rgba(0, 0, 0, 0.3);
+        border: 1px solid rgba(255, 107, 61, 0.12);
+        margin-bottom: 18px;
+      }
+      header.hero h1 {
+        margin: 0 0 8px;
+        font-size: 28px;
+        letter-spacing: -0.02em;
+      }
+      header.hero p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 14px;
+      }
+      .pill {
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: rgba(18, 18, 18, 0.06);
+        border: 1px solid var(--border);
+        font-size: 12px;
+      }
+      .run-card {
+        background: #fff;
+        border-radius: 18px;
+        border: 1px solid var(--border);
+        box-shadow: 0 18px 32px -26px rgba(0, 0, 0, 0.35);
+        padding: 16px 18px;
+        margin-bottom: 20px;
+      }
+      .run-header {
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        align-items: flex-start;
+        flex-wrap: wrap;
+      }
+      .run-header h2 {
+        margin: 0 0 6px;
+        font-size: 18px;
+      }
+      .run-path {
+        font-size: 12px;
+        color: var(--muted);
+        word-break: break-all;
+      }
+      .run-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin: 10px 0 12px;
+      }
+      .btn {
+        border: none;
+        padding: 8px 12px;
+        border-radius: 10px;
+        background: var(--accent);
+        color: #fff;
+        font-size: 12px;
+        text-decoration: none;
+        display: inline-block;
+      }
+      .btn.ghost {
+        background: rgba(18, 18, 18, 0.08);
+        color: var(--ink);
+      }
+      table.leaderboard-table {
+        width: 100%;
+        border-collapse: separate;
+        border-spacing: 0;
+        min-width: 840px;
+      }
+      table.leaderboard-table th,
+      table.leaderboard-table td {
+        border-bottom: 1px solid var(--border);
+        padding: 10px 12px;
+        text-align: left;
+        font-size: 13px;
+        vertical-align: top;
+      }
+      table.leaderboard-table th {
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-size: 11px;
+        color: var(--muted);
+        background: var(--paper-2);
+        position: sticky;
+        top: 0;
+        z-index: 2;
+      }
+      .leaderboard-table-wrap {
+        overflow: auto;
+      }
+      .leaderboard-sub {
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .badges {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+      .badge {
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: rgba(18, 18, 18, 0.08);
+        font-size: 11px;
+      }
+      .badge.pareto { background: rgba(42, 167, 161, 0.2); }
+      .empty {
+        padding: 12px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <header class="hero">
+        <h1>Param Forge Run Leaderboards</h1>
+        <p>Aggregated leaderboards across runs (cost, latency, failure, flags). Generated from run manifests + receipts.</p>
+      </header>
+      <div class="run-meta">
+        __SUMMARY_PILLS__
+      </div>
+      __GLOBAL_SECTION__
+      __RUN_SECTIONS__
+    </div>
   </body>
 </html>
 """
@@ -8940,6 +9643,19 @@ def _view_build_snippet(receipt: dict) -> str:
     return "\n".join(lines)
 
 
+def _view_classify_warning(message: str) -> str:
+    text = message.strip().lower()
+    if not text:
+        return "warning"
+    if "size snapped" in text or "snapped to" in text:
+        return "normalization"
+    if "aspect ratio" in text and ("normalized" in text or "snapped" in text):
+        return "normalization"
+    if "normalized" in text and ("size" in text or "aspect ratio" in text):
+        return "normalization"
+    return "warning"
+
+
 def _view_load_manifest(run_dir: Path) -> dict | None:
     manifest_path = run_dir / "run.json"
     if not manifest_path.exists():
@@ -8977,6 +9693,27 @@ def _view_build_index(run_path: Path, view_dir: Path) -> dict:
     run_dir = run_path if run_path.is_dir() else run_path.parent
     manifest = _view_load_manifest(run_dir)
     receipts, job_lookup = _view_collect_receipts(run_dir, manifest)
+    job_stats: dict[str, dict[str, int]] = {}
+    if manifest and isinstance(manifest.get("jobs"), list):
+        for job in manifest.get("jobs", []):
+            if not isinstance(job, dict):
+                continue
+            params = job.get("params") if isinstance(job.get("params"), dict) else {}
+            provider = params.get("provider") or job.get("provider") or "unknown"
+            model = params.get("model") or job.get("model") or "default"
+            column_key = f"{provider}::{model}"
+            entry = job_stats.setdefault(
+                column_key,
+                {"total": 0, "failed": 0, "skipped": 0, "succeeded": 0},
+            )
+            entry["total"] += 1
+            status = job.get("status")
+            if status == "failed":
+                entry["failed"] += 1
+            elif status == "skipped":
+                entry["skipped"] += 1
+            elif status == "success":
+                entry["succeeded"] += 1
 
     prompts: list[dict[str, str]] = []
     prompt_by_id: dict[str, str] = {}
@@ -9088,13 +9825,23 @@ def _view_build_index(run_path: Path, view_dir: Path) -> dict:
             warnings.extend([str(item) for item in receipt.get("warnings") if item])
         if isinstance(resolved.get("warnings"), list):
             warnings.extend([str(item) for item in resolved.get("warnings") if item])
+        normalizations: list[str] = []
+        warning_flags: list[str] = []
+        for item in warnings:
+            bucket = _view_classify_warning(item)
+            if bucket == "normalization":
+                normalizations.append(item)
+            else:
+                warning_flags.append(item)
+        if normalizations:
+            normalizations = list(dict.fromkeys(normalizations))
         snippet = _view_build_snippet(receipt)
         variant_id = receipt_path.name
         flags = []
         if isinstance(quality_gates, list):
             flags.extend([str(item) for item in quality_gates if item])
-        if warnings:
-            flags.extend(warnings)
+        if warning_flags:
+            flags.extend(warning_flags)
         variants.append(
             {
                 "id": variant_id,
@@ -9116,6 +9863,7 @@ def _view_build_index(run_path: Path, view_dir: Path) -> dict:
                 "quality": quality,
                 "retrieval_score": retrieval_score,
                 "flags": flags,
+                "normalizations": normalizations,
                 "snippet": snippet,
             }
         )
@@ -9130,7 +9878,472 @@ def _view_build_index(run_path: Path, view_dir: Path) -> dict:
         "prompts": prompts,
         "columns": columns,
         "variants": variants,
+        "job_stats": job_stats,
     }
+
+
+def _view_html_escape(value: object) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def _view_mean(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return float(sum(values) / len(values))
+
+
+def _view_percentile(values: list[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    sorted_vals = sorted(values)
+    pos = (len(sorted_vals) - 1) * quantile
+    base = int(math.floor(pos))
+    rest = pos - base
+    if base + 1 < len(sorted_vals):
+        return sorted_vals[base] + rest * (sorted_vals[base + 1] - sorted_vals[base])
+    return sorted_vals[base]
+
+
+def _view_score_variant(variant: dict[str, object]) -> float | None:
+    values: list[float] = []
+    for key in ("adherence", "quality", "retrieval_score"):
+        raw = variant.get(key)
+        if isinstance(raw, (int, float)):
+            values.append(float(raw))
+    if not values:
+        return None
+    return float(sum(values) / len(values))
+
+
+def _view_color_scale(value: float | None, min_value: float | None, max_value: float | None) -> str | None:
+    if value is None or min_value is None or max_value is None:
+        return None
+    if max_value <= min_value:
+        return "hsl(120, 55%, 90%)"
+    t = (value - min_value) / (max_value - min_value)
+    t = max(0.0, min(1.0, t))
+    hue = 120 - 120 * t
+    return f"hsl({hue:.1f}, 55%, 90%)"
+
+
+def _view_pareto_front(rows: list[dict[str, object]], cost_key: str, quality_key: str) -> set[str]:
+    frontier: set[str] = set()
+    for row in rows:
+        key = str(row.get("key") or "")
+        cost = row.get(cost_key)
+        quality = row.get(quality_key)
+        if not isinstance(cost, (int, float)) or not isinstance(quality, (int, float)):
+            continue
+        dominated = False
+        for other in rows:
+            if other is row:
+                continue
+            other_cost = other.get(cost_key)
+            other_quality = other.get(quality_key)
+            if not isinstance(other_cost, (int, float)) or not isinstance(other_quality, (int, float)):
+                continue
+            better_or_equal_quality = other_quality >= quality
+            better_or_equal_cost = other_cost <= cost
+            strictly_better = other_quality > quality or other_cost < cost
+            if better_or_equal_quality and better_or_equal_cost and strictly_better:
+                dominated = True
+                break
+        if not dominated:
+            frontier.add(key)
+    return frontier
+
+
+def _view_init_stat_entry(label: str) -> dict[str, object]:
+    return {
+        "label": label,
+        "costs": [],
+        "latencies": [],
+        "scores": [],
+        "total": 0,
+        "flagged": 0,
+        "flag_counts": {},
+        "normalization_counts": {},
+    }
+
+
+def _view_collect_variant_stats(variants: list[dict[str, object]]) -> dict[str, dict[str, object]]:
+    stats: dict[str, dict[str, object]] = {}
+    for variant in variants:
+        if not isinstance(variant, dict):
+            continue
+        key = str(variant.get("column_key") or "")
+        if not key:
+            continue
+        label = str(variant.get("column_label") or key)
+        entry = stats.setdefault(key, _view_init_stat_entry(label))
+        entry["label"] = label
+        entry["total"] = int(entry.get("total") or 0) + 1
+        cost = variant.get("cost_usd")
+        if isinstance(cost, (int, float)):
+            entry["costs"].append(float(cost))
+        latency = variant.get("render_seconds_per_image")
+        if isinstance(latency, (int, float)):
+            entry["latencies"].append(float(latency))
+        score = _view_score_variant(variant)
+        if isinstance(score, (int, float)):
+            entry["scores"].append(float(score))
+        flags = variant.get("flags") if isinstance(variant.get("flags"), list) else []
+        if flags:
+            entry["flagged"] = int(entry.get("flagged") or 0) + 1
+            counts = entry["flag_counts"]
+            for flag in flags:
+                name = str(flag)
+                counts[name] = int(counts.get(name, 0)) + 1
+        normalizations = (
+            variant.get("normalizations") if isinstance(variant.get("normalizations"), list) else []
+        )
+        if normalizations:
+            counts = entry["normalization_counts"]
+            for note in normalizations:
+                name = str(note)
+                counts[name] = int(counts.get(name, 0)) + 1
+    return stats
+
+
+def _view_rows_from_stats(
+    stats: dict[str, dict[str, object]],
+    job_stats: dict[str, dict[str, int]] | None = None,
+    columns: list[dict[str, str]] | None = None,
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    ordered_keys: list[tuple[str, str]] = []
+    if columns:
+        for column in columns:
+            if not isinstance(column, dict):
+                continue
+            key = str(column.get("key") or "")
+            if not key:
+                continue
+            label = str(column.get("label") or key)
+            ordered_keys.append((key, label))
+    else:
+        for key, entry in stats.items():
+            ordered_keys.append((key, str(entry.get("label") or key)))
+
+    for key, label in ordered_keys:
+        entry = stats.get(key, _view_init_stat_entry(label))
+        costs = entry.get("costs") if isinstance(entry.get("costs"), list) else []
+        latencies = entry.get("latencies") if isinstance(entry.get("latencies"), list) else []
+        scores = entry.get("scores") if isinstance(entry.get("scores"), list) else []
+        avg_cost = _view_mean(costs)
+        p50 = _view_percentile(latencies, 0.5)
+        p95 = _view_percentile(latencies, 0.95)
+        quality = _view_mean(scores)
+        total = int(entry.get("total") or 0)
+        flagged = int(entry.get("flagged") or 0)
+        flag_rate = (flagged / total) if total else None
+        flag_counts = entry.get("flag_counts") if isinstance(entry.get("flag_counts"), dict) else {}
+        top_flags = [name for name, _ in sorted(flag_counts.items(), key=lambda kv: kv[1], reverse=True)[:2]]
+        norm_counts = (
+            entry.get("normalization_counts") if isinstance(entry.get("normalization_counts"), dict) else {}
+        )
+        top_norms = [name for name, _ in sorted(norm_counts.items(), key=lambda kv: kv[1], reverse=True)[:2]]
+        failure_rate = None
+        if job_stats and isinstance(job_stats.get(key), dict):
+            job_entry = job_stats.get(key, {})
+            job_total = job_entry.get("total") if isinstance(job_entry.get("total"), int) else None
+            failed = job_entry.get("failed") if isinstance(job_entry.get("failed"), int) else None
+            if job_total:
+                failure_rate = (failed / job_total) if failed is not None else None
+        rows.append(
+            {
+                "key": key,
+                "label": label,
+                "avg_cost": avg_cost,
+                "p50": p50,
+                "p95": p95,
+                "quality": quality,
+                "flag_rate": flag_rate,
+                "top_flags": top_flags,
+                "top_norms": top_norms,
+                "failure_rate": failure_rate,
+                "total": total,
+            }
+        )
+    return rows
+
+
+def _view_decorate_rows(rows: list[dict[str, object]]) -> None:
+    pareto_cost = _view_pareto_front(rows, "avg_cost", "quality")
+    pareto_latency = _view_pareto_front(rows, "p95", "quality")
+
+    cost_values = [row.get("avg_cost") for row in rows if isinstance(row.get("avg_cost"), (int, float))]
+    latency_values = [row.get("p95") for row in rows if isinstance(row.get("p95"), (int, float))]
+    min_cost = min(cost_values) if cost_values else None
+    max_cost = max(cost_values) if cost_values else None
+    min_latency = min(latency_values) if latency_values else None
+    max_latency = max(latency_values) if latency_values else None
+
+    for row in rows:
+        key = str(row.get("key") or "")
+        row["pareto_cost"] = key in pareto_cost
+        row["pareto_latency"] = key in pareto_latency
+        row["cost_color"] = _view_color_scale(
+            row.get("avg_cost") if isinstance(row.get("avg_cost"), (int, float)) else None,
+            min_cost,
+            max_cost,
+        )
+        row["latency_color"] = _view_color_scale(
+            row.get("p95") if isinstance(row.get("p95"), (int, float)) else None,
+            min_latency,
+            max_latency,
+        )
+
+
+def _view_collect_run_dirs(root: Path) -> list[Path]:
+    run_dirs: list[Path] = []
+    if root.is_file():
+        return []
+    for path in root.rglob("run.json"):
+        if ".param_forge_view" in path.parts:
+            continue
+        run_dirs.append(path.parent)
+    if root.joinpath("run.json").exists() and root not in run_dirs:
+        run_dirs.insert(0, root)
+    run_dirs = list(dict.fromkeys(run_dirs))
+    run_dirs.sort(key=lambda p: p.joinpath("run.json").stat().st_mtime, reverse=True)
+    return run_dirs
+
+
+def _view_build_run_leaderboard_from_data(
+    run_dir: Path, out_dir: Path, data: dict[str, object]
+) -> dict[str, object]:
+    columns = data.get("columns") if isinstance(data.get("columns"), list) else []
+    variants = data.get("variants") if isinstance(data.get("variants"), list) else []
+    prompts = data.get("prompts") if isinstance(data.get("prompts"), list) else []
+    job_stats = data.get("job_stats") if isinstance(data.get("job_stats"), dict) else {}
+    stats = _view_collect_variant_stats([item for item in variants if isinstance(item, dict)])
+    rows = _view_rows_from_stats(stats, job_stats=job_stats, columns=columns)
+    _view_decorate_rows(rows)
+
+    run_view_path = run_dir / ".param_forge_view" / "index.html"
+    view_href = None
+    if run_view_path.exists():
+        view_href = _view_rel_path(run_view_path, out_dir)
+
+    total_cost = 0.0
+    for variant in variants:
+        if isinstance(variant, dict):
+            cost = variant.get("cost_usd")
+            if isinstance(cost, (int, float)):
+                total_cost += float(cost)
+    run_id = None
+    if isinstance(data.get("run"), dict):
+        run_id = data.get("run", {}).get("id")
+    return {
+        "run_id": run_id or run_dir.name,
+        "path": str(run_dir),
+        "prompts": len(prompts),
+        "models": len(columns),
+        "images": len(variants),
+        "estimated_cost": total_cost if total_cost > 0 else None,
+        "rows": rows,
+        "view_href": view_href,
+    }
+
+
+def _view_build_run_leaderboard(run_dir: Path, out_dir: Path) -> dict[str, object]:
+    data = _view_build_index(run_dir, run_dir)
+    return _view_build_run_leaderboard_from_data(run_dir, out_dir, data)
+
+
+def _view_build_aggregate_leaderboard(
+    runs_data: list[tuple[Path, dict[str, object]]], out_dir: Path
+) -> dict[str, object] | None:
+    if not runs_data:
+        return None
+    stats: dict[str, dict[str, object]] = {}
+    job_stats: dict[str, dict[str, int]] = {}
+    prompt_total = 0
+    image_total = 0
+    run_count = 0
+    for run_dir, data in runs_data:
+        run_count += 1
+        prompts = data.get("prompts") if isinstance(data.get("prompts"), list) else []
+        variants = data.get("variants") if isinstance(data.get("variants"), list) else []
+        prompt_total += len(prompts)
+        image_total += len(variants)
+        run_stats = _view_collect_variant_stats([item for item in variants if isinstance(item, dict)])
+        for key, entry in run_stats.items():
+            merged = stats.setdefault(key, _view_init_stat_entry(str(entry.get("label") or key)))
+            merged["label"] = str(entry.get("label") or merged.get("label") or key)
+            merged["total"] = int(merged.get("total") or 0) + int(entry.get("total") or 0)
+            merged["flagged"] = int(merged.get("flagged") or 0) + int(entry.get("flagged") or 0)
+            for field in ("costs", "latencies", "scores"):
+                merged_list = merged.get(field) if isinstance(merged.get(field), list) else []
+                entry_list = entry.get(field) if isinstance(entry.get(field), list) else []
+                merged_list.extend([item for item in entry_list if isinstance(item, (int, float))])
+                merged[field] = merged_list
+            for field in ("flag_counts", "normalization_counts"):
+                merged_counts = merged.get(field) if isinstance(merged.get(field), dict) else {}
+                entry_counts = entry.get(field) if isinstance(entry.get(field), dict) else {}
+                for name, count in entry_counts.items():
+                    merged_counts[name] = int(merged_counts.get(name, 0)) + int(count)
+                merged[field] = merged_counts
+        run_job_stats = data.get("job_stats") if isinstance(data.get("job_stats"), dict) else {}
+        for key, entry in run_job_stats.items():
+            if not isinstance(entry, dict):
+                continue
+            merged_job = job_stats.setdefault(
+                key, {"total": 0, "failed": 0, "skipped": 0, "succeeded": 0}
+            )
+            for field in ("total", "failed", "skipped", "succeeded"):
+                value = entry.get(field)
+                if isinstance(value, int):
+                    merged_job[field] = int(merged_job.get(field, 0)) + value
+
+    rows = _view_rows_from_stats(stats, job_stats=job_stats, columns=None)
+    _view_decorate_rows(rows)
+
+    total_cost = 0.0
+    for _, data in runs_data:
+        variants = data.get("variants") if isinstance(data.get("variants"), list) else []
+        for variant in variants:
+            if isinstance(variant, dict):
+                cost = variant.get("cost_usd")
+                if isinstance(cost, (int, float)):
+                    total_cost += float(cost)
+    return {
+        "run_id": f"All runs ({run_count})",
+        "path": str(out_dir),
+        "prompts": prompt_total,
+        "models": len(rows),
+        "images": image_total,
+        "estimated_cost": total_cost if total_cost > 0 else None,
+        "rows": rows,
+        "view_href": None,
+    }
+
+
+def _view_write_runs_dashboard(
+    runs: list[dict[str, object]],
+    out_path: Path,
+    runs_root: Path,
+    aggregate: dict[str, object] | None = None,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    run_sections: list[str] = []
+    total_runs = len(runs)
+    summary_pills = [
+        f'<div class="pill">Runs: {total_runs}</div>',
+        f'<div class="pill">Root: {_view_html_escape(runs_root)}</div>',
+    ]
+    if aggregate:
+        summary_pills.append(f'<div class="pill">Models: {aggregate.get("models")}</div>')
+        summary_pills.append(f'<div class="pill">Images: {aggregate.get("images")}</div>')
+    for run in runs:
+        run_sections.append(_view_render_run_section(run))
+
+    global_section = ""
+    if aggregate:
+        global_section = _view_render_run_section(aggregate, title_override="All runs (aggregate)")
+    html_text = _RUNS_DASHBOARD_TEMPLATE.replace("__RUN_SECTIONS__", "\n".join(run_sections))
+    html_text = html_text.replace("__GLOBAL_SECTION__", global_section or "")
+    html_text = html_text.replace("__SUMMARY_PILLS__", "\n".join(summary_pills))
+    out_path.write_text(html_text, encoding="utf-8")
+
+
+def _view_render_run_section(run: dict[str, object], title_override: str | None = None) -> str:
+    rows = run.get("rows") if isinstance(run.get("rows"), list) else []
+    if rows:
+        row_html: list[str] = []
+        for row in rows:
+            label = _view_html_escape(row.get("label") or row.get("key") or "")
+            avg_cost = row.get("avg_cost")
+            cost_text = "N/A"
+            if isinstance(avg_cost, (int, float)):
+                cost_text = f"${int(round(avg_cost * 1000))}/1K"
+            cost_style = row.get("cost_color")
+            cost_attr = f' style="background: {cost_style};"' if cost_style else ""
+            p50 = row.get("p50")
+            p95 = row.get("p95")
+            latency_text = "N/A"
+            if isinstance(p50, (int, float)):
+                latency_text = f"p50 {p50:.1f}s"
+            latency_sub = f"p95 {p95:.1f}s" if isinstance(p95, (int, float)) else "p95 N/A"
+            latency_style = row.get("latency_color")
+            latency_attr = f' style="background: {latency_style};"' if latency_style else ""
+            failure_rate = row.get("failure_rate")
+            failure_text = f"{failure_rate * 100:.1f}%" if isinstance(failure_rate, (int, float)) else "N/A"
+            flag_rate = row.get("flag_rate")
+            flag_text = f"{flag_rate * 100:.1f}%" if isinstance(flag_rate, (int, float)) else "N/A"
+            top_flags = row.get("top_flags") if isinstance(row.get("top_flags"), list) else []
+            top_norms = row.get("top_norms") if isinstance(row.get("top_norms"), list) else []
+            flag_sub = f"top flags: {', '.join(top_flags)}" if top_flags else ""
+            norm_sub = f"top normalization: {', '.join(top_norms)}" if top_norms else ""
+            pareto_badges: list[str] = []
+            if row.get("pareto_cost"):
+                pareto_badges.append('<span class="badge pareto">cost</span>')
+            if row.get("pareto_latency"):
+                pareto_badges.append('<span class="badge pareto">latency</span>')
+            pareto_html = "".join(pareto_badges) if pareto_badges else "—"
+            row_html.append(
+                "<tr>"
+                f"<td>{label}</td>"
+                f"<td>{_view_html_escape(row.get('total') or 0)}</td>"
+                f"<td{cost_attr}>{_view_html_escape(cost_text)}</td>"
+                f"<td{latency_attr}><div>{_view_html_escape(latency_text)}</div>"
+                f"<div class=\"leaderboard-sub\">{_view_html_escape(latency_sub)}</div></td>"
+                f"<td>{_view_html_escape(failure_text)}</td>"
+                f"<td><div>{_view_html_escape(flag_text)}</div>"
+                f"<div class=\"leaderboard-sub\">{_view_html_escape(flag_sub)}</div>"
+                f"<div class=\"leaderboard-sub\">{_view_html_escape(norm_sub)}</div></td>"
+                f"<td><div class=\"badges\">{pareto_html}</div></td>"
+                "</tr>"
+            )
+        table_html = (
+            "<div class=\"leaderboard-table-wrap\">"
+            "<table class=\"leaderboard-table\">"
+            "<thead><tr>"
+            "<th>Model</th>"
+            "<th>Images (n)</th>"
+            "<th>Avg cost / 1K images</th>"
+            "<th>Latency</th>"
+            "<th>Failure rate</th>"
+            "<th>Flag rate</th>"
+            "<th>Pareto</th>"
+            "</tr></thead>"
+            f"<tbody>{''.join(row_html)}</tbody>"
+            "</table></div>"
+        )
+    else:
+        table_html = '<div class="empty">No receipts found for this run.</div>'
+
+    view_href = run.get("view_href")
+    action_html = ""
+    if view_href:
+        action_html = f'<a class="btn" href="{_view_html_escape(view_href)}">Open run viewer</a>'
+    elif view_href is None and title_override is None:
+        action_html = '<span class="pill">Run viewer not generated</span>'
+
+    estimated_cost = run.get("estimated_cost")
+    cost_pill = (
+        f'<div class="pill">Est. cost: ${estimated_cost:.2f}</div>'
+        if isinstance(estimated_cost, (int, float))
+        else '<div class="pill">Est. cost: N/A</div>'
+    )
+    title = title_override or (run.get("run_id") or "")
+    return (
+        "<section class=\"run-card\">"
+        "<div class=\"run-header\">"
+        f"<div><h2>{_view_html_escape(title)}</h2>"
+        f"<div class=\"run-path\">{_view_html_escape(run.get('path') or '')}</div></div>"
+        f"<div>{action_html}</div>"
+        "</div>"
+        "<div class=\"run-meta\">"
+        f"<div class=\"pill\">Prompts: {run.get('prompts')}</div>"
+        f"<div class=\"pill\">Models: {run.get('models')}</div>"
+        f"<div class=\"pill\">Images: {run.get('images')}</div>"
+        f"{cost_pill}"
+        "</div>"
+        f"{table_html}"
+        "</section>"
+    )
 
 
 def _view_write_html(data: dict, out_path: Path) -> None:
@@ -9159,7 +10372,12 @@ def _maybe_open_viewer(run_dir: Path) -> None:
 
 def _run_view_cli(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="PARAM FORGE: view a receipt run locally.")
-    parser.add_argument("path", help="Run folder, run.json, or receipt path")
+    parser.add_argument("path", nargs="?", help="Run folder, run.json, or receipt path")
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Build a dashboard across all runs in the provided path (default: ./runs)",
+    )
     parser.add_argument(
         "--out",
         default=None,
@@ -9167,6 +10385,32 @@ def _run_view_cli(argv: list[str]) -> int:
     )
     parser.add_argument("--no-open", action="store_true", help="Do not open the viewer in a browser.")
     args = parser.parse_args(argv)
+
+    if args.all:
+        runs_root = None
+        if args.path:
+            runs_root = Path(args.path).expanduser().resolve()
+        else:
+            runs_root = (Path.cwd() / "runs").resolve()
+        if not runs_root.exists():
+            print(f"No runs directory found at {runs_root}")
+            return 1
+        out_dir = (
+            Path(args.out).expanduser().resolve() if args.out else (runs_root / ".param_forge_view_all")
+        )
+        out_path = out_dir / "index.html"
+        run_dirs = _view_collect_run_dirs(runs_root)
+        runs_data = [(run_dir, _view_build_index(run_dir, run_dir)) for run_dir in run_dirs]
+        runs = [_view_build_run_leaderboard_from_data(run_dir, out_dir, data) for run_dir, data in runs_data]
+        aggregate = _view_build_aggregate_leaderboard(runs_data, out_dir)
+        _view_write_runs_dashboard(runs, out_path, runs_root, aggregate=aggregate)
+        if not args.no_open:
+            _open_path(out_path)
+        print(f"Run dashboard written to {out_path}")
+        return 0
+
+    if not args.path:
+        parser.error("path is required unless --all is set")
 
     target = Path(args.path).expanduser().resolve()
     run_dir = target if target.is_dir() else target.parent
