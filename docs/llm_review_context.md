@@ -21,10 +21,12 @@ Provide targeted feedback that leads to 10x improvements in:
 - Steps: Mode → Provider → Model → Prompt → Size → Images per prompt → Output dir
 - Generates images + receipts, then (optionally) analyzes and applies recommendations.
 - Auto-opens a local receipt viewer at the end of interactive runs.
+- Optional: user can opt into local run history to improve future Optimize recommendations.
 
 ### API Explore (interactive)
 - UI label: "API Explore" (read-only parameter reference).
 - Lets you browse provider/model params and cost notes without running a job.
+- Prompts for provider/model selection to filter the reference list.
 
 ### Batch run (interactive + CLI)
 - UI label: “Batch run” (select providers/models, size, concurrency, budgets).

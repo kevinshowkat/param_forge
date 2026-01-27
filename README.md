@@ -91,6 +91,11 @@ python scripts/param_forge.py batch-run \
 ```
 Tip: in the UI, Batch run lets you pick providers/models directly without a matrix file.
 
+Interactive modes (UI):
+- Optimize: guided single-run loop with receipts + recommendations.
+- Batch run: matrix or provider/model sweeps.
+- API Explore: read-only parameter reference (pick provider/model to filter).
+
 Prompt selection (interactive):
 - The Optimize flow includes a **Prompt** step.
 - Press Enter with no input to use the default prompt.
@@ -107,6 +112,11 @@ Receipt analyzer provider:
 - Override with env var: `RECEIPT_ANALYZER=openai` (or `anthropic`, `council`).
 - Or pass `--analyzer openai` on the CLI.
 - Note: `council` runs multiple analyzers and may take a few minutes.
+
+Local history (opt-in):
+- The Optimize flow can store local run history to improve future recommendations.
+- Stored in `~/.param_forge/config.json` and `~/.param_forge/run_history.jsonl`.
+- Override without prompting: `PARAM_FORGE_HISTORY=1` (enable) or `PARAM_FORGE_HISTORY=0` (disable).
 
 ## Council analyzer
 Param Forge includes a **council** analyzer option that aggregates multiple LLMs and synthesizes a single recommendation. This is inspired by Andrej Karpathy’s LLM Council approach.
