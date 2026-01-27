@@ -20,7 +20,7 @@
   </defs>
 
   <rect class="bg" x="0" y="0" width="1200" height="1040"/>
-  <text class="title" x="40" y="54">Explore Mode — Feedback Loop</text>
+  <text class="title" x="40" y="54">Optimize Mode - Feedback Loop</text>
 
   <!-- Loop ring -->
   <circle class="ring" cx="600" cy="360" r="210"/>

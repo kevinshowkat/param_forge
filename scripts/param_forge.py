@@ -32,6 +32,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -79,6 +80,53 @@ SIZE_CHOICES = [
     ("1536x1024", "1536x1024"),
 ]
 OUT_DIR_CHOICES = ["outputs/param_forge", "outputs/param_forge_dated"]
+_API_COMMON_PARAMS: list[tuple[str, str]] = [
+    ("prompt", "Text prompt describing the image."),
+    ("size", "Aspect ratio / resolution. Cost: larger sizes usually cost more."),
+    ("n", "Images per prompt. Cost: scales linearly with n."),
+    ("model", "Model name override. Cost: model dependent."),
+    ("output_format", "jpeg/png/webp output. PNG can increase payload size."),
+    ("seed", "Deterministic seed (if supported)."),
+    ("background", "Background mode (OpenAI only)."),
+]
+_API_PROVIDER_PARAMS: dict[str, list[tuple[str, str]]] = {
+    "openai": [
+        ("provider_options.quality", "Quality tier (low/medium/high). Cost: higher tiers cost more."),
+        ("provider_options.moderation", "Moderation setting."),
+        ("provider_options.input_fidelity", "Input fidelity for edits."),
+        ("provider_options.output_compression", "Compression for non-PNG outputs."),
+        (
+            "provider_options.use_responses",
+            "Use Responses API instead of images endpoint (aka openai_use_responses). Cost: may differ by API path.",
+        ),
+        (
+            "provider_options.responses_model",
+            "Responses model override (aka openai_responses_model). Cost: model dependent.",
+        ),
+    ],
+    "gemini": [
+        ("provider_options.image_size", "Size tier hint (1K/2K/4K). Cost: higher tiers cost more."),
+        ("provider_options.safety_settings", "Safety config overrides."),
+    ],
+    "imagen": [
+        ("provider_options.image_size", "Size tier hint (1K/2K/4K). Cost: higher tiers cost more."),
+        ("provider_options.add_watermark", "Add watermark (true/false)."),
+        ("provider_options.person_generation", "People generation policy."),
+    ],
+    "flux": [
+        ("provider_options.endpoint", "BFL endpoint selector. Cost: depends on endpoint."),
+        ("provider_options.url", "Explicit endpoint URL. Cost: depends on endpoint."),
+        ("provider_options.model", "Model/endpoint alias. Cost: depends on endpoint."),
+        ("provider_options.prompt_upsampling", "Prompt upsampling. Cost: may increase latency."),
+        ("provider_options.guidance", "Guidance scale. Cost: may increase latency/compute."),
+        ("provider_options.steps", "Diffusion steps. Cost: may increase latency/compute."),
+        ("provider_options.safety_tolerance", "Safety tolerance."),
+        ("provider_options.poll_interval", "Polling cadence (seconds)."),
+        ("provider_options.poll_timeout", "Polling timeout (seconds)."),
+        ("provider_options.request_timeout", "HTTP request timeout (seconds)."),
+        ("provider_options.download_timeout", "HTTP download timeout (seconds)."),
+    ],
+}
 _EXPERIMENT_SCHEMA_VERSION = 1
 _EXPERIMENT_BUDGET_MODES = ("estimate", "strict", "off")
 _EXPERIMENT_DEFAULT_CONCURRENCY = 3
@@ -120,8 +168,9 @@ _BANNER = [
     "██║      ╚██████╔╝ ██║  ██║ ╚██████╔╝███████╗",
     "╚═╝       ╚═════╝  ╚═╝  ╚═╝  ╚═════╝ ╚══════╝",
 ]
-_VERSION_CURRENT = ("v0.6.0", "START")
+_VERSION_CURRENT = ("v0.6.1", "START")
 _VERSION_HISTORY = [
+    ("v0.6.0", "START"),
     ("v0.5.0", "The Colonel"),
     ("v0.4.0", "Pilot"),
 ]
@@ -160,6 +209,272 @@ def _env_flag(name: str) -> bool:
     if raw is None:
         return False
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _history_base_dir() -> Path:
+    return Path.home() / HISTORY_DIR_NAME
+
+
+def _history_config_path() -> Path:
+    return _history_base_dir() / HISTORY_CONFIG_FILE
+
+
+def _history_log_path() -> Path:
+    return _history_base_dir() / HISTORY_LOG_FILE
+
+
+def _load_history_config() -> dict:
+    path = _history_config_path()
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _save_history_config(config: dict) -> None:
+    path = _history_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(config)
+    payload.setdefault("schema_version", HISTORY_SCHEMA_VERSION)
+    payload["updated_at"] = _utc_iso_now()
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+
+
+def _history_opt_in_value() -> bool | None:
+    raw = os.getenv(HISTORY_OPT_IN_ENV)
+    if raw is not None:
+        return _env_flag(HISTORY_OPT_IN_ENV)
+    config = _load_history_config()
+    value = config.get("history_opt_in")
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+def _persist_history_opt_in(value: bool) -> None:
+    try:
+        config = _load_history_config()
+        config["history_opt_in"] = bool(value)
+        _save_history_config(config)
+    except Exception:
+        return
+
+
+def _new_history_session_id() -> str:
+    return f"{_utc_iso_now()}-{uuid.uuid4().hex[:8]}"
+
+
+def _load_history_records(max_records: int | None = None) -> list[dict]:
+    path = _history_log_path()
+    if not path.exists():
+        return []
+    records: list[dict] = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    payload = json.loads(raw)
+                except Exception:
+                    continue
+                if isinstance(payload, dict):
+                    records.append(payload)
+    except Exception:
+        return []
+    if max_records is not None and max_records > 0 and len(records) > max_records:
+        records = records[-max_records:]
+    return records
+
+
+def _trim_history_records(path: Path, max_records: int) -> None:
+    if max_records <= 0 or not path.exists():
+        return
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return
+    if len(lines) <= max_records:
+        return
+    trimmed = lines[-max_records:]
+    path.write_text("\n".join(trimmed) + "\n", encoding="utf-8")
+
+
+def _append_history_record(record: dict) -> None:
+    path = _history_log_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+    _trim_history_records(path, HISTORY_MAX_RECORDS)
+
+
+def _history_record_date(value: object) -> str:
+    if isinstance(value, str) and len(value) >= 10:
+        return value[:10]
+    return "unknown-date"
+
+
+def _history_goals_match(stored: object, desired: list[str] | None) -> bool:
+    if not desired:
+        return True
+    if isinstance(stored, list):
+        stored_set = {str(item) for item in stored}
+        return any(goal in stored_set for goal in desired)
+    return False
+
+
+def _history_provider_match(stored: object, provider: str | None, model: str | None) -> bool:
+    if not provider:
+        return True
+    provider_key, _ = _normalize_provider_and_model(provider, model)
+    stored_provider = str(stored or "").strip().lower()
+    if not stored_provider:
+        return False
+    return stored_provider == provider_key
+
+
+def _history_model_match(stored: object, model: str | None) -> bool:
+    if not model:
+        return True
+    stored_model = str(stored or "").strip().lower()
+    if not stored_model:
+        return False
+    return stored_model == str(model).strip().lower()
+
+
+def _format_history_record_line(record: dict) -> str:
+    date_label = _history_record_date(record.get("created_at"))
+    settings_line = record.get("settings_line")
+    if not isinstance(settings_line, str):
+        settings = record.get("settings")
+        if isinstance(settings, dict):
+            settings_line = _format_call_settings_line(settings)
+        else:
+            settings_line = "(no settings)"
+    metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+    parts = [date_label, str(settings_line)]
+    if isinstance(metrics, dict):
+        cost_line = metrics.get("cost_line")
+        cost_text = _strip_cost_prefix(cost_line) if isinstance(cost_line, str) else None
+        elapsed = metrics.get("elapsed_sec")
+        if cost_text:
+            parts.append(f"cost {cost_text}")
+        if isinstance(elapsed, (int, float)):
+            parts.append(f"{elapsed:.1f}s")
+        adherence = metrics.get("adherence")
+        quality = metrics.get("quality")
+        retrieval = metrics.get("retrieval_score")
+        if isinstance(adherence, int):
+            parts.append(f"adh {adherence}")
+        if isinstance(quality, int):
+            parts.append(f"qual {quality}")
+        if isinstance(retrieval, (int, float)):
+            parts.append(f"retr {retrieval}")
+    return " | ".join(parts)
+
+
+def _build_local_history_text(
+    *,
+    provider: str,
+    model: str | None,
+    user_goals: list[str] | None,
+    exclude_session_id: str | None,
+    limit: int | None = None,
+) -> str | None:
+    if limit is None:
+        limit = HISTORY_PROMPT_LIMIT
+    records = _load_history_records(max_records=HISTORY_MAX_RECORDS)
+    if not records:
+        return None
+    filtered: list[dict] = []
+    for record in records:
+        if record.get("mode") not in {None, "optimize"}:
+            continue
+        if exclude_session_id and record.get("session_id") == exclude_session_id:
+            continue
+        if not _history_provider_match(record.get("provider"), provider, model):
+            continue
+        if model and not _history_model_match(record.get("model"), model):
+            continue
+        if not _history_goals_match(record.get("goals"), user_goals):
+            continue
+        filtered.append(record)
+    if not filtered:
+        return None
+    subset = list(reversed(filtered[-limit:]))
+    lines = [_format_history_record_line(entry) for entry in subset]
+    return "\n".join(lines).strip() if lines else None
+
+
+def _build_history_record(
+    *,
+    session_id: str | None,
+    round_index: int,
+    provider: str,
+    model: str | None,
+    size: str,
+    n: int,
+    settings: dict[str, object] | None,
+    user_goals: list[str] | None,
+    user_notes: str | None,
+    recommendation: object,
+    accepted: bool,
+    elapsed: float | None,
+    cost_line: str | None,
+    adherence: int | None,
+    quality: int | None,
+    retrieval: int | None,
+) -> dict:
+    settings_payload = dict(settings) if isinstance(settings, dict) else {}
+    record = {
+        "schema_version": HISTORY_SCHEMA_VERSION,
+        "created_at": _utc_iso_now(),
+        "mode": "optimize",
+        "session_id": session_id,
+        "round": round_index,
+        "provider": provider,
+        "model": model,
+        "size": size,
+        "n": n,
+        "goals": list(user_goals) if user_goals else [],
+        "notes": user_notes or "",
+        "settings": settings_payload,
+        "settings_line": _format_call_settings_line(settings_payload),
+        "metrics": {
+            "elapsed_sec": elapsed,
+            "cost_line": cost_line,
+            "cost_per_image_usd": _parse_cost_amount(cost_line),
+            "adherence": adherence,
+            "quality": quality,
+            "retrieval_score": retrieval,
+        },
+        "recommendations": {
+            "summary": _recommendations_summary(recommendation),
+            "accepted": accepted,
+        },
+    }
+    return record
+
+
+def _maybe_log_history_record(enabled: bool, record: dict) -> None:
+    if not enabled:
+        return
+    try:
+        _append_history_record(record)
+    except Exception:
+        return
 
 
 def _retrieval_score_enabled(args: argparse.Namespace | None = None) -> bool:
@@ -259,6 +574,13 @@ RETRIEVAL_SCORE_ENV = "LLM_RETRIEVAL_SCORE"
 RETRIEVAL_PACKET_ENV = "LLM_RETRIEVAL_PACKET"
 RETRIEVAL_PACKET_DEFAULT = "compact"
 FINAL_SUMMARY_ENV = "FINAL_SUMMARY"
+HISTORY_OPT_IN_ENV = "PARAM_FORGE_HISTORY"
+HISTORY_DIR_NAME = ".param_forge"
+HISTORY_CONFIG_FILE = "config.json"
+HISTORY_LOG_FILE = "run_history.jsonl"
+HISTORY_SCHEMA_VERSION = 1
+HISTORY_MAX_RECORDS = 300
+HISTORY_PROMPT_LIMIT = 6
 MAX_ROUNDS = 3
 
 _COST_ESTIMATE_CACHE: dict[tuple[str, str | None, str], str] = {}
@@ -1498,10 +1820,13 @@ def _interactive_args_raw(color_override: bool | None = None) -> argparse.Namesp
     with _RawMode(fd, original):
         experiment_selected = False
         while True:
-            mode = _select_from_list("Mode", ["Explore", "Batch run"], 0)
+            mode = _select_from_list("Mode", ["Optimize", "Batch run", "API Explore"], 0)
             if mode.lower() == "batch run":
                 experiment_selected = True
                 break
+            if mode.lower() == "api explore":
+                _show_api_explore_raw()
+                continue
             break
     if experiment_selected:
         return _interactive_experiment_args_simple()
@@ -1523,9 +1848,12 @@ def _interactive_args_simple() -> argparse.Namespace:
     print("Type a number and press Enter. Press Enter to accept defaults.")
 
     while True:
-        mode = _prompt_choice("Mode", ["Explore", "Batch run"], 0)
+        mode = _prompt_choice("Mode", ["Optimize", "Batch run", "API Explore"], 0)
         if mode.lower() == "batch run":
             return _interactive_experiment_args_simple()
+        if mode.lower() == "api explore":
+            _show_api_explore_raw()
+            continue
         break
     provider = _prompt_choice("Provider", _provider_display_choices(), 0)
     provider = _provider_from_display(provider)
@@ -1925,6 +2253,7 @@ def _interactive_args_curses(stdscr, color_override: bool | None = None) -> argp
     out_idx = 0
     field_idx = 0
     provider_display_choices = _provider_display_choices()
+    mode_choices = ["Optimize", "Batch run", "API Explore"]
 
     while True:
         stdscr.erase()
@@ -1976,7 +2305,7 @@ def _interactive_args_curses(stdscr, color_override: bool | None = None) -> argp
             stdscr,
             y,
             "Mode",
-            ["Explore", "Batch run"],
+            mode_choices,
             mode_idx,
             field_idx == 0,
             field_idx,
@@ -1985,11 +2314,12 @@ def _interactive_args_curses(stdscr, color_override: bool | None = None) -> argp
             done_pair,
             color_enabled,
         )
-        hint = (
-            "Identify optimal API settings for your goal: lower cost, faster render, etc."
-            if mode_idx == 0
-            else "Batch-run prompt sets across a matrix."
-        )
+        if mode_idx == 0:
+            hint = "Identify optimal API settings for your goal: lower cost, faster render, etc."
+        elif mode_idx == 1:
+            hint = "Batch-run prompt sets across a matrix."
+        else:
+            hint = "Browse provider/model parameters and cost notes."
         _safe_addstr(stdscr, y, 4, hint[: max(0, width - 5)], curses.A_BOLD)
         y += 2
         if field_idx >= 1:
@@ -2099,7 +2429,7 @@ def _interactive_args_curses(stdscr, color_override: bool | None = None) -> argp
             continue
         if key in (curses.KEY_LEFT, ord("h"), ord("H"), ord("a"), ord("A")):
             if field_idx == 0:
-                mode_idx = (mode_idx - 1) % 2
+                mode_idx = (mode_idx - 1) % len(mode_choices)
             elif field_idx == 1:
                 provider_idx = (provider_idx - 1) % len(PROVIDER_CHOICES)
                 model_idx = 0
@@ -2114,7 +2444,7 @@ def _interactive_args_curses(stdscr, color_override: bool | None = None) -> argp
             continue
         if key in (curses.KEY_RIGHT, ord("l"), ord("L"), ord("d"), ord("D")):
             if field_idx == 0:
-                mode_idx = (mode_idx + 1) % 2
+                mode_idx = (mode_idx + 1) % len(mode_choices)
             elif field_idx == 1:
                 provider_idx = (provider_idx + 1) % len(PROVIDER_CHOICES)
                 model_idx = 0
@@ -2142,8 +2472,13 @@ def _interactive_args_curses(stdscr, color_override: bool | None = None) -> argp
             continue
         if key in (10, 13, curses.KEY_ENTER, ord("\t")):
             if field_idx == 0:
-                if mode_idx == 1:
+                selected_mode = mode_choices[mode_idx].lower()
+                if selected_mode == "batch run":
                     return _interactive_experiment_args_curses(stdscr, color_enabled=color_enabled)
+                if selected_mode == "api explore":
+                    _show_api_explore_curses(stdscr, color_enabled=color_enabled)
+                    field_idx = 0
+                    continue
                 field_idx = 1
                 continue
             if field_idx == 3:
@@ -2199,6 +2534,22 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
             curses.init_pair(2, curses.COLOR_CYAN, -1)
             curses.init_pair(3, curses.COLOR_GREEN, -1)
             curses.init_pair(4, curses.COLOR_YELLOW, -1)
+        history_opt_in = _history_opt_in_value()
+        history_session_id: str | None = None
+
+        def _ensure_history_opt_in() -> bool:
+            nonlocal history_opt_in, history_session_id
+            if history_opt_in is None:
+                history_opt_in = _prompt_yes_no_curses(
+                    stdscr,
+                    "Enable local history to improve future Optimize recommendations? (stores settings + metrics)",
+                    color_enabled=color_enabled,
+                    footer_line="Press Y to opt in, N/Esc to skip",
+                )
+                _persist_history_opt_in(history_opt_in)
+            if history_opt_in and history_session_id is None:
+                history_session_id = _new_history_session_id()
+            return bool(history_opt_in)
         args = _interactive_args_curses(stdscr, color_override=color_override)
         result["ran"] = True
         if args is None:
@@ -2675,6 +3026,16 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                             emphasis_line = f"{emphasis_line} {speed_note}"
                         else:
                             emphasis_line = speed_note
+                    history_enabled = _ensure_history_opt_in()
+                    local_history_text = None
+                    if history_enabled:
+                        local_history_text = _build_local_history_text(
+                            provider=args.provider,
+                            model=args.model,
+                            user_goals=stored_goals,
+                            exclude_session_id=history_session_id,
+                            limit=HISTORY_PROMPT_LIMIT,
+                        )
                     recommendation, cost_line, accepted, stop_recommended = _show_receipt_analysis_curses(
                         stdscr,
                         receipt_path=receipts[-1],
@@ -2688,6 +3049,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                         user_goals=stored_goals,
                         user_notes=stored_notes,
                         analysis_history=analysis_history,
+                        local_history_text=local_history_text,
                         emphasis_line=emphasis_line,
                         last_elapsed=last_elapsed,
                         last_cost=stored_cost,
@@ -2707,6 +3069,25 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                         quality=round_scores[1],
                         retrieval=retrieval_score,
                     )
+                    history_record = _build_history_record(
+                        session_id=history_session_id,
+                        round_index=run_index,
+                        provider=args.provider,
+                        model=args.model,
+                        size=args.size,
+                        n=args.n,
+                        settings=last_call_settings,
+                        user_goals=stored_goals,
+                        user_notes=stored_notes,
+                        recommendation=recommendation,
+                        accepted=accepted,
+                        elapsed=last_elapsed,
+                        cost_line=cost_line,
+                        adherence=round_scores[0],
+                        quality=round_scores[1],
+                        retrieval=retrieval_score,
+                    )
+                    _maybe_log_history_record(history_enabled, history_record)
                     if cost_line:
                         stored_cost = cost_line.replace("COST:", "").strip()
                     if run_index >= MAX_ROUNDS:
@@ -2798,6 +3179,16 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                     user_goals, user_notes = goals_result
                     stored_goals = user_goals
                     stored_notes = user_notes
+                    history_enabled = _ensure_history_opt_in()
+                    local_history_text = None
+                    if history_enabled:
+                        local_history_text = _build_local_history_text(
+                            provider=args.provider,
+                            model=args.model,
+                            user_goals=user_goals,
+                            exclude_session_id=history_session_id,
+                            limit=HISTORY_PROMPT_LIMIT,
+                        )
                     recommendation, cost_line, accepted, stop_recommended = _show_receipt_analysis_curses(
                         stdscr,
                         receipt_path=receipts[-1],
@@ -2811,11 +3202,13 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                         user_goals=user_goals,
                         user_notes=user_notes,
                         analysis_history=analysis_history,
+                        local_history_text=local_history_text,
                         last_elapsed=last_elapsed,
                         last_cost=stored_cost,
                         benchmark_elapsed=stored_speed_benchmark,
                         round_scores=round_scores,
                     )
+                    retrieval_score = _load_retrieval_score(receipts[-1]) if receipts else None
                     _append_analysis_history(
                         analysis_history,
                         round_index=run_index,
@@ -2826,8 +3219,27 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                         cost_line=cost_line,
                         adherence=round_scores[0],
                         quality=round_scores[1],
-                        retrieval=_load_retrieval_score(receipts[-1]) if receipts else None,
+                        retrieval=retrieval_score,
                     )
+                    history_record = _build_history_record(
+                        session_id=history_session_id,
+                        round_index=run_index,
+                        provider=args.provider,
+                        model=args.model,
+                        size=args.size,
+                        n=args.n,
+                        settings=last_call_settings,
+                        user_goals=user_goals,
+                        user_notes=user_notes,
+                        recommendation=recommendation,
+                        accepted=accepted,
+                        elapsed=last_elapsed,
+                        cost_line=cost_line,
+                        adherence=round_scores[0],
+                        quality=round_scores[1],
+                        retrieval=retrieval_score,
+                    )
+                    _maybe_log_history_record(history_enabled, history_record)
                     if cost_line:
                         stored_cost = cost_line.replace("COST:", "").strip()
                     if run_index >= MAX_ROUNDS:
@@ -3016,6 +3428,12 @@ def _line_text_and_attr(line: object, *, color_enabled: bool) -> tuple[str, int]
         if tag == "change":
             attr = curses.color_pair(3) | curses.A_BOLD if color_enabled else curses.A_BOLD
             return text, attr
+        if tag == "param":
+            attr = curses.color_pair(2) | curses.A_BOLD if color_enabled else curses.A_BOLD
+            return text, attr
+        if tag == "desc":
+            attr = curses.A_DIM
+            return text, attr
         if tag == "goal":
             attr = curses.color_pair(4) | curses.A_BOLD if color_enabled else curses.A_BOLD
             return text, attr
@@ -3155,7 +3573,7 @@ def _prompt_status_lines(index: int, total: int, prompt: str, status: str, max_w
 def _prompt_status_attr(status: str, color_enabled: bool) -> int:
     import curses
     if status == "current":
-        return curses.color_pair(2) | curses.A_BOLD if color_enabled else curses.A_BOLD
+        return curses.color_pair(4) | curses.A_BOLD if color_enabled else curses.A_BOLD
     if status == "done":
         return curses.color_pair(3) | curses.A_BOLD if color_enabled else curses.A_NORMAL
     return curses.A_DIM
@@ -5203,7 +5621,7 @@ def _prompt_choice_curses(
                 break
             attr = curses.A_DIM
             if i == idx:
-                attr = curses.color_pair(2) | curses.A_BOLD if color_enabled else curses.A_BOLD
+                attr = curses.color_pair(4) | curses.A_BOLD if color_enabled else curses.A_BOLD
             _safe_addstr(stdscr, y, 2, choice[: max(0, width - 3)], attr)
             y += 1
         _safe_addstr(
@@ -5253,7 +5671,7 @@ def _prompt_multi_select_curses(
             line = f"{marker} {choice}"
             attr = curses.A_DIM
             if i == idx:
-                attr = curses.color_pair(2) | curses.A_BOLD if color_enabled else curses.A_BOLD
+                attr = curses.color_pair(4) | curses.A_BOLD if color_enabled else curses.A_BOLD
             _safe_addstr(stdscr, y, 2, line[: max(0, width - 3)], attr)
             y += 1
         _safe_addstr(
@@ -5869,7 +6287,7 @@ def _prompt_goal_selection_curses(stdscr, color_enabled: bool) -> tuple[list[str
             line = f"{marker} {option}"
             attr = curses.A_DIM
             if i == idx:
-                attr = curses.color_pair(2) | curses.A_BOLD if color_enabled else curses.A_BOLD
+                attr = curses.color_pair(4) | curses.A_BOLD if color_enabled else curses.A_BOLD
             _safe_addstr(stdscr, y, 2, line[: max(0, width - 3)], attr)
             y += 1
         footer = "Space: toggle • Enter: continue • Q/Esc: cancel"
@@ -5904,8 +6322,16 @@ def _prompt_goal_selection_curses(stdscr, color_enabled: bool) -> tuple[list[str
     return goals, notes
 
 
-def _prompt_yes_no_curses(stdscr, prompt: str, *, color_enabled: bool) -> bool:
+def _prompt_yes_no_curses(
+    stdscr,
+    prompt: str,
+    *,
+    color_enabled: bool,
+    footer_line: str | None = None,
+) -> bool:
     import curses
+    if footer_line is None:
+        footer_line = "Press Y to run, N or Esc to cancel"
     while True:
         stdscr.erase()
         height, width = stdscr.getmaxyx()
@@ -5913,14 +6339,246 @@ def _prompt_yes_no_curses(stdscr, prompt: str, *, color_enabled: bool) -> bool:
         if y < height - 2:
             _safe_addstr(stdscr, y, 0, prompt[: max(0, width - 1)], curses.A_BOLD)
             y += 2
-        footer = "Press Y to run, N or Esc to cancel"
-        _safe_addstr(stdscr, min(height - 1, y), 0, footer[: max(0, width - 1)], curses.A_DIM)
+        _safe_addstr(
+            stdscr,
+            min(height - 1, y),
+            0,
+            footer_line[: max(0, width - 1)],
+            curses.A_DIM,
+        )
         stdscr.refresh()
         key = stdscr.getch()
         if key in (ord("y"), ord("Y")):
             return True
         if key in (ord("n"), ord("N"), 27):
             return False
+
+
+def _add_wrapped_lines(
+    lines: list[object],
+    text: str,
+    *,
+    max_width: int,
+    tag: str | None = None,
+) -> None:
+    wrapped = _wrap_text(text, max_width)
+    if tag and wrapped:
+        lines.append((wrapped[0], tag))
+        for line in wrapped[1:]:
+            lines.append(line)
+        return
+    for line in wrapped:
+        lines.append(line)
+
+
+def _add_param_doc_lines(
+    lines: list[object],
+    name: str,
+    desc: str,
+    *,
+    max_width: int,
+    tagged: bool,
+) -> None:
+    label = f"  {name}"
+    if tagged:
+        lines.append((label[: max_width], "param"))
+    else:
+        lines.append(label[: max_width])
+    if not desc:
+        return
+    indent = "    "
+    desc_width = max(10, max_width - len(indent))
+    wrapped_desc = _wrap_text(desc, desc_width)
+    for line in wrapped_desc:
+        text = f"{indent}{line}"
+        if tagged:
+            lines.append((text[: max_width], "desc"))
+        else:
+            lines.append(text[: max_width])
+
+
+def _build_api_explore_lines(
+    max_width: int,
+    *,
+    tagged: bool = True,
+    provider_filter: str | None = None,
+    model_filter: str | None = None,
+) -> list[object]:
+    def _display_param_name(name: str) -> str:
+        prefix = "provider_options."
+        if name.startswith(prefix):
+            return name[len(prefix):]
+        return name
+
+    lines: list[object] = []
+    _add_wrapped_lines(
+        lines,
+        "API Explore (stub): known params per provider/model with cost notes.",
+        max_width=max_width,
+        tag="section" if tagged else None,
+    )
+    _add_wrapped_lines(
+        lines,
+        "Request params are top-level; provider options are nested under provider_options.",
+        max_width=max_width,
+    )
+    lines.append("")
+    sections = [
+        ("OpenAI (provider: openai)", "openai", MODEL_CHOICES_BY_PROVIDER.get("openai", [])),
+        ("Gemini (provider: google -> gemini)", "gemini", MODEL_CHOICES_BY_PROVIDER.get("gemini", [])),
+        ("Imagen (provider: google -> imagen)", "imagen", MODEL_CHOICES_BY_PROVIDER.get("imagen", [])),
+        ("Flux / BFL (provider: black forest labs)", "flux", MODEL_CHOICES_BY_PROVIDER.get("flux", [])),
+    ]
+    for title, provider_key, models in sections:
+        if provider_filter and provider_key != provider_filter:
+            continue
+        _add_wrapped_lines(
+            lines,
+            title,
+            max_width=max_width,
+            tag="section" if tagged else None,
+        )
+        if not models:
+            models = ["(default)"]
+        for model in models:
+            if model_filter and str(model) != str(model_filter):
+                continue
+            _add_wrapped_lines(
+                lines,
+                f"Model: {model}",
+                max_width=max_width,
+                tag="goal" if tagged else None,
+            )
+            _add_wrapped_lines(
+                lines,
+                "Request params:",
+                max_width=max_width,
+                tag="section" if tagged else None,
+            )
+            for name, desc in _API_COMMON_PARAMS:
+                _add_param_doc_lines(
+                    lines,
+                    name,
+                    desc,
+                    max_width=max_width,
+                    tagged=tagged,
+                )
+            provider_params = _API_PROVIDER_PARAMS.get(provider_key, [])
+            if provider_params:
+                lines.append("")
+                _add_wrapped_lines(
+                    lines,
+                    "Provider options:",
+                    max_width=max_width,
+                    tag="section" if tagged else None,
+                )
+                for name, desc in provider_params:
+                    label = _display_param_name(name)
+                    _add_param_doc_lines(
+                        lines,
+                        label,
+                        desc,
+                        max_width=max_width,
+                        tagged=tagged,
+                    )
+            lines.append("")
+    return lines
+
+
+def _show_api_explore_curses(stdscr, *, color_enabled: bool) -> None:
+    provider_choices = ["All providers", "OpenAI", "Gemini", "Imagen", "Flux"]
+    provider_map = {
+        "OpenAI": "openai",
+        "Gemini": "gemini",
+        "Imagen": "imagen",
+        "Flux": "flux",
+    }
+
+    while True:
+        provider_choice = _prompt_choice_curses(
+            stdscr,
+            title="API Explore - pick provider",
+            choices=provider_choices,
+            default_index=0,
+            color_enabled=color_enabled,
+        )
+        if provider_choice is None:
+            return
+        provider_filter = provider_map.get(provider_choice)
+        model_filter = None
+        if provider_filter:
+            models = MODEL_CHOICES_BY_PROVIDER.get(provider_filter, [])
+            model_choices = ["All models"] + list(models)
+            model_choice = _prompt_choice_curses(
+                stdscr,
+                title="API Explore - pick model",
+                choices=model_choices,
+                default_index=0,
+                color_enabled=color_enabled,
+            )
+            if model_choice is None:
+                return
+            if model_choice != "All models":
+                model_filter = model_choice
+
+        height, width = stdscr.getmaxyx()
+        body_lines = _build_api_explore_lines(
+            max_width=max(32, width - 2),
+            tagged=True,
+            provider_filter=provider_filter,
+            model_filter=model_filter,
+        )
+        result = _render_scrollable_text_with_banner(
+            stdscr,
+            title_line="API Explore - provider/model params",
+            body_lines=body_lines,
+            footer_line="Up/Down/PgUp/PgDn to scroll • R to re-pick • Q/Esc/Enter to exit",
+            color_enabled=color_enabled,
+            action_keys={ord("r"): "repick", ord("R"): "repick"},
+        )
+        if result != "repick":
+            return
+
+
+def _show_api_explore_raw() -> None:
+    provider_choices = ["All providers", "OpenAI", "Gemini", "Imagen", "Flux"]
+    provider_map = {
+        "OpenAI": "openai",
+        "Gemini": "gemini",
+        "Imagen": "imagen",
+        "Flux": "flux",
+    }
+    while True:
+        provider_choice = _prompt_choice("API Explore - Provider", provider_choices, 0)
+        provider_filter = provider_map.get(provider_choice)
+        model_filter = None
+        if provider_filter:
+            models = MODEL_CHOICES_BY_PROVIDER.get(provider_filter, [])
+            model_choices = ["All models"] + list(models)
+            model_choice = _prompt_choice("API Explore - Model", model_choices, 0)
+            if model_choice != "All models":
+                model_filter = model_choice
+
+        max_width = max(60, _term_width(90) - 2)
+        body_lines = _build_api_explore_lines(
+            max_width=max_width,
+            tagged=False,
+            provider_filter=provider_filter,
+            model_filter=model_filter,
+        )
+        print("\nAPI Explore - provider/model params\n")
+        for line in body_lines:
+            if isinstance(line, tuple):
+                print(line[0])
+            else:
+                print(str(line))
+        try:
+            choice = input("\nPress Enter to return, or R to re-pick: ").strip().lower()
+        except EOFError:
+            return
+        if choice == "r":
+            continue
+        return
 
 
 def _render_scrollable_text(
@@ -6072,6 +6730,7 @@ def _show_receipt_analysis_curses(
     user_goals: list[str] | None = None,
     user_notes: str | None = None,
     analysis_history: list[dict] | None = None,
+    local_history_text: str | None = None,
     emphasis_line: str | None = None,
     allow_rerun: bool = True,
     last_elapsed: float | None = None,
@@ -6187,6 +6846,7 @@ def _show_receipt_analysis_curses(
                 user_goals=user_goals,
                 user_notes=user_notes,
                 history_text=history_text,
+                local_history_text=local_history_text,
                 history_rounds=len(analysis_history or []),
             )
         except Exception as exc:
@@ -7588,6 +8248,7 @@ def _build_receipt_analysis_prompt(
     user_goals: list[str] | None,
     user_notes: str | None,
     history_text: str | None = None,
+    local_history_text: str | None = None,
     model_options_line: str | None = None,
     enable_web_search: bool = True,
     current_round: int = 1,
@@ -7603,6 +8264,8 @@ def _build_receipt_analysis_prompt(
     history_block = ""
     if history_text:
         history_block = f"Session history (previous rounds):\n{history_text}\n\n"
+    if local_history_text:
+        history_block = f"{history_block}Local history (previous sessions):\n{local_history_text}\n\n"
     model_block = ""
     if model_options_line:
         model_block = f"{model_options_line}\n"
@@ -7680,6 +8343,7 @@ def _build_recommendation_only_prompt(
     user_goals: list[str] | None,
     user_notes: str | None,
     history_text: str | None = None,
+    local_history_text: str | None = None,
     model_options_line: str | None = None,
     enable_web_search: bool = True,
     current_round: int = 1,
@@ -7695,6 +8359,8 @@ def _build_recommendation_only_prompt(
     history_block = ""
     if history_text:
         history_block = f"Session history (previous rounds):\n{history_text}\n"
+    if local_history_text:
+        history_block = f"{history_block}Local history (previous sessions):\n{local_history_text}\n"
     model_block = ""
     if model_options_line:
         model_block = f"{model_options_line}\n"
@@ -7761,6 +8427,7 @@ def _analyze_receipt_payload(
     user_goals: list[str] | None = None,
     user_notes: str | None = None,
     history_text: str | None = None,
+    local_history_text: str | None = None,
     history_rounds: int = 0,
 ) -> tuple[str, list[dict[str, str]], list[dict] | None, str | None, str | None]:
     analyzer_key = _normalize_analyzer(analyzer)
@@ -7826,6 +8493,7 @@ def _analyze_receipt_payload(
         user_goals=user_goals,
         user_notes=user_notes,
         history_text=history_text,
+        local_history_text=local_history_text,
         model_options_line=model_options_line,
         enable_web_search=allow_web_search,
         current_round=current_round,
@@ -7841,6 +8509,7 @@ def _analyze_receipt_payload(
             user_goals=user_goals,
             user_notes=user_notes,
             history_text=history_text,
+            local_history_text=local_history_text,
             model_options_line=model_options_line,
             enable_web_search=False,
             current_round=current_round,
@@ -7914,6 +8583,7 @@ def _analyze_receipt_payload(
             user_goals=user_goals,
             user_notes=user_notes,
             history_text=history_text,
+            local_history_text=local_history_text,
             model_options_line=model_options_line,
             enable_web_search=allow_web_search,
             current_round=current_round,
@@ -7929,6 +8599,7 @@ def _analyze_receipt_payload(
                 user_goals=user_goals,
                 user_notes=user_notes,
                 history_text=history_text,
+                local_history_text=local_history_text,
                 model_options_line=model_options_line,
                 enable_web_search=False,
                 current_round=current_round,

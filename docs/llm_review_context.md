@@ -16,11 +16,15 @@ Provide targeted feedback that leads to 10x improvements in:
 - Demo/readability (a “run → view → pick → copy” narrative).
 
 ## Key flows
-### Explore (interactive)
+### Optimize (interactive)
 - Entry point: `python scripts/param_forge.py`
 - Steps: Mode → Provider → Model → Prompt → Size → Images per prompt → Output dir
 - Generates images + receipts, then (optionally) analyzes and applies recommendations.
 - Auto-opens a local receipt viewer at the end of interactive runs.
+
+### API Explore (interactive)
+- UI label: "API Explore" (read-only parameter reference).
+- Lets you browse provider/model params and cost notes without running a job.
 
 ### Batch run (interactive + CLI)
 - UI label: “Batch run” (select providers/models, size, concurrency, budgets).

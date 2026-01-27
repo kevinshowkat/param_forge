@@ -8,6 +8,7 @@ param_forge_review.tar.gz
 
 outputs/
 scripts/outputs/
+runs/
 feedback.png
 preview.png
 docs/explore_flow.png

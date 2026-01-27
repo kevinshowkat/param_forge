@@ -7,7 +7,7 @@ Interactive terminal UI for independent image-model tinkerers experimenting acro
 ## TL;DR
 PARAM FORGE is a local terminal workbench for running image prompts across models/providers and saving receipts so you can reproduce, compare, and iterate fast.
 
-<img src="docs/explore_flow.svg" width="800" alt="Explore Mode — Feedback Loop" />
+<img src="docs/explore_flow.svg" width="800" alt="Optimize Mode - Feedback Loop" />
 
 ## Who it's for
 Independent image-model experimenters who want quick comparisons, reproducible runs, and a paper trail they can trust.
@@ -92,7 +92,7 @@ python scripts/param_forge.py batch-run \
 Tip: in the UI, Batch run lets you pick providers/models directly without a matrix file.
 
 Prompt selection (interactive):
-- The Explore flow includes a **Prompt** step.
+- The Optimize flow includes a **Prompt** step.
 - Press Enter with no input to use the default prompt.
 
 Receipt viewer:
