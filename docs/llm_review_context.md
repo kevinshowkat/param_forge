@@ -20,7 +20,7 @@ Provide targeted feedback that leads to 10x improvements in:
 - Entry point: `python scripts/param_forge.py`
 - Steps: Mode → Provider → Model → Prompt → Size → Images per prompt → Output dir
 - Generates images + receipts, then (optionally) analyzes and applies recommendations.
-- Auto-opens a local receipt viewer at the end of interactive runs.
+- Use the `view` command to open the local receipt viewer after interactive runs.
 - Optional: user can opt into local run history to improve future Optimize recommendations.
 
 ### API Explore (interactive)

@@ -477,6 +477,90 @@ def _maybe_log_history_record(enabled: bool, record: dict) -> None:
         return
 
 
+def _ensure_capture_state() -> _CaptureState:
+    global _CAPTURE_STATE
+    if _CAPTURE_STATE is not None:
+        return _CAPTURE_STATE
+    session_id = time.strftime("%Y%m%d_%H%M%S")
+    out_dir = _repo_root() / "runs" / "flow_capture" / session_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _CAPTURE_STATE = _CaptureState(session_id=session_id, out_dir=out_dir)
+    return _CAPTURE_STATE
+
+
+def _capture_screen_text(stdscr) -> list[str]:
+    import curses
+    height, width = stdscr.getmaxyx()
+    lines: list[str] = []
+    for y in range(height):
+        try:
+            raw = stdscr.instr(y, 0, max(1, width - 1))
+        except curses.error:
+            raw = b""
+        if isinstance(raw, bytes):
+            line = raw.decode("utf-8", errors="ignore")
+        else:
+            line = str(raw)
+        lines.append(line.rstrip())
+    return lines
+
+
+def _capture_screenshot(path: Path) -> str | None:
+    try:
+        if sys.platform == "darwin" and shutil.which("screencapture"):
+            subprocess.run(["screencapture", "-x", str(path)], check=True)
+            return None
+        if shutil.which("gnome-screenshot"):
+            subprocess.run(["gnome-screenshot", "-f", str(path)], check=True)
+            return None
+        if shutil.which("import"):
+            subprocess.run(["import", "-window", "root", str(path)], check=True)
+            return None
+        return "no screenshot tool available"
+    except Exception as exc:
+        return str(exc)
+
+
+def _flash_capture_notice(stdscr, message: str) -> None:
+    import curses
+    height, width = stdscr.getmaxyx()
+    _safe_addstr(stdscr, max(0, height - 1), 0, _truncate_text(message, width - 1), curses.A_DIM)
+    stdscr.refresh()
+    time.sleep(0.4)
+
+
+def _capture_current_screen(stdscr) -> None:
+    state = _ensure_capture_state()
+    state.counter += 1
+    step = f"{state.counter:04d}"
+    timestamp = _utc_iso_now()
+    lines = _capture_screen_text(stdscr)
+    text_path = state.out_dir / f"step_{step}.txt"
+    text_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    screenshot_path = state.out_dir / f"step_{step}.png"
+    screenshot_error = _capture_screenshot(screenshot_path)
+    meta = {
+        "step": step,
+        "timestamp": timestamp,
+        "session_id": state.session_id,
+        "text_path": text_path.name,
+        "screenshot_path": screenshot_path.name if screenshot_error is None else None,
+        "screenshot_error": screenshot_error,
+        "rows": len(lines),
+        "cols": max((len(line) for line in lines), default=0),
+    }
+    meta_path = state.out_dir / f"step_{step}.json"
+    meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    _flash_capture_notice(stdscr, f"Captured step {step} -> {state.out_dir}")
+
+
+def _handle_capture_key(stdscr, key: int) -> bool:
+    if key in _CAPTURE_KEYS:
+        _capture_current_screen(stdscr)
+        return True
+    return False
+
+
 def _retrieval_score_enabled(args: argparse.Namespace | None = None) -> bool:
     raw = os.getenv(RETRIEVAL_SCORE_ENV)
     if raw is not None:
@@ -582,9 +666,18 @@ HISTORY_SCHEMA_VERSION = 1
 HISTORY_MAX_RECORDS = 300
 HISTORY_PROMPT_LIMIT = 6
 MAX_ROUNDS = 3
+_CAPTURE_KEYS = {ord("C")}
+_CAPTURE_STATE: "_CaptureState | None" = None
 
 _COST_ESTIMATE_CACHE: dict[tuple[str, str | None, str], str] = {}
 _PRICING_REFERENCE_CACHE: dict | None = None
+
+
+@dataclass
+class _CaptureState:
+    session_id: str
+    out_dir: Path
+    counter: int = 0
 
 
 def _compose_side_by_side(
@@ -2407,6 +2500,8 @@ def _interactive_args_curses(stdscr, color_override: bool | None = None) -> argp
         key = stdscr.getch()
         if key == -1:
             continue
+        if _handle_capture_key(stdscr, key):
+            continue
         if key == curses.KEY_MOUSE:
             try:
                 _, _, _, _, bstate = curses.getmouse()
@@ -2556,11 +2651,14 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
             result["exit_code"] = 1
             return
         if getattr(args, "mode", "") == "experiment":
+            result["view_out_dir"] = Path(args.out)
             result["exit_code"] = _run_experiment_curses(
                 stdscr,
                 args=args,
                 color_enabled=color_enabled,
             )
+            if _has_viewer_artifacts(Path(args.out)):
+                result["view_ready"] = True
             return
         result["view_out_dir"] = Path(args.out)
         args.analyzer = _resolve_receipt_analyzer(getattr(args, "analyzer", None))
@@ -2588,7 +2686,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                 curses.flushinp()
             except curses.error:
                 pass
-            stdscr.getch()
+            _wait_for_non_mouse_key(stdscr)
             return
         if not hasattr(args, "openai_stream"):
             args.openai_stream = _env_flag(OPENAI_STREAM_ENV)
@@ -2781,6 +2879,8 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                     stdscr.refresh()
                     frame_idx += 1
                     key = stdscr.getch()
+                    if _handle_capture_key(stdscr, key):
+                        continue
                     if key in (ord("q"), ord("Q")):
                         local_cancel = True
                 thread.join()
@@ -2819,7 +2919,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                     )
                     stdscr.refresh()
                     stdscr.timeout(-1)
-                    stdscr.getch()
+                    _wait_for_non_mouse_key(stdscr)
                     return receipts, images, True, y + 2, last_elapsed, current_settings, []
 
                 results = result_holder.get("results", [])
@@ -3102,14 +3202,21 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                             )
                             baseline_elapsed, baseline_cost_line = _baseline_metrics_from_history(analysis_history)
                             summary_note = None
+                            final_recommendation = None
+                            metrics_settings = base_settings
                             if recommendation:
                                 summary_note = (
-                                    "Pending recommendations not applied; summary reflects last tested settings."
+                                    "Recommendations accepted but not re-tested; final call reflects last tested settings."
+                                    if accepted
+                                    else "Pending recommendations not applied; final call reflects last tested settings."
                                 )
+                                summary = _recommendations_summary(recommendation)
+                                if summary:
+                                    summary_note = f"{summary_note} Suggested: {summary}."
                             _show_final_recommendation_curses(
                                 stdscr,
                                 settings=base_settings,
-                                recommendation=recommendation,
+                                recommendation=final_recommendation,
                                 user_goals=stored_goals,
                                 color_enabled=color_enabled,
                                 last_elapsed=last_elapsed,
@@ -3126,7 +3233,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                                 baseline_settings=baseline_settings,
                                 force_quality_metrics=bool(stored_goals and "maximize quality of render" in stored_goals),
                                 summary_note=summary_note,
-                                metrics_settings=base_settings,
+                                metrics_settings=metrics_settings,
                             )
                         return
                     if accepted and recommendation:
@@ -3254,14 +3361,21 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                             )
                             baseline_elapsed, baseline_cost_line = _baseline_metrics_from_history(analysis_history)
                             summary_note = None
+                            final_recommendation = None
+                            metrics_settings = base_settings
                             if recommendation:
                                 summary_note = (
-                                    "Pending recommendations not applied; summary reflects last tested settings."
+                                    "Recommendations accepted but not re-tested; final call reflects last tested settings."
+                                    if accepted
+                                    else "Pending recommendations not applied; final call reflects last tested settings."
                                 )
+                                summary = _recommendations_summary(recommendation)
+                                if summary:
+                                    summary_note = f"{summary_note} Suggested: {summary}."
                             _show_final_recommendation_curses(
                                 stdscr,
                                 settings=base_settings,
-                                recommendation=recommendation,
+                                recommendation=final_recommendation,
                                 user_goals=user_goals,
                                 color_enabled=color_enabled,
                                 last_elapsed=last_elapsed,
@@ -3278,7 +3392,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                                 baseline_settings=baseline_settings,
                                 force_quality_metrics=bool(user_goals and "maximize quality of render" in user_goals),
                                 summary_note=summary_note,
-                                metrics_settings=base_settings,
+                                metrics_settings=metrics_settings,
                             )
                         return
                     if accepted and recommendation:
@@ -3335,7 +3449,7 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
     if result.get("open_path"):
         _open_path(Path(result["open_path"]))  # type: ignore[arg-type]
     if result.get("view_ready") and result.get("view_out_dir"):
-        _maybe_open_viewer(Path(result["view_out_dir"]))  # type: ignore[arg-type]
+        _print_view_command(Path(result["view_out_dir"]))  # type: ignore[arg-type]
     return int(result.get("exit_code", 0))
 
 
@@ -3354,12 +3468,10 @@ def _run_raw_fallback(reason: str | None, color_override: bool | None) -> int:
         args = _interactive_args_simple()
     if getattr(args, "mode", "") == "experiment":
         exit_code = _run_experiment_from_namespace(args)
-        if exit_code == 0:
-            _maybe_open_viewer(Path(args.out))
+        _print_view_command(Path(args.out))
         return exit_code
     exit_code = _run_generation(args)
-    if exit_code == 0:
-        _maybe_open_viewer(Path(args.out))
+    _print_view_command(Path(args.out))
     return exit_code
 
 
@@ -3386,6 +3498,8 @@ def _wait_for_non_mouse_key(stdscr) -> int:
     import curses
     while True:
         key = stdscr.getch()
+        if _handle_capture_key(stdscr, key):
+            continue
         if key == curses.KEY_MOUSE:
             try:
                 curses.getmouse()
@@ -5426,25 +5540,16 @@ def _show_final_recommendation_curses(
                 prefix = "Change: " if not diff.startswith("Change:") else ""
                 for line in _wrap_text(f"{prefix}{diff}", max_width):
                     lines.append((line, "change"))
-    footer_line = "Open receipt viewer (o) • Press Q or Enter to exit"
-    open_keys = {ord("o"), ord("O")} if receipt_path else None
-    hotkeys = None
-    if receipt_path:
-        hotkeys = {"o": curses.color_pair(1) | curses.A_BOLD if color_enabled else curses.A_BOLD}
+    footer_line = "Press Q or Enter to exit"
     while True:
-        action = _render_scrollable_text_with_banner(
+        _render_scrollable_text_with_banner(
             stdscr,
             title_line=f"Final recommendation (max {MAX_ROUNDS} rounds)",
             body_lines=lines,
-            footer_line=footer_line if receipt_path else "Press Q or Enter to exit",
+            footer_line=footer_line,
             color_enabled=color_enabled,
             footer_attr=curses.A_DIM,
-            footer_hotkeys=hotkeys,
-            open_keys=open_keys,
         )
-        if action == "open" and receipt_path:
-            _maybe_open_viewer(receipt_path.parent)
-            continue
         break
 
 
@@ -5633,6 +5738,8 @@ def _prompt_choice_curses(
         )
         stdscr.refresh()
         key = stdscr.getch()
+        if _handle_capture_key(stdscr, key):
+            continue
         if key in (ord("q"), ord("Q"), 27):
             return None
         if key in (curses.KEY_UP, ord("k"), ord("K")):
@@ -5683,6 +5790,8 @@ def _prompt_multi_select_curses(
         )
         stdscr.refresh()
         key = stdscr.getch()
+        if _handle_capture_key(stdscr, key):
+            continue
         if key in (ord("q"), ord("Q"), 27):
             return None
         if key in (curses.KEY_UP, ord("k"), ord("K")):
@@ -5927,23 +6036,24 @@ def _run_experiment_curses(
             footer = "Cancelling... waiting for in-flight jobs"
         if done_event.is_set():
             if cancel_event.is_set():
-                footer = "Run cancelled. Press Enter to exit • O: open viewer"
+                footer = "Run cancelled. Press Enter to exit"
             else:
-                footer = "Run complete. Press Enter to exit • O: open viewer"
+                footer = "Run complete. Press Enter to exit"
         _safe_addstr(stdscr, max(0, height - 1), 0, footer[: max(0, width - 1)], curses.A_DIM)
         stdscr.refresh()
 
         if done_event.is_set():
             stdscr.timeout(-1)
             key = stdscr.getch()
-            if key in (ord("o"), ord("O")):
-                _maybe_open_viewer(run_dir)
+            if _handle_capture_key(stdscr, key):
                 continue
             if key in (10, 13, curses.KEY_ENTER, ord("q"), ord("Q"), 27):
                 return int(exit_code_holder.get("code", 1))
         else:
             stdscr.timeout(200)
             key = stdscr.getch()
+            if _handle_capture_key(stdscr, key):
+                continue
             if key in (ord("q"), ord("Q"), 27):
                 cancel_event.set()
                 continue
@@ -6295,6 +6405,8 @@ def _prompt_goal_selection_curses(stdscr, color_enabled: bool) -> tuple[list[str
         stdscr.refresh()
 
         key = stdscr.getch()
+        if _handle_capture_key(stdscr, key):
+            continue
         if key in (ord("q"), ord("Q"), 27):
             return None
         if key in (curses.KEY_UP, ord("k"), ord("K")):
@@ -6348,6 +6460,8 @@ def _prompt_yes_no_curses(
         )
         stdscr.refresh()
         key = stdscr.getch()
+        if _handle_capture_key(stdscr, key):
+            continue
         if key in (ord("y"), ord("Y")):
             return True
         if key in (ord("n"), ord("N"), 27):
@@ -6532,7 +6646,7 @@ def _show_api_explore_curses(stdscr, *, color_enabled: bool) -> None:
             stdscr,
             title_line="API Explore - provider/model params",
             body_lines=body_lines,
-            footer_line="Up/Down/PgUp/PgDn to scroll • R to re-pick • Q/Esc/Enter to exit",
+            footer_line="Up/Down/PgUp/PgDn to scroll • R to re-pick • C to capture • Q/Esc/Enter to exit",
             color_enabled=color_enabled,
             action_keys={ord("r"): "repick", ord("R"): "repick"},
         )
@@ -6620,6 +6734,8 @@ def _render_scrollable_text(
         stdscr.refresh()
 
         key = stdscr.getch()
+        if _handle_capture_key(stdscr, key):
+            continue
         if key in (ord("q"), ord("Q"), 27, 10, 13):
             break
         if key in (curses.KEY_UP, ord("k"), ord("K")):
@@ -6693,6 +6809,8 @@ def _render_scrollable_text_with_banner(
         stdscr.refresh()
 
         key = stdscr.getch()
+        if _handle_capture_key(stdscr, key):
+            continue
         if accept_keys and key in accept_keys:
             return "accept"
         if open_keys and key in open_keys:
@@ -6882,6 +7000,10 @@ def _show_receipt_analysis_curses(
     stop_reason = None
     if not cost_line and pre_cost_line:
         cost_line = pre_cost_line
+    if rounds_left <= 0:
+        if analysis:
+            analysis = _rewrite_rec_line(analysis, [])
+        recommendation = None
     recommendations = _normalize_recommendations(recommendation)
     if not recommendations:
         recommendation = None
@@ -6934,6 +7056,9 @@ def _show_receipt_analysis_curses(
         )
     except Exception as exc:
         detail_lines = _wrap_text(f"Render settings unavailable: {exc}", max(20, width - 2))
+    if rounds_left <= 0:
+        detail_lines.append("")
+        detail_lines.append(("Max rounds reached; no further recommendations.", "goal"))
 
     lines: list[str] = []
     if user_goals:
@@ -11023,21 +11148,22 @@ def _view_write_html(data: dict, out_path: Path) -> None:
     out_path.write_text(html_text, encoding="utf-8")
 
 
-def _maybe_open_viewer(run_dir: Path) -> None:
+def _has_viewer_artifacts(run_dir: Path) -> bool:
     run_dir = Path(run_dir).expanduser().resolve()
     if not run_dir.exists():
-        return
+        return False
     has_manifest = (run_dir / "run.json").exists()
     has_receipts = any(run_dir.glob("receipt-*.json"))
     if not has_manifest and not has_receipts:
+        return False
+    return True
+
+
+def _print_view_command(run_dir: Path) -> None:
+    if not _has_viewer_artifacts(run_dir):
         return
-    out_dir = run_dir / ".param_forge_view"
-    data = _view_build_index(run_dir, out_dir)
-    if not data.get("variants"):
-        return
-    out_path = out_dir / "index.html"
-    _view_write_html(data, out_path)
-    _open_path(out_path)
+    run_dir = Path(run_dir).expanduser().resolve()
+    print(f"View with: python scripts/param_forge.py view {run_dir}")
 
 
 def _run_view_cli(argv: list[str]) -> int:

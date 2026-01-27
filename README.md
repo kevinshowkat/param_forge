@@ -105,6 +105,7 @@ Receipt viewer:
 python scripts/param_forge.py view outputs/param_forge
 ```
 This opens a local web page for side-by-side comparison, winner picking, and copyable reproduction snippets.
+Runs are not auto-opened; invoke the view command after a flow completes.
 
 Receipt analyzer provider:
 - Default: Anthropic (`anthropic`), with automatic fallback to OpenAI if Anthropic rate-limits.
