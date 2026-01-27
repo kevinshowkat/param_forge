@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import contextlib
 import csv
 import html
@@ -1490,6 +1491,7 @@ def _append_analysis_history(
         {
             "round": round_index,
             "settings": _format_call_settings_line(settings or {}),
+            "settings_dict": copy.deepcopy(settings) if isinstance(settings, dict) else None,
             "elapsed": elapsed,
             "cost": cost_line,
             "recs": summary,
@@ -1600,6 +1602,99 @@ def _baseline_metrics_from_history(history: list[dict] | None) -> tuple[float | 
     baseline_elapsed = float(elapsed) if isinstance(elapsed, (int, float)) else None
     baseline_cost_line = str(cost_line) if isinstance(cost_line, str) else None
     return baseline_elapsed, baseline_cost_line
+
+
+def _history_metric_value(entry: dict, key: str) -> float | int | None:
+    if key == "time":
+        value = entry.get("elapsed")
+        return float(value) if isinstance(value, (int, float)) else None
+    if key == "cost":
+        return _parse_cost_amount(entry.get("cost"))
+    if key == "quality":
+        value = entry.get("quality")
+        return int(value) if isinstance(value, int) else None
+    if key == "adherence":
+        value = entry.get("adherence")
+        return int(value) if isinstance(value, int) else None
+    if key == "retrieval":
+        value = entry.get("retrieval")
+        return int(value) if isinstance(value, int) else None
+    return None
+
+
+def _best_round_criteria(user_goals: list[str] | None) -> list[tuple[str, str]]:
+    goals = set(user_goals or [])
+    if not goals or goals == {"something else"}:
+        return []
+    wants_time = "minimize time to render" in goals
+    wants_cost = "minimize cost of render" in goals
+    wants_quality = "maximize quality of render" in goals
+    wants_retrieval = "maximize LLM retrieval score" in goals
+    criteria: list[tuple[str, str]] = []
+
+    def _add(item: tuple[str, str]) -> None:
+        if item not in criteria:
+            criteria.append(item)
+
+    if wants_time:
+        _add(("time", "min"))
+    if wants_cost:
+        _add(("cost", "min"))
+    if wants_quality:
+        _add(("quality", "max"))
+        _add(("adherence", "max"))
+    if wants_retrieval:
+        _add(("retrieval", "max"))
+    if (wants_time or wants_cost) and not wants_quality:
+        _add(("quality", "max"))
+        _add(("adherence", "max"))
+    if (wants_time or wants_cost) and not wants_retrieval:
+        _add(("retrieval", "max"))
+    return criteria
+
+
+def _best_round_from_history(
+    history: list[dict] | None,
+    user_goals: list[str] | None,
+) -> dict | None:
+    if not history:
+        return None
+    criteria = _best_round_criteria(user_goals)
+    if not criteria:
+        return history[-1]
+    criteria = [
+        (key, mode)
+        for key, mode in criteria
+        if any(_history_metric_value(entry, key) is not None for entry in history)
+    ]
+    if not criteria:
+        return history[-1]
+
+    def _key(entry: dict) -> tuple[float, ...]:
+        parts: list[float] = []
+        for metric_key, mode in criteria:
+            value = _history_metric_value(entry, metric_key)
+            if mode == "min":
+                parts.append(float(value) if value is not None else float("inf"))
+            else:
+                parts.append(-float(value) if value is not None else float("inf"))
+        return tuple(parts)
+
+    best = history[0]
+    best_key = _key(best)
+    for entry in history[1:]:
+        entry_key = _key(entry)
+        if entry_key < best_key:
+            best = entry
+            best_key = entry_key
+        elif entry_key == best_key:
+            best_round = entry.get("round")
+            current_round = best.get("round")
+            if isinstance(best_round, int) and isinstance(current_round, int):
+                if best_round >= current_round:
+                    best = entry
+                    best_key = entry_key
+    return best
 
 
 def _compress_analysis_to_limit(text: str, limit: int, *, analyzer: str | None = None) -> str:
@@ -3193,34 +3288,70 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                     if run_index >= MAX_ROUNDS:
                         if _final_summary_enabled():
                             base_settings = last_call_settings or _capture_call_settings(args)
-                            quality_baseline, quality_current = _quality_from_history(analysis_history)
-                            adherence_baseline, adherence_current = _adherence_from_history(analysis_history)
-                            retrieval_current = _load_retrieval_score(receipts[-1]) if receipts else None
-                            retrieval_baseline, retrieval_current = _retrieval_from_history(
-                                analysis_history,
-                                retrieval_current,
-                            )
+                            best_entry = _best_round_from_history(analysis_history, stored_goals)
+                            best_round = None
+                            best_settings = base_settings
+                            best_elapsed = last_elapsed
+                            best_cost_line = cost_line
+                            best_quality = None
+                            best_adherence = None
+                            best_retrieval = None
+                            if isinstance(best_entry, dict):
+                                entry_round = best_entry.get("round")
+                                if isinstance(entry_round, int):
+                                    best_round = entry_round
+                                entry_settings = best_entry.get("settings_dict")
+                                if isinstance(entry_settings, dict):
+                                    best_settings = entry_settings
+                                entry_elapsed = best_entry.get("elapsed")
+                                if isinstance(entry_elapsed, (int, float)):
+                                    best_elapsed = float(entry_elapsed)
+                                entry_cost = best_entry.get("cost")
+                                if isinstance(entry_cost, str):
+                                    best_cost_line = entry_cost
+                                entry_quality = best_entry.get("quality")
+                                if isinstance(entry_quality, int):
+                                    best_quality = entry_quality
+                                entry_adherence = best_entry.get("adherence")
+                                if isinstance(entry_adherence, int):
+                                    best_adherence = entry_adherence
+                                entry_retrieval = best_entry.get("retrieval")
+                                if isinstance(entry_retrieval, int):
+                                    best_retrieval = entry_retrieval
+                            quality_baseline, quality_latest = _quality_from_history(analysis_history)
+                            adherence_baseline, adherence_latest = _adherence_from_history(analysis_history)
+                            retrieval_baseline, retrieval_latest = _retrieval_from_history(analysis_history)
+                            quality_current = best_quality if best_quality is not None else quality_latest
+                            adherence_current = best_adherence if best_adherence is not None else adherence_latest
+                            retrieval_current = best_retrieval if best_retrieval is not None else retrieval_latest
                             baseline_elapsed, baseline_cost_line = _baseline_metrics_from_history(analysis_history)
                             summary_note = None
                             final_recommendation = None
-                            metrics_settings = base_settings
+                            metrics_settings = best_settings
+                            last_round = run_index if isinstance(run_index, int) else None
+                            if best_round is not None and last_round is not None and best_round != last_round:
+                                summary_note = f"Best tested round: {best_round} (last round: {last_round})."
                             if recommendation:
-                                summary_note = (
-                                    "Recommendations accepted but not re-tested; final call reflects last tested settings."
+                                rec_note = (
+                                    "Recommendations accepted but not re-tested; final call reflects best tested settings."
                                     if accepted
-                                    else "Pending recommendations not applied; final call reflects last tested settings."
+                                    else "Pending recommendations not applied; final call reflects best tested settings."
                                 )
                                 summary = _recommendations_summary(recommendation)
                                 if summary:
-                                    summary_note = f"{summary_note} Suggested: {summary}."
+                                    rec_note = f"{rec_note} Suggested: {summary}."
+                                if summary_note:
+                                    summary_note = f"{summary_note} {rec_note}"
+                                else:
+                                    summary_note = rec_note
                             _show_final_recommendation_curses(
                                 stdscr,
-                                settings=base_settings,
+                                settings=best_settings,
                                 recommendation=final_recommendation,
                                 user_goals=stored_goals,
                                 color_enabled=color_enabled,
-                                last_elapsed=last_elapsed,
-                                cost_line=cost_line,
+                                last_elapsed=best_elapsed,
+                                cost_line=best_cost_line,
                                 baseline_elapsed=baseline_elapsed,
                                 baseline_cost_line=baseline_cost_line,
                                 quality_baseline=quality_baseline,
@@ -3352,34 +3483,70 @@ def _run_curses_flow(color_override: bool | None = None) -> int:
                     if run_index >= MAX_ROUNDS:
                         if _final_summary_enabled():
                             base_settings = last_call_settings or _capture_call_settings(args)
-                            quality_baseline, quality_current = _quality_from_history(analysis_history)
-                            adherence_baseline, adherence_current = _adherence_from_history(analysis_history)
-                            retrieval_current = _load_retrieval_score(receipts[-1]) if receipts else None
-                            retrieval_baseline, retrieval_current = _retrieval_from_history(
-                                analysis_history,
-                                retrieval_current,
-                            )
+                            best_entry = _best_round_from_history(analysis_history, user_goals)
+                            best_round = None
+                            best_settings = base_settings
+                            best_elapsed = last_elapsed
+                            best_cost_line = cost_line
+                            best_quality = None
+                            best_adherence = None
+                            best_retrieval = None
+                            if isinstance(best_entry, dict):
+                                entry_round = best_entry.get("round")
+                                if isinstance(entry_round, int):
+                                    best_round = entry_round
+                                entry_settings = best_entry.get("settings_dict")
+                                if isinstance(entry_settings, dict):
+                                    best_settings = entry_settings
+                                entry_elapsed = best_entry.get("elapsed")
+                                if isinstance(entry_elapsed, (int, float)):
+                                    best_elapsed = float(entry_elapsed)
+                                entry_cost = best_entry.get("cost")
+                                if isinstance(entry_cost, str):
+                                    best_cost_line = entry_cost
+                                entry_quality = best_entry.get("quality")
+                                if isinstance(entry_quality, int):
+                                    best_quality = entry_quality
+                                entry_adherence = best_entry.get("adherence")
+                                if isinstance(entry_adherence, int):
+                                    best_adherence = entry_adherence
+                                entry_retrieval = best_entry.get("retrieval")
+                                if isinstance(entry_retrieval, int):
+                                    best_retrieval = entry_retrieval
+                            quality_baseline, quality_latest = _quality_from_history(analysis_history)
+                            adherence_baseline, adherence_latest = _adherence_from_history(analysis_history)
+                            retrieval_baseline, retrieval_latest = _retrieval_from_history(analysis_history)
+                            quality_current = best_quality if best_quality is not None else quality_latest
+                            adherence_current = best_adherence if best_adherence is not None else adherence_latest
+                            retrieval_current = best_retrieval if best_retrieval is not None else retrieval_latest
                             baseline_elapsed, baseline_cost_line = _baseline_metrics_from_history(analysis_history)
                             summary_note = None
                             final_recommendation = None
-                            metrics_settings = base_settings
+                            metrics_settings = best_settings
+                            last_round = run_index if isinstance(run_index, int) else None
+                            if best_round is not None and last_round is not None and best_round != last_round:
+                                summary_note = f"Best tested round: {best_round} (last round: {last_round})."
                             if recommendation:
-                                summary_note = (
-                                    "Recommendations accepted but not re-tested; final call reflects last tested settings."
+                                rec_note = (
+                                    "Recommendations accepted but not re-tested; final call reflects best tested settings."
                                     if accepted
-                                    else "Pending recommendations not applied; final call reflects last tested settings."
+                                    else "Pending recommendations not applied; final call reflects best tested settings."
                                 )
                                 summary = _recommendations_summary(recommendation)
                                 if summary:
-                                    summary_note = f"{summary_note} Suggested: {summary}."
+                                    rec_note = f"{rec_note} Suggested: {summary}."
+                                if summary_note:
+                                    summary_note = f"{summary_note} {rec_note}"
+                                else:
+                                    summary_note = rec_note
                             _show_final_recommendation_curses(
                                 stdscr,
-                                settings=base_settings,
+                                settings=best_settings,
                                 recommendation=final_recommendation,
                                 user_goals=user_goals,
                                 color_enabled=color_enabled,
-                                last_elapsed=last_elapsed,
-                                cost_line=cost_line,
+                                last_elapsed=best_elapsed,
+                                cost_line=best_cost_line,
                                 baseline_elapsed=baseline_elapsed,
                                 baseline_cost_line=baseline_cost_line,
                                 quality_baseline=quality_baseline,
@@ -7116,9 +7283,19 @@ def _show_receipt_analysis_curses(
             )
         )
 
+    view_cmd: str | None = None
+    run_dir = receipt_path.parent
+    if _has_viewer_artifacts(run_dir):
+        view_cmd = f"python scripts/param_forge.py view {run_dir}"
+        lines.append("")
+        lines.append(("Model Showdown viewer:", "section"))
+        for line in _wrap_text(view_cmd, max(20, width - 2)):
+            lines.append((line, "desc"))
+    view_segment = "View model showdown (v) • " if view_cmd else ""
+
     rec_label = "recommendations" if recommendations and len(recommendations) > 1 else "recommendation"
     footer_line = (
-        f"Accept {rec_label} (y) • Open receipt (o) • Export text (t) • Print text (p) • "
+        f"Accept {rec_label} (y) • {view_segment}Open receipt (o) • Export text (t) • Print text (p) • "
         "Quit (q) • Up/Down/PgUp/PgDn to scroll"
     )
     footer_attr = curses.color_pair(4) | curses.A_BOLD if color_enabled else curses.A_BOLD
@@ -7132,6 +7309,8 @@ def _show_receipt_analysis_curses(
             "t": curses.color_pair(1) | curses.A_BOLD if color_enabled else curses.A_BOLD,
             "p": curses.color_pair(1) | curses.A_BOLD if color_enabled else curses.A_BOLD,
         }
+        if view_cmd:
+            hotkeys["v"] = curses.color_pair(1) | curses.A_BOLD if color_enabled else curses.A_BOLD
         accept_keys = {ord("y"), ord("Y")}
     else:
         hotkeys = {
@@ -7139,6 +7318,8 @@ def _show_receipt_analysis_curses(
             "t": curses.color_pair(1) | curses.A_BOLD if color_enabled else curses.A_BOLD,
             "p": curses.color_pair(1) | curses.A_BOLD if color_enabled else curses.A_BOLD,
         }
+        if view_cmd:
+            hotkeys["v"] = curses.color_pair(1) | curses.A_BOLD if color_enabled else curses.A_BOLD
     open_keys = {ord("o"), ord("O")}
     action_keys = {
         ord("t"): "export",
@@ -7146,6 +7327,8 @@ def _show_receipt_analysis_curses(
         ord("p"): "print",
         ord("P"): "print",
     }
+    if view_cmd:
+        action_keys.update({ord("v"): "view", ord("V"): "view"})
     while True:
         action = _render_scrollable_text_with_banner(
             stdscr,
@@ -7154,7 +7337,7 @@ def _show_receipt_analysis_curses(
             footer_line=(
                 footer_line
                 if accept_keys
-                else "Open receipt (o) • Export text (t) • Print text (p) • Up/Down/PgUp/PgDn to scroll, Q or Enter to exit"
+                else f"{view_segment}Open receipt (o) • Export text (t) • Print text (p) • Up/Down/PgUp/PgDn to scroll, Q or Enter to exit"
             ),
             color_enabled=color_enabled,
             emphasis_line=emphasis_line,
@@ -7164,6 +7347,15 @@ def _show_receipt_analysis_curses(
             open_keys=open_keys,
             action_keys=action_keys,
         )
+        if action == "view":
+            if view_cmd:
+                _show_notice_curses(
+                    stdscr,
+                    "Model Showdown",
+                    f"Run: {view_cmd}",
+                    color_enabled=color_enabled,
+                )
+            continue
         if action == "export":
             export_lines: list[str] = []
             if user_goals:
