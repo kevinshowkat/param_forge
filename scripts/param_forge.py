@@ -6985,9 +6985,8 @@ def _show_receipt_analysis_curses(
 
     rec_label = "recommendations" if recommendations and len(recommendations) > 1 else "recommendation"
     footer_line = (
-        "Open receipt (o) • Export text (t) • Print text (p) • "
-        f"Accept {rec_label} (y) or quit (q) • "
-        "Up/Down/PgUp/PgDn to scroll"
+        f"Accept {rec_label} (y) • Open receipt (o) • Export text (t) • Print text (p) • "
+        "Quit (q) • Up/Down/PgUp/PgDn to scroll"
     )
     footer_attr = curses.color_pair(4) | curses.A_BOLD if color_enabled else curses.A_BOLD
     hotkeys = None
