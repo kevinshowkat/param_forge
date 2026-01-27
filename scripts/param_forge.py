@@ -5540,6 +5540,14 @@ def _show_final_recommendation_curses(
                 prefix = "Change: " if not diff.startswith("Change:") else ""
                 for line in _wrap_text(f"{prefix}{diff}", max_width):
                     lines.append((line, "change"))
+    if receipt_path:
+        run_dir = receipt_path.parent
+        if _has_viewer_artifacts(run_dir):
+            lines.append("")
+            lines.append(("Viewer command:", "section"))
+            view_cmd = f"python scripts/param_forge.py view {run_dir}"
+            for line in _wrap_text(view_cmd, max_width):
+                lines.append((line, "desc"))
     footer_line = "Press Q or Enter to exit"
     while True:
         _render_scrollable_text_with_banner(
