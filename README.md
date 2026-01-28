@@ -2,7 +2,7 @@
 
 Interactive terminal UI for independent image-model tinkerers experimenting across providers.
 
-<img src="assets/param_forge_demo_v2.gif" width="800" alt="PARAM FORGE terminal demo" />
+<img src="assets/param_forge_demo_v3.gif" width="800" alt="PARAM FORGE terminal demo" />
 
 ## TL;DR
 PARAM FORGE is a local terminal workbench for running image prompts across models/providers and saving receipts so you can reproduce, compare, and iterate fast.
